@@ -969,6 +969,59 @@ def test_request_review_rollback_discards_staged_copies(kanban_home):
         assert sorted(p.name for p in attachment_dir.iterdir()) == ["evidence.json"]
 
 
+@pytest.mark.parametrize("failure_target", ["_end_run", "_insert_completion_attachment"])
+def test_complete_task_rollback_discards_explicit_dir_artifact(kanban_home, tmp_path, failure_target):
+    """A post-staging completion or attachment-row error leaves no orphan and retry keeps its basename."""
+    workspace = tmp_path / "dir-workspace"
+    workspace.mkdir()
+    artifact = workspace / "evidence.json"
+    artifact.write_bytes(b"{}")
+    with kbc.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="completion rollback", workspace_kind="dir", workspace_path=str(workspace),
+        )
+        kb.claim_task(conn, task_id)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        run_id = task.current_run_id
+        assert run_id is not None
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("run bookkeeping failed")
+
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(kb, failure_target, _boom)
+            with pytest.raises(RuntimeError, match="run bookkeeping failed"):
+                kb.complete_task(
+                    conn, task_id, summary="done",
+                    metadata={
+                        "artifacts": [str(artifact)],
+                        "_explicit_artifacts": [str(artifact)],
+                    },
+                    expected_run_id=run_id,
+                )
+
+        attachment_dir = kb.task_attachments_dir(task_id)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert not kb.list_attachments(conn, task_id)
+        assert not attachment_dir.exists() or not any(attachment_dir.iterdir())
+
+        assert kb.complete_task(
+            conn, task_id, summary="done",
+            metadata={
+                "artifacts": [str(artifact)],
+                "_explicit_artifacts": [str(artifact)],
+            },
+            expected_run_id=run_id,
+        )
+        attachments = kb.list_attachments(conn, task_id)
+        assert [attachment.filename for attachment in attachments] == ["evidence.json"]
+        assert sorted(path.name for path in attachment_dir.iterdir()) == ["evidence.json"]
+        assert Path(attachments[0].stored_path).read_bytes() == b"{}"
+
+
 # ---------------------------------------------------------------------------
 # Deferred scratch cleanup for parent/child handoff (#33774)
 # ---------------------------------------------------------------------------
