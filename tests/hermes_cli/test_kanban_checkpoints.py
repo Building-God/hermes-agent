@@ -71,6 +71,22 @@ def test_checkpoint_idempotency_is_stable_but_rejects_conflicting_progress(check
         )
 
 
+def test_checkpoint_idempotency_uses_canonical_numeric_payload_identity(checkpoint_conn):
+    task_id, run_id = _claim(checkpoint_conn)
+
+    first = kb.save_task_checkpoint(
+        checkpoint_conn, task_id, expected_run_id=run_id, progress={"n": 1.0}, idempotency_key="numeric",
+    )
+    assert kb.save_task_checkpoint(
+        checkpoint_conn, task_id, expected_run_id=run_id, progress={"n": 1.0}, idempotency_key="numeric",
+    ) == first
+
+    with pytest.raises(kb.CheckpointIdempotencyError):
+        kb.save_task_checkpoint(
+            checkpoint_conn, task_id, expected_run_id=run_id, progress={"n": 1}, idempotency_key="numeric",
+        )
+
+
 def test_checkpoint_rejects_stale_run_and_sequences_continue_across_attempts(checkpoint_conn):
     task_id, first_run_id = _claim(checkpoint_conn)
     first = kb.save_task_checkpoint(

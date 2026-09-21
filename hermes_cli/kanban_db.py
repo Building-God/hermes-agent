@@ -2137,7 +2137,7 @@ def save_task_checkpoint(
             ).fetchone()
             if existing is not None:
                 checkpoint = _checkpoint_from_row(existing, task_id)
-                if checkpoint.progress != progress:
+                if checkpoint.payload_sha256 != digest:
                     raise CheckpointIdempotencyError("idempotency_key was already used with different progress")
                 return checkpoint
         sequence = int(conn.execute(
