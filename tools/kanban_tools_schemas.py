@@ -389,12 +389,14 @@ KANBAN_ATTACHMENTS_SCHEMA = _schema(
 KANBAN_CREATE_SCHEMA = _schema(
     "kanban_create",
     (
-        "Create a new kanban task, optionally as a child of the current "
-        "one (pass the current task id in ``parents``). Used by "
-        "orchestrator workers to fan out - decompose work into child "
-        "tasks with specific assignees, link them into a pipeline, "
-        "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "Create a new kanban task with optional prerequisite tasks in "
+        "``parents``. These are dependency edges, not ownership labels: "
+        "the new task cannot run until every listed parent is done. "
+        "To hand work off after finishing your own task, list your task "
+        "as a parent and complete it. To run a child first and resume "
+        "your programme after its result, create that child without "
+        "your programme as a parent, then link the child's result as "
+        "a prerequisite of your programme."
     ),
     {
         "title": _prop("string", "Short task title (required)."),
@@ -413,11 +415,11 @@ KANBAN_CREATE_SCHEMA = _schema(
             "type": "array",
             "items": {"type": "string"},
             "description": (
-                "Parent task ids. The new task stays in 'todo' "
-                "until every parent reaches 'done'; then it "
-                "auto-promotes to 'ready'. Typical fan-in: list "
-                "all the researcher task ids when creating a "
-                "synthesizer task."
+                "Prerequisite task ids, not ownership. The new task stays "
+                "in 'todo' until every listed task reaches 'done'; then "
+                "it auto-promotes to 'ready'. For source-to-synthesis "
+                "fan-in, list the source task ids. Do not list the current "
+                "programme id if that programme must wait for this new task."
             ),
         },
         "tenant": _prop("string", (
