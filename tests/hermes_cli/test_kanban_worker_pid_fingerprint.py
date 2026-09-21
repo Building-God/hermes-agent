@@ -138,10 +138,22 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     assert kbd.enforce_max_runtime(conn, signal_fn=sig) == []
     assert kb.release_stale_claims(conn, signal_fn=sig) == 0
     assert killed == []
-    assert kb.get_task(conn, tid).status == "running"
-    # An explicit operator reclaim releases the claim (human override) but still sends nothing.
-    assert kb.reclaim_task(conn, tid, reason="operator", signal_fn=sig) is True
+    task_before_manual_reclaim = kb.get_task(conn, tid)
+    assert task_before_manual_reclaim is not None and task_before_manual_reclaim.status == "running"
+    # An explicit operator reclaim cannot release this unverified live worker's claim: doing so
+    # would make the task dispatchable beside an identity that may not belong to the worker.
+    assert kb.reclaim_task(conn, tid, reason="operator", signal_fn=sig) is False
+    task_after_manual_reclaim = kb.get_task(conn, tid)
+    assert task_after_manual_reclaim is not None
+    assert task_after_manual_reclaim.status == "running"
+    assert task_after_manual_reclaim.claim_lock == task_before_manual_reclaim.claim_lock
+    assert task_after_manual_reclaim.worker_pid == task_before_manual_reclaim.worker_pid == os.getpid()
     assert killed == []
+    deferred = next(event for event in kb.list_events(conn, tid) if event.kind == "reclaim_deferred")
+    assert deferred.payload is not None
+    assert deferred.payload["reason"] == "manual_reclaim_worker_tree_alive"
+    assert deferred.payload["signal_refused"] is True
+    assert deferred.payload["terminated"] is False
 
     # The process is gone (a dead PID): the row is reclaimed like any dead worker, still no signal.
     tid2 = kb.create_task(conn, title="job2", assignee="worker")
