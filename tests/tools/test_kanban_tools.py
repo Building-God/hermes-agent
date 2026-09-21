@@ -51,6 +51,9 @@ def worker_env(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    # Pin before init_db/connect: HERMES_KANBAN_DB outranks HERMES_HOME and
+    # may otherwise leak a developer's live board into this test fixture.
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
     monkeypatch.setenv("HERMES_PROFILE", "test-worker")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
     from pathlib import Path as _Path
@@ -124,6 +127,31 @@ def test_checkpoint_refuses_unbound_or_unpinned_worker(monkeypatch, worker_env):
     monkeypatch.delenv("HERMES_KANBAN_DB")
     unpinned = json.loads(kt._handle_checkpoint({"action": "load"}))
     assert "dispatcher-pinned" in unpinned["error"]
+
+
+def test_checkpoint_refuses_reclaimed_run_and_delegated_child(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    with kbc.connect() as conn:
+        assert kb.reclaim_task(conn, worker_env, signal_fn=lambda *_args, **_kwargs: None)
+        kb.claim_task(conn, worker_env)
+        successor_run = kb.get_task(conn, worker_env).current_run_id
+    assert successor_run != int(os.environ["HERMES_KANBAN_RUN_ID"])
+
+    stale_save = json.loads(kt._handle_checkpoint({"action": "save", "progress": {"step": "stale"}}))
+    stale_load = json.loads(kt._handle_checkpoint({"action": "load"}))
+    assert "no longer owns" in stale_save["error"]
+    assert "no longer owns" in stale_load["error"]
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(successor_run))
+    monkeypatch.setattr(kt, "_is_delegated_child_context", lambda: True)
+    delegated = json.loads(kt._handle_checkpoint({"action": "save", "progress": {"step": "child"}}))
+    assert "refused" in delegated["error"]
+
+    with kbc.connect() as conn:
+        assert kb.load_task_checkpoint(conn, worker_env) is None
 
 
 def test_create_exposes_and_persists_bounded_retry_limit(worker_env):

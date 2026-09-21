@@ -277,6 +277,8 @@ def _checkpoint_worker_identity() -> tuple[str, int]:
     compare it to the task's current running attempt before reads and writes.
     """
     _reject_delegated_child_mutation("kanban_checkpoint")
+    if _is_delegated_child_context():
+        raise _Reject("kanban_checkpoint refused: delegated child context is not a dispatcher-owned worker")
     task_id = os.environ.get("HERMES_KANBAN_TASK")
     if not task_id or not _is_dispatcher_owned_worker():
         raise _Reject("kanban_checkpoint refused: it is available only to a dispatcher-owned worker task")
