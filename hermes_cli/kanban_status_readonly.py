@@ -118,6 +118,42 @@ def _block_origin(conn: sqlite3.Connection, task_id: str) -> str:
     return payload.get("kind") if payload.get("kind") in {"needs_input", "capability", "transient"} else "unspecified"
 
 
+def _checkpoint_note_at(conn: sqlite3.Connection, task_id: str) -> str | None:
+    """Return the timestamp of a human-authored CHECKPOINT note, never its text."""
+    note = _one(
+        conn,
+        "SELECT MAX(created_at) AS at FROM task_comments "
+        "WHERE task_id=? AND ltrim(body) LIKE 'CHECKPOINT:%'",
+        (task_id,),
+    )
+    return _utc(note["at"]) if note else None
+
+
+def _typed_checkpoint(conn: sqlite3.Connection, task_id: str) -> dict:
+    """Report checkpoint metadata without reading progress or validating it."""
+    table = _one(
+        conn,
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_checkpoints'",
+    )
+    if table is None:
+        return {"status": "unavailable"}
+    checkpoint = _one(
+        conn,
+        "SELECT sequence, run_id, payload_sha256, created_at FROM task_checkpoints "
+        "WHERE task_id=? ORDER BY sequence DESC LIMIT 1",
+        (task_id,),
+    )
+    if checkpoint is None:
+        return {"status": "absent"}
+    return {
+        "status": "present",
+        "sequence": int(checkpoint["sequence"]),
+        "source_run_id": int(checkpoint["run_id"]),
+        "created_at": _utc(checkpoint["created_at"]),
+        "payload_sha256": checkpoint["payload_sha256"],
+    }
+
+
 def _worker_log_activity(task_id: str, board: str, active_started_at: int | None) -> dict:
     """Report only writes in this attempt; log bytes may span earlier attempts."""
     from hermes_cli import kanban_db as kb
@@ -169,17 +205,15 @@ def _task_row(conn: sqlite3.Connection, task: sqlite3.Row, *, completed: bool, b
             conn, "SELECT kind, created_at FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1",
             (task["id"],),
         )
-        checkpoint = _one(
-            conn,
-            "SELECT MAX(created_at) AS at FROM task_comments "
-            "WHERE task_id=? AND ltrim(body) LIKE 'CHECKPOINT:%'",
-            (task["id"],),
-        )
         row["last_event"] = {
             "kind": event["kind"] if event else None,
             "at": _utc(event["created_at"]) if event else None,
         }
-        row["last_checkpoint_at"] = _utc(checkpoint["at"]) if checkpoint else None
+        row["last_checkpoint_note_at"] = _checkpoint_note_at(conn, task["id"])
+        # Kept for existing JSON consumers; it is a CHECKPOINT comment timestamp,
+        # not evidence that a durable checkpoint exists or is loadable.
+        row["last_checkpoint_at"] = row["last_checkpoint_note_at"]
+        row["typed_checkpoint"] = _typed_checkpoint(conn, task["id"])
         if task["status"] == "blocked":
             row["block_origin"] = _block_origin(conn, task["id"])
             row["human_action"] = (
@@ -279,11 +313,21 @@ def render_status(snapshot: dict) -> str:
         event = task.get("last_event") or {}
         activity = event.get("kind") or "none"
         at = event.get("at") or "unknown time"
-        checkpoint = task.get("last_checkpoint_at") or "none"
+        note = task.get("last_checkpoint_note_at", task.get("last_checkpoint_at")) or "none"
+        typed = task.get("typed_checkpoint") or {"status": "unavailable"}
+        typed_status = typed.get("status", "unavailable")
+        if typed_status == "present":
+            typed_text = (
+                f"sequence {typed.get('sequence')} from run {typed.get('source_run_id')} "
+                f"at {typed.get('created_at') or 'unknown time'}"
+            )
+        else:
+            typed_text = typed_status
         lines.append(
             f"- {task['id']} [{task['status']}] {_short(task['title'])} "
             f"(@{_short(task.get('assignee') or 'unassigned', limit=32)}); "
-            f"last event {activity} at {at}; latest checkpoint {checkpoint}"
+            f"last event {activity} at {at}; CHECKPOINT note {note}; "
+            f"typed durable checkpoint {typed_text}"
         )
         if task["status"] == "blocked":
             origin = task.get("block_origin", "unknown")

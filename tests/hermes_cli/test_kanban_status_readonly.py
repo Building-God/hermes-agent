@@ -340,3 +340,47 @@ def test_snapshot_resolves_each_profile_home_without_cross_home_leak(tmp_path, m
     for home, expected in ((homes[0], "t_a"), (homes[1], "t_b"), (homes[0], "t_a")):
         monkeypatch.setenv("HERMES_HOME", str(home))
         assert [row["id"] for row in snapshot_for_board("default")["recent_results"]] == [expected]
+
+
+def test_status_distinguishes_native_typed_checkpoint_from_checkpoint_note(tmp_path, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_status_readonly import render_status
+
+    path = kb.init_db(tmp_path / "native-kanban.db")
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at) VALUES ('t_typed', 'Safe title', 'running', 1)"
+        )
+        conn.execute(
+            "INSERT INTO task_checkpoints "
+            "(task_id, sequence, run_id, progress_json, payload_sha256, version, created_at) "
+            "VALUES ('t_typed', 1, 111, '{\"secret\":\"do not disclose\"}', ?, 1, 200)",
+            ("a" * 64,),
+        )
+    monkeypatch.setattr(kb, "kanban_db_path", lambda **kwargs: path)
+    with read_only_connection(board="native") as conn:
+        snapshot = build_snapshot(conn, board="native")
+    task = snapshot["open_tasks"][0]
+    assert task["last_checkpoint_note_at"] is None
+    assert task["last_checkpoint_at"] is None
+    assert task["typed_checkpoint"] == {
+        "status": "present",
+        "sequence": 1,
+        "source_run_id": 111,
+        "created_at": "1970-01-01T00:03:20Z",
+        "payload_sha256": "a" * 64,
+    }
+    rendered = render_status(snapshot)
+    assert "CHECKPOINT note none" in rendered
+    assert "typed durable checkpoint sequence 1 from run 111" in rendered
+    assert "do not disclose" not in json.dumps(snapshot)
+
+
+def test_old_schema_reports_typed_checkpoint_as_unavailable_not_absent(board):
+    from hermes_cli.kanban_status_readonly import render_status
+
+    _task(board, "t_legacy")
+    snapshot = build_snapshot(board, board="legacy")
+    task = snapshot["open_tasks"][0]
+    assert task["typed_checkpoint"] == {"status": "unavailable"}
+    assert "typed durable checkpoint unavailable" in render_status(snapshot)
