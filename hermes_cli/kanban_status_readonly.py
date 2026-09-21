@@ -118,13 +118,17 @@ def _block_origin(conn: sqlite3.Connection, task_id: str) -> str:
     return payload.get("kind") if payload.get("kind") in {"needs_input", "capability", "transient"} else "unspecified"
 
 
-def _worker_log_activity(task_id: str, board: str) -> dict:
-    """Filesystem metadata is observable output, never proof of useful work."""
+def _worker_log_activity(task_id: str, board: str, active_started_at: int | None) -> dict:
+    """Report only writes in this attempt; log bytes may span earlier attempts."""
     from hermes_cli import kanban_db as kb
 
+    if active_started_at is None:
+        return {"last_write_at": None, "size_bytes": None}
     try:
         stat = kb.worker_log_path(task_id, board=board).stat()
     except OSError:
+        return {"last_write_at": None, "size_bytes": None}
+    if stat.st_mtime < active_started_at:
         return {"last_write_at": None, "size_bytes": None}
     return {"last_write_at": _utc(stat.st_mtime), "size_bytes": stat.st_size}
 
@@ -164,11 +168,11 @@ def _task_row(conn: sqlite3.Connection, task: sqlite3.Row, *, completed: bool, b
             )
         if task["status"] == "running":
             row["worker_liveness"] = {
-                "last_heartbeat_at": _utc(task["last_heartbeat_at"]),
-                "log": _worker_log_activity(task["id"], board),
+                "last_heartbeat_at": _utc(task["active_last_heartbeat_at"]),
+                "log": _worker_log_activity(task["id"], board, task["active_started_at"]),
                 "runtime_cap_at": _utc(
-                    task["started_at"] + task["max_runtime_seconds"]
-                    if task["started_at"] is not None and task["max_runtime_seconds"] is not None
+                    task["active_started_at"] + task["max_runtime_seconds"]
+                    if task["active_started_at"] is not None and task["max_runtime_seconds"] is not None
                     else None
                 ),
             }
@@ -187,19 +191,23 @@ def build_snapshot(
     ).fetchall()})
     marks = ",".join("?" for _ in OPEN_STATUSES)
     open_rows = conn.execute(
-        "SELECT id, title, status, assignee, completed_at, result, created_at, "
-        "started_at, last_heartbeat_at, max_runtime_seconds "
-        f"FROM tasks WHERE status IN ({marks}) "
-        "ORDER BY CASE status WHEN 'running' THEN 0 WHEN 'blocked' THEN 1 "
+        "SELECT t.id, t.title, t.status, t.assignee, t.completed_at, t.result, t.created_at, "
+        "t.max_runtime_seconds, r.started_at AS active_started_at, "
+        "r.last_heartbeat_at AS active_last_heartbeat_at "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id=t.current_run_id AND r.task_id=t.id "
+        f"WHERE t.status IN ({marks}) "
+        "ORDER BY CASE t.status WHEN 'running' THEN 0 WHEN 'blocked' THEN 1 "
         "WHEN 'review' THEN 2 WHEN 'ready' THEN 3 ELSE 4 END, "
-        "created_at ASC, id ASC LIMIT ?",
+        "t.created_at ASC, t.id ASC LIMIT ?",
         (*sorted(OPEN_STATUSES), open_limit),
     ).fetchall()
     done_rows = conn.execute(
-        "SELECT id, title, status, assignee, completed_at, result, created_at, "
-        "started_at, last_heartbeat_at, max_runtime_seconds "
-        "FROM tasks WHERE status='done' "
-        "ORDER BY completed_at DESC, id DESC LIMIT ?", (completed_limit,),
+        "SELECT t.id, t.title, t.status, t.assignee, t.completed_at, t.result, t.created_at, "
+        "t.max_runtime_seconds, r.started_at AS active_started_at, "
+        "r.last_heartbeat_at AS active_last_heartbeat_at "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id=t.current_run_id AND r.task_id=t.id "
+        "WHERE t.status='done' "
+        "ORDER BY t.completed_at DESC, t.id DESC LIMIT ?", (completed_limit,),
     ).fetchall()
     open_total = sum(counts[status] for status in OPEN_STATUSES)
     return {
@@ -254,7 +262,7 @@ def render_status(snapshot: dict) -> str:
         lines.append(
             f"- {task['id']} [{task['status']}] {_short(task['title'])} "
             f"(@{_short(task.get('assignee') or 'unassigned', limit=32)}); "
-            f"last event {activity} at {at}; checkpoint {checkpoint}"
+            f"last event {activity} at {at}; latest checkpoint {checkpoint}"
         )
         if task["status"] == "blocked":
             origin = task.get("block_origin", "unknown")
@@ -263,10 +271,12 @@ def render_status(snapshot: dict) -> str:
         if task["status"] == "running":
             live = task.get("worker_liveness") or {}
             log = live.get("log") or {}
+            log_size = log.get("size_bytes")
+            log_size_text = f" ({log_size} total bytes across attempts)" if log_size is not None else ""
             lines.append(
                 f"  Heartbeat: {live.get('last_heartbeat_at') or 'none'} (liveness only); "
-                f"worker log write: {log.get('last_write_at') or 'none'} "
-                f"({log.get('size_bytes') if log.get('size_bytes') is not None else '?'} bytes); "
+                f"worker log write in attempt: {log.get('last_write_at') or 'none'}"
+                f"{log_size_text}; "
                 f"runtime cap threshold: {live.get('runtime_cap_at') or 'none'}"
             )
     lines.append("Recent results:")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 
 import pytest
@@ -17,11 +18,13 @@ def board():
     conn.executescript("""
         CREATE TABLE tasks (id TEXT, title TEXT, status TEXT, assignee TEXT,
             completed_at INTEGER, result TEXT, created_at INTEGER,
-            started_at INTEGER, last_heartbeat_at INTEGER, max_runtime_seconds INTEGER);
+            started_at INTEGER, last_heartbeat_at INTEGER, max_runtime_seconds INTEGER,
+            current_run_id INTEGER);
         CREATE TABLE task_events (id INTEGER, task_id TEXT, kind TEXT, created_at INTEGER,
             payload TEXT);
         CREATE TABLE task_comments (task_id TEXT, body TEXT, created_at INTEGER);
-        CREATE TABLE task_runs (id INTEGER, task_id TEXT, summary TEXT, outcome TEXT);
+        CREATE TABLE task_runs (id INTEGER, task_id TEXT, summary TEXT, outcome TEXT,
+            started_at INTEGER, last_heartbeat_at INTEGER);
         CREATE TABLE task_attachments (task_id TEXT, filename TEXT, stored_path TEXT);
         CREATE TABLE kanban_notify_subs (task_id TEXT, last_event_id INTEGER,
             delivery_failures INTEGER, claim_token TEXT);
@@ -40,7 +43,8 @@ def _task(conn, task_id, *, status="running", result=None, completed_at=None):
 
 def test_done_with_empty_task_result_still_has_preserved_result_evidence(board):
     _task(board, "t_done", status="done", completed_at=200)
-    board.execute("INSERT INTO task_runs VALUES (1, 't_done', 'PRIVATE RUN SUMMARY', 'completed')")
+    board.execute("INSERT INTO task_runs (id,task_id,summary,outcome) "
+                  "VALUES (1, 't_done', 'PRIVATE RUN SUMMARY', 'completed')")
     board.execute("INSERT INTO task_attachments VALUES ('t_done', 'report.txt', '/private/path')")
     board.execute("INSERT INTO task_events VALUES (10, 't_done', 'completed', 199, 'PRIVATE PAYLOAD')")
     result = build_snapshot(board, board="fixture")["recent_results"][0]
@@ -112,9 +116,11 @@ def test_running_separates_heartbeat_log_activity_and_runtime_cap(board, monkeyp
     from hermes_cli import kanban_status_readonly as status_module
 
     _task(board, "t_running")
-    board.execute("UPDATE tasks SET started_at=100, last_heartbeat_at=130, "
+    board.execute("UPDATE tasks SET started_at=100, last_heartbeat_at=130, current_run_id=1, "
                   "max_runtime_seconds=300 WHERE id='t_running'")
-    monkeypatch.setattr(status_module, "_worker_log_activity", lambda *_: {
+    board.execute("INSERT INTO task_runs (id,task_id,started_at,last_heartbeat_at) "
+                  "VALUES (1,'t_running',100,130)")
+    monkeypatch.setattr(status_module, "_worker_log_activity", lambda *args: {
         "last_write_at": "1970-01-01T00:02:00Z", "size_bytes": 40,
     })
     item = build_snapshot(board, board="fixture")["open_tasks"][0]
@@ -122,6 +128,41 @@ def test_running_separates_heartbeat_log_activity_and_runtime_cap(board, monkeyp
         "last_heartbeat_at": "1970-01-01T00:02:10Z",
         "log": {"last_write_at": "1970-01-01T00:02:00Z", "size_bytes": 40},
         "runtime_cap_at": "1970-01-01T00:06:40Z",
+    }
+
+
+def test_resumed_running_uses_active_attempt_not_first_start(board, monkeypatch):
+    from hermes_cli import kanban_status_readonly as status_module
+
+    _task(board, "t_resumed")
+    board.execute("UPDATE tasks SET started_at=100, last_heartbeat_at=130, "
+                  "max_runtime_seconds=300, current_run_id=2 WHERE id='t_resumed'")
+    board.execute("INSERT INTO task_runs (id,task_id,started_at,last_heartbeat_at) "
+                  "VALUES (1,'t_resumed',100,130), (2,'t_resumed',500,510)")
+    seen = []
+    monkeypatch.setattr(status_module, "_worker_log_activity", lambda *args: (
+        seen.append(args) or {"last_write_at": None, "size_bytes": None}
+    ))
+    live = build_snapshot(board, board="fixture")["open_tasks"][0]["worker_liveness"]
+    assert live["last_heartbeat_at"] == "1970-01-01T00:08:30Z"
+    assert live["runtime_cap_at"] == "1970-01-01T00:13:20Z"
+    assert seen == [("t_resumed", "fixture", 500)]
+
+
+def test_worker_log_activity_excludes_previous_attempt(tmp_path, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_status_readonly as status_module
+
+    log_path = tmp_path / "worker.log"
+    log_path.write_bytes(b"old")
+    os.utime(log_path, (100, 100))
+    monkeypatch.setattr(kb, "worker_log_path", lambda *args, **kwargs: log_path)
+    assert status_module._worker_log_activity("t_resumed", "fixture", 500) == {
+        "last_write_at": None, "size_bytes": None,
+    }
+    os.utime(log_path, (520, 520))
+    assert status_module._worker_log_activity("t_resumed", "fixture", 500) == {
+        "last_write_at": "1970-01-01T00:08:40Z", "size_bytes": 3,
     }
 
 
@@ -175,16 +216,19 @@ def test_status_tool_uses_read_only_board_and_rejects_mutation(tmp_path, monkeyp
         conn.executescript("""
             CREATE TABLE tasks (id TEXT, title TEXT, status TEXT, assignee TEXT,
                 completed_at INTEGER, result TEXT, created_at INTEGER,
-                started_at INTEGER, last_heartbeat_at INTEGER, max_runtime_seconds INTEGER);
+                started_at INTEGER, last_heartbeat_at INTEGER, max_runtime_seconds INTEGER,
+                current_run_id INTEGER);
             CREATE TABLE task_events (id INTEGER, task_id TEXT, kind TEXT, created_at INTEGER);
             CREATE TABLE task_comments (task_id TEXT, body TEXT, created_at INTEGER);
-            CREATE TABLE task_runs (id INTEGER, task_id TEXT, summary TEXT, outcome TEXT);
+            CREATE TABLE task_runs (id INTEGER, task_id TEXT, summary TEXT, outcome TEXT,
+                started_at INTEGER, last_heartbeat_at INTEGER);
             CREATE TABLE task_attachments (task_id TEXT, filename TEXT);
             CREATE TABLE kanban_notify_subs (task_id TEXT, last_event_id INTEGER,
                 delivery_failures INTEGER, claim_token TEXT);
             INSERT INTO tasks (id, title, status, assignee, completed_at, result, created_at)
                 VALUES ('t_1', 'Safe title', 'done', 'pilot', 2, NULL, 1);
-            INSERT INTO task_runs VALUES (1, 't_1', 'PRIVATE SUMMARY', 'completed');
+            INSERT INTO task_runs (id,task_id,summary,outcome)
+                VALUES (1, 't_1', 'PRIVATE SUMMARY', 'completed');
             INSERT INTO task_events VALUES (1, 't_1', 'completed', 2);
         """)
     monkeypatch.setenv("HERMES_KANBAN_DB", str(path))
@@ -238,10 +282,12 @@ def test_snapshot_resolves_each_profile_home_without_cross_home_leak(tmp_path, m
     schema = """
         CREATE TABLE tasks (id TEXT, title TEXT, status TEXT, assignee TEXT,
             completed_at INTEGER, result TEXT, created_at INTEGER,
-            started_at INTEGER, last_heartbeat_at INTEGER, max_runtime_seconds INTEGER);
+            started_at INTEGER, last_heartbeat_at INTEGER, max_runtime_seconds INTEGER,
+            current_run_id INTEGER);
         CREATE TABLE task_events (id INTEGER, task_id TEXT, kind TEXT, created_at INTEGER, payload TEXT);
         CREATE TABLE task_comments (task_id TEXT, body TEXT, created_at INTEGER);
-        CREATE TABLE task_runs (id INTEGER, task_id TEXT, summary TEXT, outcome TEXT);
+        CREATE TABLE task_runs (id INTEGER, task_id TEXT, summary TEXT, outcome TEXT,
+            started_at INTEGER, last_heartbeat_at INTEGER);
         CREATE TABLE task_attachments (task_id TEXT, filename TEXT);
         CREATE TABLE kanban_notify_subs (task_id TEXT, last_event_id INTEGER,
             delivery_failures INTEGER, claim_token TEXT);
