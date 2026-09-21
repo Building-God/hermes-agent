@@ -208,9 +208,33 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
         conn1.close()
         conn2.close()
 
+def test_reclaim_task_holds_claim_when_worker_tree_survives(kanban_home, monkeypatch):
+    """Manual reclaim cannot requeue beside a tree the kill fence cannot verify."""
+    conn = kbc.connect()
+    try:
+        task_id = kb.create_task(conn, title="stuck", assignee="broken")
+        assert kb.claim_task(conn, task_id) is not None
+        kbd._set_worker_pid(conn, task_id, os.getpid())
+        monkeypatch.setattr(kbd, "_snapshot_worker_descendants", lambda _pid: ({}, True))
+        monkeypatch.setattr(kbd, "_poll_worker_exit", lambda _pid, _started_at: False)
 
-# ---------------------------------------------------------------------------
-# GC + retention
+        assert kb.reclaim_task(conn, task_id, signal_fn=lambda _pid, _sig: None) is False
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running" and task.worker_pid == os.getpid()
+        deferred = next(
+            event for event in kb.list_events(conn, task_id) if event.kind == "reclaim_deferred"
+        )
+        assert deferred.payload is not None
+        assert deferred.payload["reason"] == "manual_reclaim_worker_tree_alive"
+        assert deferred.payload["termination_attempted"] is True
+        assert deferred.payload["terminated"] is False
+    finally:
+        conn.close()
+
+
+
 # ---------------------------------------------------------------------------
 
 

@@ -94,6 +94,12 @@ def test_reopen_demotes_done_descendants_with_events_and_comments(conn):
 def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     conn, tmp_path, monkeypatch,
 ):
+    """Pin composed transaction atomicity, not global worker-tree containment.
+
+    The intentionally post-commit termination here remains a known M18 boundary:
+    a prepared pre-commit tree-fence receipt is required before ancestor reopen
+    or dashboard direct-status can be accepted as universally safe stop paths.
+    """
     parent_id = kb.create_task(conn, title="ancestor", assignee="planner")
     assert kb.complete_task(conn, parent_id, result="done")
     child_id = kb.create_task(

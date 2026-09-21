@@ -2725,6 +2725,15 @@ def reclaim_task(
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(
         row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
+    if _worker_survived_termination(termination):
+        # Operator reclaim is not a force-release escape hatch: the still-live
+        # host-local worker remains tracked and non-dispatchable until a later
+        # reclaim can prove its complete process tree is gone.
+        _defer_reclaim_for_live_worker(
+            conn, task_id, prev_lock, int(time.time()), termination,
+            reason="manual_reclaim_worker_tree_alive",
+        )
+        return False
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
@@ -4085,28 +4094,44 @@ def specify_triage_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
-    """Archive a task; a *running* task's host-local worker is terminated.
+    """Archive a task after fencing any running host-local worker tree.
 
-    Clearing ``worker_pid`` in the DB alone left the OS process running past its
-    own archive — it kept executing (and pushing work) against a task nothing
-    tracked anymore (#76196). Snapshot pid+claim inside the archive txn so the
-    kill is contingent on THIS caller winning the archive transition (a losing
-    concurrent archiver must never signal the pid); the kill itself runs after
-    commit — ``_poll_worker_exit`` can wait ~5 s and must not hold the write
-    lock. Post-release kill is safe here because ``archived`` is terminal: no
-    dispatcher can spawn a duplicate worker off the released claim. The
-    termination outcome lands as its own ``archive_worker_termination`` event so
-    the ``archived`` event stays atomic with the status flip.
+    An archive is deletable, so it must never discard the only worker identity
+    evidence before termination confirms both the root and its snapshotted
+    descendants are gone.  A failed fence leaves the running claim tracked and
+    extends it for a retry, rather than making an effect-capable worker orphan.
     """
-    with write_txn(conn):
-        row = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if not row:
+    row = conn.execute(
+        "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if not row or row["status"] == "archived":
+        return False
+
+    was_running = row["status"] == "running"
+    prev_pid, prev_lock, prev_started = row["worker_pid"], row["claim_lock"], row["worker_started_at"]
+    termination = None
+    if was_running:
+        # This snapshots descendants before root teardown; doing it after the
+        # archive commit loses the only reliable ancestry fence.
+        termination = _terminate_reclaimed_worker(
+            prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started,
+        )
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, task_id, prev_lock, int(time.time()), termination,
+                reason="archive_worker_tree_alive",
+            )
             return False
-        was_running = row["status"] == "running"
-        prev_pid, prev_lock, prev_started = row["worker_pid"], row["claim_lock"], row["worker_started_at"]
+
+    with write_txn(conn):
+        # Do not archive a different concurrent running claim than the one
+        # fenced above.  A non-running concurrent transition is safe to archive.
+        if was_running:
+            current = conn.execute(
+                "SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,),
+            ).fetchone()
+            if current is None or (current["status"] == "running" and current["claim_lock"] != prev_lock):
+                return False
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
@@ -4120,9 +4145,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
             summary="task archived with run still active",
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
-    if was_running:
-        termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
-        with write_txn(conn):
+        if termination is not None:
             _append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
     # ``archived`` parents no longer block children; promote them now.
     recompute_ready(conn)

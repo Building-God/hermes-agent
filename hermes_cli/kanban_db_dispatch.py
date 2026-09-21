@@ -464,9 +464,22 @@ def _snapshot_worker_descendants(pid: int) -> tuple[dict[int, str], bool]:
 
 
 def _verified_descendant_survivors(descendants: Mapping[int, str]) -> list[int]:
-    """Return snapshot members still bearing their captured identity."""
-    return [pid for pid, fingerprint in descendants.items()
-            if _kb._pid_alive(pid) and _process_fingerprint(pid) == fingerprint]
+    """Return snapshot members whose exit cannot be proven safe.
+
+    A matching fingerprint proves the snapshot child still survives.  An
+    unreadable fingerprint for a live PID is also a survivor: treating a probe
+    failure as a different process would release the claim beside a potentially
+    effect-capable orphan.  A known *different* fingerprint is a recycled PID,
+    not ours to signal and evidence that the snapshotted child has exited.
+    """
+    survivors: list[int] = []
+    for pid, fingerprint in descendants.items():
+        if not _kb._pid_alive(pid):
+            continue
+        current = _process_fingerprint(pid)
+        if current is None or current == fingerprint:
+            survivors.append(pid)
+    return survivors
 
 
 def _poll_descendant_exit(descendants: Mapping[int, str]) -> list[int]:
@@ -608,13 +621,17 @@ def _terminate_reclaimed_worker(
             info["descendant_termination_errors"] = survivor_errors
     if survivors and sys.platform != "win32":
         # Parent got its graceful window first. Only snapshot identities still
-        # matching are ours; a recycled number is never signalled.
+        # matching are ours; a recycled or unreadable number is never signalled.
         for descendant in survivors:
+            if _process_fingerprint(descendant) != descendants[descendant]:
+                continue
             with contextlib.suppress(ProcessLookupError, OSError):
                 kill(descendant, signal.SIGTERM)
         survivors = _poll_descendant_exit(descendants)
         if survivors:
             for descendant in survivors:
+                if _process_fingerprint(descendant) != descendants[descendant]:
+                    continue
                 _sigkill(kill, descendant)
             survivors = _poll_descendant_exit(descendants)
     info["surviving_descendant_pids"] = survivors

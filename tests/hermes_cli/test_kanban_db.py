@@ -2247,6 +2247,56 @@ def test_archive_running_task_terminates_worker(kanban_home, monkeypatch):
         assert kb.get_task(conn, t).status == "archived"
 
 
+def test_archive_holds_running_claim_when_worker_tree_survives(kanban_home, monkeypatch):
+    """Archive refuses a deletable state until the worker tree fence succeeds."""
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="x", assignee="a")
+        assert kb.claim_task(conn, task_id) is not None
+        kbd._set_worker_pid(conn, task_id, os.getpid())
+        monkeypatch.setattr(kbd, "_snapshot_worker_descendants", lambda _pid: ({}, True))
+        monkeypatch.setattr(kbd, "_poll_worker_exit", lambda _pid, _started_at: False)
+
+        assert kb.archive_task(conn, task_id, signal_fn=lambda _pid, _sig: None) is False
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running" and task.worker_pid == os.getpid()
+        deferred = next(
+            event for event in kb.list_events(conn, task_id) if event.kind == "reclaim_deferred"
+        )
+        assert deferred.payload is not None
+        assert deferred.payload["reason"] == "archive_worker_tree_alive"
+        assert deferred.payload["termination_attempted"] is True
+        assert deferred.payload["terminated"] is False
+        assert all(event.kind != "archived" for event in kb.list_events(conn, task_id))
+
+
+def test_archive_refuses_recycled_worker_identity(kanban_home, monkeypatch):
+    """Archive retains tracking rather than signalling or untracking a recycled PID."""
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="x", assignee="a")
+        assert kb.claim_task(conn, task_id) is not None
+        kbd._set_worker_pid(conn, task_id, os.getpid())
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+        monkeypatch.setattr(kbd, "_pid_recycled", lambda _pid, _started_at: True)
+        signals = []
+
+        assert kb.archive_task(
+            conn, task_id, signal_fn=lambda pid, sig: signals.append((pid, sig)),
+        ) is False
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running" and task.worker_pid == os.getpid()
+        assert signals == []
+        deferred = next(
+            event for event in kb.list_events(conn, task_id) if event.kind == "reclaim_deferred"
+        )
+        assert deferred.payload is not None
+        assert deferred.payload["pid_recycled"] is True
+        assert deferred.payload["tree_snapshot_failed"] is True
+
+
 def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
     """A never-claimed (``triage``/``ready``/``done``) task has no live worker:
     ``archive_task`` must not signal anything, and no termination event is

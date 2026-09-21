@@ -124,6 +124,26 @@ def test_tree_kill_refuses_recycled_root_and_descendant_identities(monkeypatch):
     assert [argv[2] for argv in calls] == [str(root)]
 
 
+def test_tree_kill_holds_unreadable_live_descendant_without_signalling_it(monkeypatch):
+    """A live child with an unreadable identity blocks release but is never killed by bare PID."""
+    root, child = 71_101, 71_102
+    calls = []
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(kbd, "_pid_recycled", lambda _pid, _started_at: False)
+    monkeypatch.setattr(kbd, "_snapshot_worker_descendants", lambda _pid: ({child: "epoch|child"}, True))
+    monkeypatch.setattr(kbd, "_worker_alive", lambda _pid, _started_at: False)
+    monkeypatch.setattr(kbd, "_poll_descendant_exit", lambda _descendants: [child])
+    monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: None)
+
+    result = kbd._terminate_reclaimed_worker(
+        root, f"{kb._host_prefix()}lock", started_at="epoch|root",
+        signal_fn=lambda pid, sig: calls.append((pid, sig)),
+    )
+
+    assert result["terminated"] is False
+    assert result["surviving_descendant_pids"] == [child]
+    assert [pid for pid, _sig in calls] == [root]
+
 def test_max_runtime_failed_kill_holds_claim_with_retryable_diagnostic(isolated_board, monkeypatch):
     """A no-op signal hook cannot release a claim beside the still-live worker."""
     task_id = _overdue_claim(isolated_board, os.getpid())
