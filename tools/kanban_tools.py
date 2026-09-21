@@ -1,4 +1,4 @@
-"""Kanban tools — structured tool-call surface for worker + orchestrator agents.
+"""Kanban tools - structured tool-call surface for worker + orchestrator agents.
 
 Registered only under the dispatcher (``HERMES_KANBAN_TASK`` set) or when the profile
 enables the ``kanban`` toolset. Tools rather than ``hermes kanban`` shell-outs: they run
@@ -23,7 +23,7 @@ from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
-    KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
+    KANBAN_LIST_SCHEMA, KANBAN_STATUS_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
     KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
 
 logger = logging.getLogger(__name__)
@@ -76,7 +76,7 @@ def _is_delegated_child_context() -> bool:
 
 def _is_dispatcher_owned_worker() -> bool:
     """False for delegate_task children AND for cron jobs fired in-process from
-    a worker — i.e. whenever HERMES_KANBAN_* is present but not ours."""
+    a worker - i.e. whenever HERMES_KANBAN_* is present but not ours."""
     return _delegation_ctx("is_dispatcher_owned_worker_context", True)
 
 
@@ -428,7 +428,7 @@ def _goal_judge_available() -> bool:
 _GOAL_GATE_MESSAGES = {
     "kanban_complete": {
         "blocked": (
-            "Goal completion rejected: judge ruled the goal unachievable — {reason}. The task "
+            "Goal completion rejected: judge ruled the goal unachievable - {reason}. The task "
             "will NOT complete silently. Either re-scope the task with kanban_edit, or record "
             "the block with kanban_block and hand the decision to a human / reviewer."),
         "continue": (
@@ -437,7 +437,7 @@ _GOAL_GATE_MESSAGES = {
             "create continuation tasks with parents=[{tid}] and keep this task alive.")},
     "kanban_request_review": {
         "blocked": (
-            "Goal review handoff rejected: judge ruled the goal unachievable — {reason}. "
+            "Goal review handoff rejected: judge ruled the goal unachievable - {reason}. "
             "Record the block with kanban_block instead of requesting review."),
         "continue": (
             "Goal review handoff rejected by judge: {reason}. Provide acceptance evidence "
@@ -491,7 +491,7 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str) -> None:
 # board's ``last_heartbeat_at`` columns to reflect that liveness so the dispatcher watchdog (which reads
 # ``tasks.last_heartbeat_at``, not the agent's in-process timestamp) doesn't reclaim an actively-running
 # worker as stale. The model is not required to call the explicit ``kanban_heartbeat`` tool for this to work
-# — that tool stays available for workers that want to attach a note or pre-emptively extend a claim across
+# - that tool stays available for workers that want to attach a note or pre-emptively extend a claim across
 # a known-long op. Constraints: - Best-effort: never raise. The agent loop must not care if the bridge fails
 # (board missing, DB locked, etc.). - Rate-limited to one DB write per 60s per-process; runtime activity can
 # tick on every chunk/tool result and we don't need that resolution. - No-op outside dispatcher-spawned
@@ -651,6 +651,20 @@ def _handle_list(args: dict, **kw) -> str:
             "promoted": promoted})
 
 
+@_kanban_handler("kanban_status")
+def _handle_status(args: dict, **kw) -> str:
+    """Read a bounded board snapshot without any recompute or migration write."""
+    from hermes_cli.kanban_status_readonly import snapshot_for_board
+
+    raw_open = args.get("open_limit")
+    raw_completed = args.get("completed_limit")
+    open_limit = 10 if raw_open is None else int(raw_open)
+    completed_limit = 5 if raw_completed is None else int(raw_completed)
+    return json.dumps(snapshot_for_board(
+        args.get("board"), open_limit=open_limit, completed_limit=completed_limit,
+    ), ensure_ascii=True)
+
+
 @_kanban_handler("kanban_complete")
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
@@ -672,7 +686,7 @@ def _handle_complete(args: dict, **kw) -> str:
     with _board(args.get("board")) as (kb, conn):
         # Goal-mode pre-completion judge gate (Issue #38367). Prevent workers from bypassing the auxiliary
         # judge by calling kanban_complete before acceptance criteria are met. Only enforce when a judge is
-        # actually reachable — see _goal_judge_available for why an unavailable judge fails open.
+        # actually reachable - see _goal_judge_available for why an unavailable judge fails open.
         task = kb.get_task(conn, tid)
         _goal_gate("kanban_complete", task, tid, (summary or result or "").strip())
         try:
@@ -680,10 +694,10 @@ def _handle_complete(args: dict, **kw) -> str:
                 conn, tid, result=result, summary=summary, metadata=metadata,
                 created_cards=created_cards, expected_run_id=_worker_run_id(tid))
         except kb.ArtifactPreservationError as artifact_err:
-            # Structured rejection — surface the phantom ids so the worker can retry with a corrected list
+            # Structured rejection - surface the phantom ids so the worker can retry with a corrected list
             # or drop the field. Audit event already landed in the DB. The task itself was NOT mutated (the
             # gate runs before the write txn), so the worker can simply call kanban_complete again. Spell
-            # that out — without it the model often interprets a tool_error as a terminal failure and either
+            # that out - without it the model often interprets a tool_error as a terminal failure and either
             # blocks or crashes the run instead of retrying. See #22923.
             return tool_error(
                 f"kanban_complete could not preserve the declared artifacts: {artifact_err}. "
@@ -742,7 +756,7 @@ def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
     tid = _worker_guard("kanban_block", args)
     reason = _redact(
-        _require_text(args, "reason", "reason is required — explain what input you need"))
+        _require_text(args, "reason", "reason is required - explain what input you need"))
     kind = args.get("kind")
     with _board(args.get("board")) as (kb, conn):
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
@@ -751,7 +765,7 @@ def _handle_block(args: dict, **kw) -> str:
         # would be an escape hatch around the completion judge: goal_mode tasks
         # may only block on genuine external blockers.
         # Goal-mode block gate (Issue #38696, sibling of the kanban_complete judge gate in #38367).
-        # kanban_block is a second exit path out of the goal loop — run_kanban_goal_loop() treats ANY
+        # kanban_block is a second exit path out of the goal loop - run_kanban_goal_loop() treats ANY
         # `blocked` status as terminal, identically to `done`, regardless of kind. Without this, a worker
         # that learns kanban_complete is gated can just call kanban_block(reason="anything") to escape the
         # loop instead. Restrict goal_mode tasks to the kinds that represent a genuine external blocker the
@@ -761,7 +775,7 @@ def _handle_block(args: dict, **kw) -> str:
         _check(not (task and task.goal_mode and kind not in _GOAL_MODE_BLOCK_ALLOWED_KINDS),
                f"goal_mode tasks can only block with kind in "
                f"{sorted(_GOAL_MODE_BLOCK_ALLOWED_KINDS)} (got {kind!r}). If the task is actually "
-               f"finished or cannot proceed for another reason, call kanban_complete instead — "
+               f"finished or cannot proceed for another reason, call kanban_complete instead - "
                f"the completion judge will evaluate it.")
         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
@@ -783,7 +797,7 @@ def _handle_request_review(args: dict, **kw) -> str:
     """Move implementation into the first-class review phase."""
     tid = _worker_guard("kanban_request_review", args)
     summary = _redact(_require_text(
-        args, "summary", "summary is required — describe what was implemented and how it "
+        args, "summary", "summary is required - describe what was implemented and how it "
         "was verified so the reviewer has context"))
     metadata = args.get("metadata")
     _require_dict_metadata(metadata)
@@ -812,7 +826,7 @@ def _handle_request_review(args: dict, **kw) -> str:
                 expected_run_id=_worker_run_id(tid), with_reason=True)
         except kb.ArtifactPreservationError as artifact_err:
             # Same contract as kanban_complete (#22923): the transition rolled
-            # back, the task is untouched and retryable — say so explicitly or
+            # back, the task is untouched and retryable - say so explicitly or
             # the model treats the tool_error as terminal.
             return tool_error(
                 f"kanban_request_review could not preserve the declared artifacts: {artifact_err}. "
@@ -829,7 +843,7 @@ def _handle_request_changes(args: dict, **kw) -> str:
     """Return a reviewer-owned running task to its implementer."""
     tid = _worker_guard("kanban_request_changes", args)
     reason = _redact(
-        _require_text(args, "reason", "reason is required — describe the changes needed"))
+        _require_text(args, "reason", "reason is required - describe the changes needed"))
     with _board(args.get("board")) as (kb, conn):
         ok, detail = kb.request_changes(
             conn, tid, reason=reason, expected_run_id=_worker_run_id(tid))
@@ -860,14 +874,14 @@ def _handle_comment(args: dict, **kw) -> str:
     _reject_delegated_child_mutation("kanban_comment")
     tid = args.get("task_id")
     _check(tid, "task_id is required (use the current task id if that's what "
-                "you mean — pulls from env but kept explicit here)")
+                "you mean - pulls from env but kept explicit here)")
     body = _redact(_require_text(args, "body"))
     # Author comes from the worker's runtime identity, never caller args: comments are
     # injected into future workers' system prompts, so an args["author"] override could
-    # forge a directive from ``hermes-system``. Cross-task commenting stays unrestricted —
+    # forge a directive from ``hermes-system``. Cross-task commenting stays unrestricted -
     # it is the handoff channel between tasks.
     # Comments are injected into the next worker's system prompt by ``build_worker_context`` as
-    # ``**{author}** (timestamp): {body}`` — accepting an ``args["author"]`` override let a worker forge a
+    # ``**{author}** (timestamp): {body}`` - accepting an ``args["author"]`` override let a worker forge a
     # comment from an authoritative-looking name like ``hermes-system`` and poison the future-worker context
     # with what reads as a system directive. See #19713.
     author = os.environ.get("HERMES_PROFILE") or "worker"
@@ -1000,7 +1014,7 @@ def _handle_create(args: dict, **kw) -> str:
     _reject_delegated_child_mutation("kanban_create")
     title = _require_text(args, "title")
     assignee = args.get("assignee")
-    _check(assignee, "assignee is required — name the profile that should execute this "
+    _check(assignee, "assignee is required - name the profile that should execute this "
                      "task (the dispatcher will only spawn tasks with an assignee)")
     # Workspace sharing is always explicit: omitted fields mean a fresh scratch workspace
     # even for a dispatcher-spawned creator (reusing the parent's path would let a child
@@ -1116,7 +1130,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     try:
         target = _resolve_notify_target()
         if target is None:
-            return False  # CLI / cron / test — no persistent channel
+            return False  # CLI / cron / test - no persistent channel
         from hermes_cli import kanban_db_notify as _kbn
         # Inheritance and explicit subscriptions already encode the delivery policy.
         # Auto-subscribe must not turn a passive destination into an agent wake.
@@ -1167,10 +1181,11 @@ def _handle_link(args: dict, **kw) -> str:
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
-_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock"})
+_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_status", "kanban_unblock"})
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
+    ("kanban_status", KANBAN_STATUS_SCHEMA, _handle_status, "📊"),
     ("kanban_complete", KANBAN_COMPLETE_SCHEMA, _handle_complete, "✔"),
     ("kanban_block", KANBAN_BLOCK_SCHEMA, _handle_block, "⏸"),
     ("kanban_request_review", KANBAN_REQUEST_REVIEW_SCHEMA, _handle_request_review, "👀"),

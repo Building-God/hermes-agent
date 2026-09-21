@@ -43,7 +43,7 @@ def _schema(name: str, description: str, properties: dict[str, Any], required: l
 KANBAN_SHOW_SCHEMA = _schema(
     "kanban_show",
     (
-        "Read a task's full state — title, body, assignee, parent task "
+        "Read a task's full state - title, body, assignee, parent task "
         "handoffs, your prior attempts on this task if any, comments, "
         "and recent events. Use this to (re)orient yourself before "
         "starting work, especially on retries. The response includes a "
@@ -65,7 +65,7 @@ KANBAN_LIST_SCHEMA = _schema(
         "with ids, title, status, assignee, priority, parent/child ids, and "
         "counts. Bounded to 50 rows by default, 200 max, with truncation "
         "metadata. Also recomputes ready tasks before listing, matching the "
-        "CLI. Orchestrator-only — dispatcher-spawned task workers never see "
+        "CLI. Orchestrator-only - dispatcher-spawned task workers never see "
         "this tool."
     ),
     {
@@ -85,6 +85,23 @@ KANBAN_LIST_SCHEMA = _schema(
     [],
 )
 
+KANBAN_STATUS_SCHEMA = _schema(
+    "kanban_status",
+    (
+        "Answer an operator's 'what is happening?' question from a bounded, "
+        "read-only board snapshot. Includes open/done counts, open task titles "
+        "and event/checkpoint times, preserved-result sources, and notifier "
+        "cursor state. Heartbeats mean liveness, not useful progress; a settled "
+        "notifier cursor does not prove platform delivery or human receipt. "
+        "Does not return task bodies, comments, run prose, or log content."
+    ),
+    {
+        "open_limit": _prop("integer", "Maximum open tasks returned (default 10, max 100)."),
+        "completed_limit": _prop("integer", "Maximum recent results returned (default 5, max 20)."),
+    },
+    [],
+)
+
 KANBAN_COMPLETE_SCHEMA = _schema(
     "kanban_complete",
     (
@@ -95,7 +112,7 @@ KANBAN_COMPLETE_SCHEMA = _schema(
         "tests_run, decisions, findings, etc). At least one of "
         "``summary`` or ``result`` is required. If you created new "
         "tasks via ``kanban_create`` during this run, list their ids "
-        "in ``created_cards`` — the kernel verifies them so phantom "
+        "in ``created_cards`` - the kernel verifies them so phantom "
         "references are caught before they leak into downstream "
         "automation. If you produced local deliverable files (charts, PDFs, "
         "spreadsheets, generated images), list their absolute paths "
@@ -114,7 +131,7 @@ KANBAN_COMPLETE_SCHEMA = _schema(
         )),
         "metadata": _prop("object", (
                 "Free-form dict of structured facts about this "
-                "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
+                "attempt - {\"changed_files\": [...], \"tests_run\": 12, "
                 "\"findings\": [...]}. Surfaced to downstream "
                 "workers alongside ``summary``."
         )),
@@ -135,7 +152,7 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "id blocks the completion with an error listing "
                 "what went wrong (auditable in the task's events). "
                 "Only list ids you got back from a successful "
-                "``kanban_create`` call — do not invent or "
+                "``kanban_create`` call - do not invent or "
                 "remember ids from prose. Omit the field if you "
                 "did not create any cards."
             ),
@@ -145,7 +162,7 @@ KANBAN_COMPLETE_SCHEMA = _schema(
             "items": {"type": "string"},
             "description": (
                 "Optional list of absolute paths to deliverable "
-                "files you produced during this run — generated "
+                "files you produced during this run - generated "
                 "charts, PDFs, spreadsheets, images, archives. "
                 "Examples: [\"~/.hermes/cache/scratch/q3-revenue.png\", "
                 "\"~/.hermes/cache/scratch/report.pdf\"]. The gateway notifier "
@@ -169,14 +186,14 @@ KANBAN_BLOCK_SCHEMA = _schema(
     "kanban_block",
     (
         "Stop work on this task and route it according to WHY you're stuck. "
-        "Set ``kind`` to say which: 'dependency' (waiting on another task — "
+        "Set ``kind`` to say which: 'dependency' (waiting on another task - "
         "goes to todo and auto-resumes when that task finishes, no human "
         "needed), 'needs_input' (you need a human decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
         "no agent can do), or 'transient' (a flaky failure that may clear). "
         "``reason`` is shown to the human on the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
-        "auto-escalated to triage. Use for genuine blockers only — don't "
+        "auto-escalated to triage. Use for genuine blockers only - don't "
         "block on things you can resolve yourself."
     ),
     {
@@ -207,7 +224,7 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
         "verification are complete and you want a human (or reviewer) to "
         "look before it is marked done. Moves the task to the 'review' "
         "column and notifies the subscriber. Unlike ``kanban_block`` this is "
-        "NOT a blocker — it never counts toward unblock-loop detection, so a "
+        "NOT a blocker - it never counts toward unblock-loop detection, so a "
         "task can cycle through review across follow-ups without ever being "
         "falsely escalated to triage. Use this instead of blocking with a "
         "free-form 'review-required:' reason."
@@ -216,7 +233,7 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
         "summary": _prop("string", (
                 "What was implemented and how it was verified, in one or "
-                "two sentences — shown to the reviewer. Don't paste "
+                "two sentences - shown to the reviewer. Don't paste "
                 "the whole diff; the reviewer has the board and the PR."
         )),
         "reviewer": _prop("string", (
@@ -236,7 +253,7 @@ KANBAN_REQUEST_REVIEW_SCHEMA = _schema(
             "items": {"type": "string"},
             "description": (
                 "Optional list of absolute paths to deliverable "
-                "files this handoff names — generated charts, "
+                "files this handoff names - generated charts, "
                 "PDFs, spreadsheets, images, archives. Examples: "
                 "['~/.hermes/cache/scratch/q3-revenue.png', '~/.hermes/cache/scratch/report.pdf']. "
                 "A review handoff is the last implementer "
@@ -278,7 +295,7 @@ KANBAN_HEARTBEAT_SCHEMA = _schema(
         "Signal that you're still alive during a long operation "
         "(training, encoding, large crawls). Call every few minutes so "
         "humans see liveness separately from PID checks. Pure side "
-        "effect — no work changes."
+        "effect - no work changes."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
@@ -296,12 +313,12 @@ KANBAN_COMMENT_SCHEMA = _schema(
         "Append a comment to a task's thread. Use for durable notes "
         "that should outlive this run (questions for the next worker, "
         "partial findings, rationale). Ephemeral reasoning doesn't "
-        "belong here — use your normal response instead."
+        "belong here - use your normal response instead."
     ),
     {
         "task_id": _prop("string", (
                 "Task id. Required (may be your own task or "
-                "another's — comment threads are per-task)."
+                "another's - comment threads are per-task)."
         )),
         "body": _prop("string", "Markdown-supported comment body."),
     },
@@ -337,7 +354,7 @@ KANBAN_ATTACH_SCHEMA = _schema(
 KANBAN_ATTACH_URL_SCHEMA = _schema(
     "kanban_attach_url",
     (
-        "Attach a file to a task by URL — Hermes downloads it server-side "
+        "Attach a file to a task by URL - Hermes downloads it server-side "
         "and stores it as a real attachment (capped at 25 MB). Use when "
         "you have a link rather than the bytes. Only http/https URLs are "
         "accepted."
@@ -374,7 +391,7 @@ KANBAN_CREATE_SCHEMA = _schema(
     (
         "Create a new kanban task, optionally as a child of the current "
         "one (pass the current task id in ``parents``). Used by "
-        "orchestrator workers to fan out — decompose work into child "
+        "orchestrator workers to fan out - decompose work into child "
         "tasks with specific assignees, link them into a pipeline, "
         "then complete your own task. The dispatcher picks up the new "
         "tasks on its next tick and spawns the assigned profiles."
@@ -384,7 +401,7 @@ KANBAN_CREATE_SCHEMA = _schema(
         "assignee": _prop("string", (
                 "Profile name that should execute this task "
                 "(e.g. 'researcher-a', 'reviewer', 'writer'). "
-                "Required — tasks without an assignee are never "
+                "Required - tasks without an assignee are never "
                 "dispatched."
         )),
         "body": _prop("string", (
@@ -432,7 +449,7 @@ KANBAN_CREATE_SCHEMA = _schema(
         )),
         "triage": _prop("boolean", (
                 "If true, task lands in 'triage' instead of 'todo' "
-                "— a specifier profile is expected to flesh out "
+                "- a specifier profile is expected to flesh out "
                 "the body before work starts."
         )),
         "idempotency_key": _prop("string", (
@@ -462,7 +479,7 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "Skill names to force-load into the dispatched "
                 "worker. The kanban lifecycle is already injected "
                 "automatically; use this to pin a task to a specialist "
-                "context — e.g. ['translation'] for a translation "
+                "context - e.g. ['translation'] for a translation "
                 "task, ['github-code-review'] for a reviewer task. "
                 "The names must match skills installed on the "
                 "assignee's profile."
@@ -499,7 +516,7 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "Provider the 'model' belongs to (e.g. 'openrouter', "
                 "'anthropic', 'nous'). Set this whenever the model "
                 "is not from the assignee profile's configured "
-                "provider — a model name alone is resolved against "
+                "provider - a model name alone is resolved against "
                 "the profile's provider and will fail if it belongs "
                 "to a different one. Requires 'model'."
         )),
@@ -511,7 +528,7 @@ KANBAN_UNBLOCK_SCHEMA = _schema(
     "kanban_unblock",
     (
         "Unblock a Kanban task. It moves to ready when all parents are done, "
-        "or todo while any parent remains open. Orchestrator-only — only "
+        "or todo while any parent remains open. Orchestrator-only - only "
         "profiles with the kanban toolset can unblock routed work; "
         "dispatcher-spawned task workers never see this tool."
     ),

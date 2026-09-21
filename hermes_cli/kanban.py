@@ -1,6 +1,6 @@
-"""``hermes kanban …`` — dispatch (``kanban_command``), task-verb handlers, ``run_slash`` for ``/kanban``.
+"""``hermes kanban ...`` - dispatch (``kanban_command``), task-verb handlers, ``run_slash`` for ``/kanban``.
 DB work lives in ``kanban_db``; siblings: ``kanban_parser`` (argparse, re-exported ``build_parser``),
-``kanban_output`` (text/--json), ``kanban_boards`` (``boards …``), ``kanban_ops`` (dispatch/daemon/
+``kanban_output`` (text/--json), ``kanban_boards`` (``boards ...``), ``kanban_ops`` (dispatch/daemon/
 tail/watch/gc/repair).
 """
 
@@ -11,6 +11,7 @@ import contextlib
 import json
 import os
 import shlex
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -99,7 +100,7 @@ def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
 def _check_dispatcher_presence(hermes_home: Optional[Path] = None) -> tuple[bool, str]:
     """``(running, message)`` for the "will anything dispatch this?" warning: True when a gateway is
     alive for this HERMES_HOME with ``kanban.dispatch_in_gateway`` on, else False + human guidance.
-    Fails OPEN (probe/config errors -> ``(True, "")``) — a missed warning beats crying wolf.
+    Fails OPEN (probe/config errors -> ``(True, "")``) - a missed warning beats crying wolf.
     ``hermes_home`` scopes the probe to a profile dir (dashboard backend); CLI callers pass None.
 
     The dashboard plugin API passes it because the dashboard backend process can be running under a
@@ -114,7 +115,7 @@ def _check_dispatcher_presence(hermes_home: Optional[Path] = None) -> tuple[bool
         # aren't misreported; use_cache=False because this one-shot probe must see the state now.
         liveness = resolve_gateway_liveness(profile_dir=hermes_home, use_cache=False)
     except Exception:
-        return (True, "")  # can't probe — silent
+        return (True, "")  # can't probe - silent
     if liveness.probe_error:  # resolver swallows per-rung failures; "can't tell" != "no gateway"
         return (True, "")
     pid = liveness.pid
@@ -123,10 +124,10 @@ def _check_dispatcher_presence(hermes_home: Optional[Path] = None) -> tuple[bool
         return (True, f"gateway pid={pid}, dispatch enabled")
     if pid:
         return (False, "Gateway is running but kanban.dispatch_in_gateway=false in "
-                "config.yaml — the task will sit in 'ready' until you flip it "
+                "config.yaml - the task will sit in 'ready' until you flip it "
                 "back on and restart the gateway, OR run the legacy "
                 "standalone daemon (`hermes kanban daemon --force`).")
-    return (False, "No gateway is running — the task will sit in 'ready' until you "
+    return (False, "No gateway is running - the task will sit in 'ready' until you "
             "start it. Run:\n    hermes gateway start\n"
             "The gateway hosts an embedded dispatcher (tick interval 60s by "
             "default); your task will be picked up on the next tick after "
@@ -136,7 +137,7 @@ def _check_dispatcher_presence(hermes_home: Optional[Path] = None) -> tuple[bool
 # --- Command dispatch ---
 
 def kanban_command(args: argparse.Namespace) -> int:
-    """Entry point from ``hermes kanban …``; returns a shell-style exit code."""
+    """Entry point from ``hermes kanban ...``; returns a shell-style exit code."""
     action = getattr(args, "kanban_action", None)
     if not action:
         parser = getattr(args, "_kanban_parser", None)
@@ -152,7 +153,7 @@ def kanban_command(args: argparse.Namespace) -> int:
     if _is_delegated_child_cli_mutation(args):
         return _err("kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI")
 
-    # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
+    # `boards ...` manages board metadata and the current-board pointer itself, so it must ignore
     # the `--board` routing override (else `--board beta boards show` reports beta).
     if action == "boards":
         return _dispatch_boards(args)
@@ -168,7 +169,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             return _err(f"kanban: {exc}", 2)
         if not normed:
             return _err("kanban: --board requires a slug", 2)
-        # Boards other than 'default' must already exist — typoed slugs would otherwise silently
+        # Boards other than 'default' must already exist - typoed slugs would otherwise silently
         # create an empty board.
         if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
             return _err(f"kanban: board {normed!r} does not exist. "
@@ -180,6 +181,13 @@ def kanban_command(args: argparse.Namespace) -> int:
         # KanbanDbCorruptError, which would turn every repair into "could not initialize database".
         if action == "repair":
             return _cmd_repair(args)
+        # Status is observational. Do not let init_db create or migrate a board
+        # merely because somebody asked what is happening.
+        if action == "status":
+            try:
+                return _cmd_status(args)
+            except (ValueError, OSError, RuntimeError, sqlite3.Error) as exc:
+                return _err(f"kanban status: {exc}")
         # init_db is idempotent (one sqlite_master SELECT when tables exist) and prevents
         # "no such table: tasks" on first use from a fresh HERMES_HOME.
         try:
@@ -329,7 +337,7 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     if _json_out(args, data):
         return 0
     if not data:
-        print("(no assignees — create a profile with `hermes -p <name> setup`)")
+        print("(no assignees - create a profile with `hermes -p <name> setup`)")
         return 0
     print(f"{'NAME':20s}  {'ON DISK':8s}  COUNTS")
     for entry in data:
@@ -443,7 +451,7 @@ def _cmd_list(args: argparse.Namespace) -> int:
         all_boards = []
     if len(all_boards) > 1:
         other_count = len(all_boards) - 1
-        print(f"Board: {kb.get_current_board()} ({other_count} other board{'s' if other_count != 1 else ''} — "
+        print(f"Board: {kb.get_current_board()} ({other_count} other board{'s' if other_count != 1 else ''} - "
               f"`hermes kanban boards list`)\n")
     if not tasks:
         print("(no matching tasks)")
@@ -618,7 +626,7 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
         ok = kb.reassign_task(conn, args.task_id, profile, reclaim_first=reclaim, reason=getattr(args, "reason", None))
     return _ok_or_err(
         ok,
-        f"cannot reassign {args.task_id} (unknown id, or still running — pass --reclaim to release first)",
+        f"cannot reassign {args.task_id} (unknown id, or still running - pass --reclaim to release first)",
         f"Reassigned {args.task_id} to {profile or '(unassigned)'}" + (" (claim reclaimed)" if reclaim else ""),
     )
 
@@ -722,7 +730,7 @@ def _cmd_link(args: argparse.Namespace) -> int:
     print(f"Linked {args.parent_id} -> {args.child_id}")
     if gated:
         print(
-            f"Note: {args.child_id} was ready and is now todo — parent "
+            f"Note: {args.child_id} was ready and is now todo - parent "
             f"{args.parent_id} is not done yet. The ready -> running claim "
             f"re-checks parents, so the child only runs after the parent "
             f"completes; use `hermes kanban unlink {args.parent_id} {args.child_id}` "
@@ -841,7 +849,7 @@ def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
     See #100954.
     ``{"done", None}`` means the judge allows the handoff; anything else is a rejection whose verdict
     disambiguates the guidance the caller gives the worker (``continue`` = not done yet, ``blocked`` =
-    judged unachievable — see #100954).
+    judged unachievable - see #100954).
     """
     if task is None or not task.goal_mode:
         return ("done", None)
@@ -892,7 +900,7 @@ def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: 
     verdict, rejection = _goal_mode_handoff_rejection(kb.get_task(conn, tid), evidence)
     if verdict == "blocked":
         return (f"kanban: goal {handoff} of {tid} rejected: judge ruled "
-                f"the goal unachievable — {rejection}. {blocked_hint}")
+                f"the goal unachievable - {rejection}. {blocked_hint}")
     if rejection is not None:
         return f"kanban: goal {handoff} of {tid} rejected by judge: {rejection}. {continue_hint}"
     return None
@@ -1004,7 +1012,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 # Only a typed owner-input block carries a question for a human.
                 verdict = ("needs a human decision" if (landed.block_kind if landed else kind) == "needs_input"
                            else "orchestration attention needed")
-                return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
+                return f"{tid} → triage (unblock loop detected - {verdict}){suffix}"
             return f"Blocked {tid}{suffix}"
 
         op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
@@ -1214,7 +1222,7 @@ def _cmd_notify_unsubscribe(args: argparse.Namespace) -> int:
 def _cmd_log(args: argparse.Namespace) -> int:
     content = kb.read_worker_log(args.task_id, tail_bytes=args.tail)
     if content is None:
-        return _err(f"(no log for {args.task_id} — task may not have spawned yet)")
+        return _err(f"(no log for {args.task_id} - task may not have spawned yet)")
     sys.stdout.write(content)
     if not content.endswith("\n"):
         sys.stdout.write("\n")
@@ -1296,7 +1304,7 @@ def _run_triage_sweep(args: argparse.Namespace, verb: str, mod, run_one, json_ke
 
 
 def _retitled_suffix(outcome) -> str:
-    return f" — retitled: {outcome.new_title!r}" if outcome.new_title else ""
+    return f" - retitled: {outcome.new_title!r}" if outcome.new_title else ""
 
 
 def _cmd_specify(args: argparse.Namespace) -> int:
@@ -1323,9 +1331,20 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
                              ("task_id", "ok", "reason", "fanout", "child_ids", "new_title"), _decompose_ok_line)
 
 
+def _cmd_status(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_status_readonly import render_status, snapshot_for_board
+
+    snapshot = snapshot_for_board(
+        getattr(args, "board", None), open_limit=args.open_limit,
+        completed_limit=args.completed_limit,
+    )
+    print(json.dumps(snapshot, ensure_ascii=True) if args.json else render_status(snapshot))
+    return 0
+
+
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
-    "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
+    "list": _cmd_list, "ls": _cmd_list, "status": _cmd_status, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,
     "diagnostics": _cmd_diagnostics, "diag": _cmd_diagnostics,
@@ -1349,16 +1368,17 @@ _HANDLERS = {
 # --- Slash-command entry point (used by /kanban from CLI and gateway) ---
 
 _SLASH_KANBAN_HELP = """\
-**/kanban** — manage the shared task board.
+**/kanban** - manage the shared task board.
 
 Common subcommands:
   `list` (alias `ls`)   List tasks on the current board
+  `status`              Read-only open work and verified result availability
   `show <id>`           Task details + comments + events
   `stats`               Per-status / per-assignee counts
-  `create <title>…`     Create a task (auto-subscribes you to events)
+  `create <title>...`     Create a task (auto-subscribes you to events)
   `comment <id> <msg>`  Append a comment
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
-  `complete <id>…`      Mark task(s) done
+  `complete <id>...`      Mark task(s) done
   `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
@@ -1374,7 +1394,7 @@ Read-only commands are safe while an agent is running.\
 
 
 def run_slash(rest: str) -> str:
-    """Execute a ``/kanban …`` string (``rest`` = everything after ``/kanban``) and return captured
+    """Execute a ``/kanban ...`` string (``rest`` = everything after ``/kanban``) and return captured
     stdout/stderr. Shared by the interactive CLI and the gateway so formatting is identical."""
     import io
 

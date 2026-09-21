@@ -1,8 +1,8 @@
-"""Argparse tree for ``hermes kanban …`` (``build_parser``).
+"""Argparse tree for ``hermes kanban ...`` (``build_parser``).
 
-The subcommand tree is declared as data — one ``_cmd(...)`` record per
+The subcommand tree is declared as data - one ``_cmd(...)`` record per
 subcommand holding its ``add_parser`` kwargs and an ordered tuple of
-``add_argument`` specs — and materialised by ``_add_commands``. Order of
+``add_argument`` specs - and materialised by ``_add_commands``. Order of
 records and arguments is the order argparse renders in ``--help``.
 """
 
@@ -119,7 +119,7 @@ _BOARD_SPECS = [
     ], help="Export a board to a portable .tar.gz archive", description=(
         "Package a board's tasks, comments, links, history, and file attachments into one archive "
         "that can be imported on another machine. Claims, worker PIDs, chat subscriptions, and "
-        "paths belonging to this machine are stripped. Workspaces are never included — they are "
+        "paths belonging to this machine are stripped. Workspaces are never included - they are "
         "rebuilt on demand."
     )),
     _cmd("import", [
@@ -129,7 +129,7 @@ _BOARD_SPECS = [
         _json_flag(),
     ], help="Import a board archive as a new board", description=(
         "Import a .tar.gz produced by `hermes kanban boards export`. The board always lands as a "
-        "NEW board — the slug gains a numeric suffix if it is already taken — so an import can "
+        "NEW board - the slug gains a numeric suffix if it is already taken - so an import can "
         "never overwrite or merge into a board you already have."
     )),
 ]
@@ -142,7 +142,7 @@ _SPECS = [
          description=(
              "Boards let you separate unrelated streams of work (projects, repos, domains) into "
              "isolated queues. Each board has its own DB, workspaces directory, and dispatcher "
-             "loop — tasks on one board cannot collide with tasks on another. The first board is "
+             "loop - tasks on one board cannot collide with tasks on another. The first board is "
              "'default' and always exists."
          )),
     _cmd("create", [
@@ -165,7 +165,7 @@ _SPECS = [
         _TENANT,
         _PRIORITY,
         _arg("--triage", action="store_true",
-             help="Park in triage — a specifier will flesh out the spec and promote to todo"),
+             help="Park in triage - a specifier will flesh out the spec and promote to todo"),
         _arg("--idempotency-key",
              help="Dedup key. If a non-archived task with this key exists, "
                   "its id is returned instead of creating a duplicate."),
@@ -180,7 +180,7 @@ _SPECS = [
                   "translation --skill github-code-review"),
         _arg("--max-retries", type=int, metavar="N",
              help="Per-task override for the consecutive-failure "
-                  f"circuit breaker. Trip on the Nth failure — e.g. --max-retries 1 blocks on the "
+                  f"circuit breaker. Trip on the Nth failure - e.g. --max-retries 1 blocks on the "
                   f"first failure (no retries), --max-retries 3 allows two retries. Omit to use "
                   f"the dispatcher's kanban.failure_limit config (default "
                   f"{kb.DEFAULT_FAILURE_LIMIT})."),
@@ -234,6 +234,13 @@ _SPECS = [
         _arg("--step-key", dest="current_step_key", metavar="KEY",
              help="Restrict to tasks with this current_step_key"),
     ], aliases=["ls"], help="List tasks"),
+    _cmd("status", [
+        _arg("--open-limit", type=int, default=10, metavar="N",
+             help="Maximum open tasks to show (1-100; default 10)"),
+        _arg("--completed-limit", type=int, default=5, metavar="N",
+             help="Maximum recent results to show (1-20; default 5)"),
+        _json_flag(help="Emit the bounded read-only status snapshot as JSON"),
+    ], help="Read-only operator status: open work, result evidence, notification caveats"),
     _cmd("show", [_TASK_ID, _json_flag(), *_run_state_args("filter listed runs by task_runs column")],
          help="Show a task with comments + events"),
     _cmd("assign", [_TASK_ID, _arg("profile", help="Profile name (or 'none' to unassign)")],
@@ -317,23 +324,23 @@ _SPECS = [
         _bulk_ids("schedule"),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
-        _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
+        _reason("Optional reason/note - recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
     _cmd("request-review", [
         _TASK_ID,
-        _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),
+        _arg("--summary", help="What was implemented and how it was verified - shown to the reviewer."),
         _arg("--reviewer", help="Optional reviewer profile; reassigns the task before review dispatch."),
         _arg("--metadata", help="JSON object with structured reviewer handoff facts."),
         _arg("--force", action="store_true",
              help="Override the live-claim guard: move a running, claimed "
                   "task to review even without owning its run (clears the worker's claim)."),
-    ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
+    ], help="Move a task to 'review' (implementation done, awaiting review) - NOT a block"),
     _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
          help="Reviewer verdict: return the active review run to its implementer"),
     _cmd("reopen-review", [
         _TASK_IDS,
-        _reason("Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons."),
+        _reason("Optional reason/note - recorded as a comment before reopening. Quote multi-word reasons."),
     ], help="Send one or more review tasks back for changes (review -> ready/todo)"),
     _cmd("promote", [
         _TASK_ID,
@@ -365,7 +372,7 @@ _SPECS = [
         # Escape hatch for hosts that truly cannot run the gateway; hidden from
         # --help so nobody casually keeps the double-dispatcher pattern alive.
         _arg("--force", action="store_true", help=argparse.SUPPRESS),
-    ], help="DEPRECATED — dispatcher now runs in the gateway. Use `hermes gateway start`."),
+    ], help="DEPRECATED - dispatcher now runs in the gateway. Use `hermes gateway start`."),
     _cmd("watch", [
         _arg("--assignee", help="Only show events for tasks assigned to this profile"),
         _arg("--tenant", help="Only show events from tasks in this tenant"),
@@ -433,7 +440,7 @@ _SPECS = [
              "Runs PRAGMA integrity_check on the board's DB and reports the result. When the "
              "failure consists only of index-scoped errors ('wrong # of entries in index <name>' / "
              "'row N missing from index <name>'), the corrupt file is quarantined to a "
-             ".corrupt.<hash>.bak sibling first and the damaged indexes are rebuilt with REINDEX — "
+             ".corrupt.<hash>.bak sibling first and the damaged indexes are rebuilt with REINDEX - "
              "the same narrow auto-repair the connect-time guard applies. Any other corruption "
              "class is reported and left untouched (fail-closed). Exits 0 when the DB is healthy "
              "or was repaired, non-zero when it is still corrupt."
