@@ -875,9 +875,9 @@ async def test_gateway_autosubscribe_roundtrips_user_id_alt_for_session_key(
 
 @pytest.mark.asyncio
 async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_path, monkeypatch):
-    """Missing artifact paths are silently skipped — they may have been
-    referenced by name only. The notifier must not crash and must still
-    deliver any artifacts that do exist."""
+    """Missing legacy artifact references are skipped, while existing files
+    are delivered. Explicit worker artifacts are a stricter completion
+    contract and must not contain missing paths."""
     import hermes_cli.kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from hermes_cli import kanban_db_notify as kbn
@@ -909,7 +909,10 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
     try:
         kt._handle_complete({
             "summary": "one real, one ghost",
-            "artifacts": [str(real_pdf), "/tmp/definitely-does-not-exist.pdf"],
+            # Historical metadata is best-effort. The top-level artifacts
+            # argument is a strict preservation contract and would reject
+            # this missing path before a notification event exists.
+            "metadata": {"artifacts": [str(real_pdf), "/tmp/definitely-does-not-exist.pdf"]},
         })
     finally:
         os.environ.pop("HERMES_KANBAN_TASK", None)
