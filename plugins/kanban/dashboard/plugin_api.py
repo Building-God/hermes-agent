@@ -605,8 +605,14 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     if s == "archived":
         ok = kanban_db.archive_task(conn, task_id)
     else:
-        with _map_errors(400, _StatusRejected, ValueError):
-            ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
+        # A parent reopen with a running descendant is a deliberate safety
+        # refusal, not an internal error: the dashboard must tell the operator
+        # to let the owning worker finish/reclaim before retrying.
+        try:
+            with _map_errors(400, _StatusRejected, ValueError):
+                ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
+        except RuntimeError as exc:
+            raise _conflict(str(exc))
         if s == "review" and ok and review_assignee_deferred and not payload.assignee:
             ok = kanban_db.assign_task(conn, task_id, None)
     if ok:
@@ -703,7 +709,10 @@ def _parents_blocking_ready(conn: sqlite3.Connection, task_id: str) -> list:
 def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) -> bool:
     """Direct status write for drag-drop moves without a structured verb (todo<->ready,
     running<->ready) + a ``status`` event. Leaving ``running`` closes the run as 'reclaimed'
-    so attempt history isn't orphaned; the worker is killed only AFTER the txn commits."""
+    only after its pre-transaction fence confirms the worker tree exited. Reopening
+    a completed parent refuses when any descendant is running, so this rollbackable
+    transaction never signals an independently owned worker.
+    """
     terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
     # Capture and fence a dashboard-owned running worker before opening the
     # status transaction. A failed termination leaves its running claim intact.

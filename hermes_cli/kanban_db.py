@@ -3975,19 +3975,20 @@ def invalidate_descendants_for_parent_reopen(
     Composes under the caller's txn (``allow_nested=True``) so the flip and the
     retractions commit atomically. Each descendant gets a
     ``descendant_invalidated`` event, the legacy ``status`` event the live feed
-    renders, and a comment naming the ancestor. Running descendants are closed
-    ``reclaimed`` and their workers killed strictly post-commit (audit trail
-    before death) — when composed, the CALLER must drain ``terminations``
-    after its own commit. ``consecutive_failures`` resets (deliberate operator
-    action), the opposite of :func:`reopen_review_task`.
+    renders, and a comment naming the ancestor. A running descendant refuses the
+    whole reopen: an operator cannot safely stop an independently owned worker
+    inside this rollbackable composed transaction. Its owner must finish or
+    explicitly reclaim it through the normal fence path, then retry the reopen.
+    ``consecutive_failures`` resets (deliberate operator action), the opposite
+    of :func:`reopen_review_task`.
 
     Returns ``{"invalidated": [{id, prior_status, new_status, resume_status}],
-    "terminations": [(worker_pid, claim_lock, worker_started_at)]}``.
+    "terminations": []}``. Raises ``RuntimeError`` when a live descendant makes
+    the reopen unsafe; callers already composing the parent flip must let that
+    exception roll their transaction back.
     """
-    caller_owns_txn = bool(conn.in_transaction)
     now = int(time.time())
     invalidated: list[dict[str, Any]] = []
-    terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
     with write_txn(conn, allow_nested=True):
         rows = conn.execute(
             """
@@ -4014,24 +4015,15 @@ def invalidate_descendants_for_parent_reopen(
             if previous_status == "review":
                 resume_status = "review"
             elif previous_status == "running":
-                resume_status = _retry_status_for_run(conn, row["id"], row["current_run_id"])
-                # The identity is still on the row while this fence runs. If it
-                # cannot be proved gone, retain the running claim and omit this
-                # descendant from the invalidation rather than creating an
-                # untracked, dispatchable overlap.
-                fenced, termination = _fence_running_release(
-                    conn, row["id"], row, reason="ancestor_reopen_worker_tree_alive",
-                )
-                if not fenced:
-                    # Abort the enclosing parent+descendant transaction: a
-                    # reopened parent with a still-running dependent is not a
-                    # valid atomic invalidation. The original running claim
-                    # remains tracked and non-dispatchable after rollback.
-                    raise RuntimeError("cannot reopen ancestor while a descendant worker tree survives")
-                terminations.append((row["worker_pid"], row["claim_lock"], row["worker_started_at"]))
-                run_id = _end_run(
-                    conn, row["id"], outcome="reclaimed", status="todo",
-                    summary=f"ancestor {task_id} reopened",
+                # Never signal an independently owned worker from this composed
+                # parent-reopen transaction.  A successful external stop followed
+                # by a rollback would leave a false running claim; an uncertain
+                # stop cannot safely become dispatchable either.  The owner must
+                # finish or reclaim the run through its normal durable fence.
+                raise RuntimeError(
+                    "cannot reopen ancestor while descendant "
+                    f"{row['id']} is running; wait for its owner to finish or "
+                    "reclaim it through the worker stop path, then retry"
                 )
             # consecutive_failures = 0: deliberate operator reset — see
             # docstring for why this diverges from reopen_review_task.
@@ -4065,9 +4057,9 @@ def invalidate_descendants_for_parent_reopen(
                 f"(will resume via '{resume_status}').", now,
             )
             invalidated.append(entry)
-    # Running descendants were already fenced before their tracking was cleared.
-    # ``terminations`` is retained as an auditable snapshot for composed callers.
-    return {"invalidated": invalidated, "terminations": terminations}
+    # A running descendant is deliberately refused by the composed invalidator:
+    # it must be stopped by its owning lifecycle before this parent can reopen.
+    return {"invalidated": invalidated, "terminations": []}
 
 
 def specify_triage_task(

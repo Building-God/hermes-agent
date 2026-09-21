@@ -6,9 +6,8 @@ assumed its result" (M3). These tests pin:
 
 * done descendants are demoted to ``todo`` with a ``descendant_invalidated``
   event AND a comment naming the ancestor (non-silent),
-* running descendants have their audit trail committed BEFORE their worker
-  is terminated, and the kill routes through ``_terminate_reclaimed_worker``
-  (the same helper the reclaim paths use),
+* running descendants refuse the reopen without calling the worker terminator:
+  the task owner must finish or use the normal reclaim lifecycle before retry,
 * ``consecutive_failures`` resets to 0 (deliberate operator action —
   opposite of the review-loop rule pinned in M2), and
 * the dashboard ``_set_status_direct`` reopen path and the DB function
@@ -91,14 +90,15 @@ def test_reopen_demotes_done_descendants_with_events_and_comments(conn):
     assert result["terminations"] == []
 
 
-def test_running_descendant_event_precedes_termination_via_reclaim_helper(
-    conn, tmp_path, monkeypatch,
+def test_running_descendant_refuses_composed_reopen_without_stop_or_defer(
+    conn, monkeypatch,
 ):
-    """Pin composed transaction atomicity, not global worker-tree containment.
+    """A rollbackable ancestor reopen must not signal another worker's process.
 
-    The intentionally post-commit termination here remains a known M18 boundary:
-    a prepared pre-commit tree-fence receipt is required before ancestor reopen
-    or dashboard direct-status can be accepted as universally safe stop paths.
+    The caller transaction rolls back both the parent flip and any earlier
+    descendant changes. The live claim/PID remains tracked, no false
+    ``reclaim_deferred`` receipt is emitted, and the operator receives a retry
+    instruction rather than an untruthful automatic-stop outcome.
     """
     parent_id = kb.create_task(conn, title="ancestor", assignee="planner")
     assert kb.complete_task(conn, parent_id, result="done")
@@ -110,29 +110,38 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     kbd._set_worker_pid(conn, child_id, 424242)
 
     kills: list[tuple] = []
-
-    def fake_terminate(pid, claim_lock, started_at=None, **kwargs):
-        # The pre-release fence must receive the captured identity before the
-        # transition clears it; the durable invalidation event follows in the
-        # same state change.
-        kills.append((pid, claim_lock, started_at))
-        return {"terminated": True}
-
-    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
-
-    _reopen_parent_directly(conn, parent_id)
-    result = kb.invalidate_descendants_for_parent_reopen(
-        conn, parent_id, author="operator",
+    monkeypatch.setattr(
+        kb, "_terminate_reclaimed_worker",
+        lambda *args, **kwargs: kills.append(args) or {"terminated": True},
     )
 
-    assert kills and kills[0][0] == 424242
-    assert result["terminations"] == kills
+    with pytest.raises(RuntimeError, match="reclaim it through the worker stop path"):
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'todo', completed_at = NULL WHERE id = ?",
+                (parent_id,),
+            )
+            kb.invalidate_descendants_for_parent_reopen(conn, parent_id, author="operator")
+
+    parent = kb.get_task(conn, parent_id)
     child = kb.get_task(conn, child_id)
-    assert child is not None
-    assert child.status == "todo"
-    assert child.current_run_id is None
-    run = kb.latest_run(conn, child_id)
-    assert run is not None and run.outcome == "reclaimed"
+    assert parent is not None and parent.status == "done"
+    assert child is not None and child.status == "running"
+    assert child.claim_lock == claimed.claim_lock and child.worker_pid == 424242
+    assert kills == []
+    assert not [e for e in kb.list_events(conn, child_id) if e.kind == "reclaim_deferred"]
+
+    # After the owner finishes, retrying the same reopen is safe and succeeds.
+    assert kb.complete_task(conn, child_id, result="owner finished", expected_run_id=claimed.current_run_id)
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'todo', completed_at = NULL WHERE id = ?",
+            (parent_id,),
+        )
+        result = kb.invalidate_descendants_for_parent_reopen(conn, parent_id, author="operator")
+    assert {entry["id"] for entry in result["invalidated"]} == {child_id}
+    child = kb.get_task(conn, child_id)
+    assert child is not None and child.status == "todo"
 
 
 def test_counter_reset_on_invalidated_descendants(conn):

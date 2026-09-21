@@ -340,6 +340,27 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
         active_review = kb.claim_review_task(conn, child_id)
         assert active_review is not None
 
+    # A live review worker is owned by its review lifecycle; parent reopen does
+    # not terminate it in a composed transaction.
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{parent_id}",
+        json={"status": "ready"},
+    )
+    assert response.status_code == 409
+    assert "reclaim it through the worker stop path" in response.json()["detail"]
+
+    with kbc.connect() as conn:
+        parent = kb.get_task(conn, parent_id)
+        child = kb.get_task(conn, child_id)
+        assert parent is not None and parent.status == "done"
+        assert child is not None and child.status == "running"
+        assert kb.request_changes(
+            conn, child_id, reason="owner released review",
+            expected_run_id=active_review.current_run_id,
+        ) == (True, "reviewer")
+
+    # The owner has released the active review, so retrying the reopen can
+    # safely retract the now-inactive review and its downstream work.
     response = client.patch(
         f"/api/plugins/kanban/tasks/{parent_id}",
         json={"status": "ready"},
@@ -350,9 +371,9 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
         child = kb.get_task(conn, child_id)
         assert child is not None
         assert child.status == "todo"
-        reclaimed = kb.latest_run(conn, child_id)
-        assert reclaimed is not None
-        assert reclaimed.outcome == "reclaimed"
+        released = kb.latest_run(conn, child_id)
+        assert released is not None
+        assert released.outcome == "changes_requested"
         assert kb.claim_review_task(conn, child_id) is None
         assert not kb.complete_task(conn, child_id, summary="must not approve")
         grandchild = kb.get_task(conn, grandchild_id)
@@ -368,7 +389,15 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
     with kbc.connect() as conn:
         child = kb.get_task(conn, child_id)
         assert child is not None
-        assert child.status == "review"
+        assert child.status == "ready"
+        implementation = kb.claim_task(conn, child_id)
+        assert implementation is not None
+        assert kb.request_review(
+            conn,
+            child_id,
+            summary="approved after parent stabilized",
+            expected_run_id=implementation.current_run_id,
+        )
         review = kb.claim_review_task(conn, child_id)
         assert review is not None
         assert kb.complete_task(
@@ -406,6 +435,28 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
         f"/api/plugins/kanban/tasks/{parent_id}",
         json={"status": "ready"},
     )
+    assert response.status_code == 409
+    assert "reclaim it through the worker stop path" in response.json()["detail"]
+
+    with kbc.connect() as conn:
+        parent = kb.get_task(conn, parent_id)
+        child = kb.get_task(conn, child_id)
+        grandchild = kb.get_task(conn, grandchild_id)
+        assert parent is not None and parent.status == "done"
+        assert child is not None and child.status == "done"
+        assert grandchild is not None and grandchild.status == "running"
+        assert grandchild.current_run_id == grandchild_run.current_run_id
+        assert not [e for e in kb.list_events(conn, grandchild_id) if e.kind == "reclaim_deferred"]
+        assert kb.complete_task(
+            conn, grandchild_id, result="owner finished",
+            expected_run_id=grandchild_run.current_run_id,
+        )
+
+    # Once the descendant owner has safely finished, the operator can retry.
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{parent_id}",
+        json={"status": "ready"},
+    )
     assert response.status_code == 200, response.text
 
     with kbc.connect() as conn:
@@ -415,9 +466,6 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
         assert grandchild is not None and grandchild.status == "todo"
         assert grandchild.current_run_id is None
         assert kb.claim_task(conn, grandchild_id) is None
-        reclaimed = kb.latest_run(conn, grandchild_id)
-        assert reclaimed is not None
-        assert reclaimed.outcome == "reclaimed"
 
     response = client.patch(
         f"/api/plugins/kanban/tasks/{parent_id}",
