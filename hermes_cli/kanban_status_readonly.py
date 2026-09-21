@@ -133,6 +133,25 @@ def _worker_log_activity(task_id: str, board: str, active_started_at: int | None
     return {"last_write_at": _utc(stat.st_mtime), "size_bytes": stat.st_size}
 
 
+def _open_prerequisites(conn: sqlite3.Connection, task_id: str) -> dict:
+    """Bounded dependency state, without reading parent bodies or comments."""
+    rows = conn.execute(
+        "SELECT p.id, p.status FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+        "WHERE l.child_id=? AND p.status NOT IN ('done','archived') "
+        "ORDER BY p.id LIMIT 6", (task_id,),
+    ).fetchall()
+    prerequisites = []
+    for parent in rows[:5]:
+        item = {"id": parent["id"], "status": parent["status"]}
+        if parent["status"] == "blocked":
+            item["block_origin"] = _block_origin(conn, parent["id"])
+            item["human_action"] = (
+                "explicitly_requested" if item["block_origin"] == "needs_input" else "not_recorded"
+            )
+        prerequisites.append(item)
+    return {"tasks": prerequisites, "truncated": len(rows) > 5}
+
+
 def _task_row(conn: sqlite3.Connection, task: sqlite3.Row, *, completed: bool, board: str) -> dict:
     row = {
         "id": task["id"],
@@ -166,6 +185,8 @@ def _task_row(conn: sqlite3.Connection, task: sqlite3.Row, *, completed: bool, b
             row["human_action"] = (
                 "explicitly_requested" if row["block_origin"] == "needs_input" else "not_recorded"
             )
+        if task["status"] == "todo":
+            row["open_prerequisites"] = _open_prerequisites(conn, task["id"])
         if task["status"] == "running":
             row["worker_liveness"] = {
                 "last_heartbeat_at": _utc(task["active_last_heartbeat_at"]),
@@ -268,6 +289,19 @@ def render_status(snapshot: dict) -> str:
             origin = task.get("block_origin", "unknown")
             action = task.get("human_action", "not_recorded")
             lines.append(f"  Block origin: {origin}; human action: {action}.")
+        if task["status"] == "todo":
+            wait = task.get("open_prerequisites") or {}
+            parents = wait.get("tasks") or []
+            if parents:
+                labels = [
+                    f"{parent['id']} [{parent['status']}"
+                    + (f", {parent['block_origin']}, human action: {parent['human_action']}"
+                       if parent['status'] == 'blocked' else "")
+                    + "]"
+                    for parent in parents
+                ]
+                suffix = ", more not shown" if wait.get("truncated") else ""
+                lines.append(f"  Open prerequisites: {', '.join(labels)}{suffix}.")
         if task["status"] == "running":
             live = task.get("worker_liveness") or {}
             log = live.get("log") or {}

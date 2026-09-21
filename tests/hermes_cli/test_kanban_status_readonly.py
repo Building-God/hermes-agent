@@ -25,6 +25,7 @@ def board():
         CREATE TABLE task_comments (task_id TEXT, body TEXT, created_at INTEGER);
         CREATE TABLE task_runs (id INTEGER, task_id TEXT, summary TEXT, outcome TEXT,
             started_at INTEGER, last_heartbeat_at INTEGER);
+        CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
         CREATE TABLE task_attachments (task_id TEXT, filename TEXT, stored_path TEXT);
         CREATE TABLE kanban_notify_subs (task_id TEXT, last_event_id INTEGER,
             delivery_failures INTEGER, claim_token TEXT);
@@ -110,6 +111,38 @@ def test_only_typed_needs_input_is_explicit_human_action(board):
     assert item["block_origin"] == "needs_input"
     assert item["human_action"] == "explicitly_requested"
     assert "PRIVATE DETAIL" not in json.dumps(item)
+
+
+def test_todo_names_blocked_prerequisite_without_inventing_human_action(board):
+    from hermes_cli.kanban_status_readonly import render_status
+
+    _task(board, "t_parent", status="blocked")
+    _task(board, "t_child", status="todo")
+    board.execute("INSERT INTO task_links VALUES ('t_parent','t_child')")
+    board.execute("INSERT INTO task_events VALUES (10,'t_parent','gave_up',199,'{}')")
+    snapshot = build_snapshot(board, board="fixture")
+    child = next(task for task in snapshot["open_tasks"] if task["id"] == "t_child")
+    assert child["open_prerequisites"] == {
+        "tasks": [{"id": "t_parent", "status": "blocked",
+                   "block_origin": "automatic_failure", "human_action": "not_recorded"}],
+        "truncated": False,
+    }
+    rendered = render_status(snapshot)
+    assert "Open prerequisites: t_parent [blocked, automatic_failure, human action: not_recorded]" in rendered
+
+
+def test_todo_propagates_only_typed_human_prerequisite(board):
+    _task(board, "t_parent", status="blocked")
+    _task(board, "t_child", status="todo")
+    board.execute("INSERT INTO task_links VALUES ('t_parent','t_child')")
+    board.execute("INSERT INTO task_events VALUES (10,'t_parent','blocked',199,?)",
+                  ('{"kind":"needs_input","reason":"PRIVATE ASK"}',))
+    child = next(task for task in build_snapshot(board, board="fixture")["open_tasks"]
+                 if task["id"] == "t_child")
+    parent = child["open_prerequisites"]["tasks"][0]
+    assert parent["block_origin"] == "needs_input"
+    assert parent["human_action"] == "explicitly_requested"
+    assert "PRIVATE ASK" not in json.dumps(child)
 
 
 def test_running_separates_heartbeat_log_activity_and_runtime_cap(board, monkeypatch):
@@ -222,6 +255,7 @@ def test_status_tool_uses_read_only_board_and_rejects_mutation(tmp_path, monkeyp
             CREATE TABLE task_comments (task_id TEXT, body TEXT, created_at INTEGER);
             CREATE TABLE task_runs (id INTEGER, task_id TEXT, summary TEXT, outcome TEXT,
                 started_at INTEGER, last_heartbeat_at INTEGER);
+            CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
             CREATE TABLE task_attachments (task_id TEXT, filename TEXT);
             CREATE TABLE kanban_notify_subs (task_id TEXT, last_event_id INTEGER,
                 delivery_failures INTEGER, claim_token TEXT);
@@ -288,6 +322,7 @@ def test_snapshot_resolves_each_profile_home_without_cross_home_leak(tmp_path, m
         CREATE TABLE task_comments (task_id TEXT, body TEXT, created_at INTEGER);
         CREATE TABLE task_runs (id INTEGER, task_id TEXT, summary TEXT, outcome TEXT,
             started_at INTEGER, last_heartbeat_at INTEGER);
+        CREATE TABLE task_links (parent_id TEXT, child_id TEXT);
         CREATE TABLE task_attachments (task_id TEXT, filename TEXT);
         CREATE TABLE kanban_notify_subs (task_id TEXT, last_event_id INTEGER,
             delivery_failures INTEGER, claim_token TEXT);
