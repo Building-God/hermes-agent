@@ -886,6 +886,32 @@ def test_worker_cannot_complete_with_profile_cache_scratch_artifact(kanban_home,
         assert Path(attachments[0].stored_path).read_bytes() == stray.read_bytes()
 
 
+def test_worker_cannot_request_review_with_profile_cache_scratch_artifact(kanban_home, monkeypatch):
+    """Review handoff uses the same fail-closed artifact boundary."""
+    profile_scratch = kanban_home / "cache" / "scratch"
+    profile_scratch.mkdir(parents=True)
+    stray = profile_scratch / "draft.md"
+    stray.write_bytes(b"draft")
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="handoff source mapping")
+        workspace = kbw.resolve_workspace(kb.get_task(conn, task_id))
+        kbw.set_workspace_path(conn, task_id, workspace)
+        kb.claim_task(conn, task_id)
+        run_id = kb.get_task(conn, task_id).current_run_id
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+
+        with pytest.raises(kb.ArtifactPreservationError, match="not durable"):
+            kb.request_review(
+                conn, task_id, summary="ready for review",
+                metadata={"artifacts": [str(stray)]}, expected_run_id=run_id,
+            )
+        assert kb.get_task(conn, task_id).status == "running"
+        assert not kb.list_attachments(conn, task_id)
+        assert not any(e.kind == "review_requested" for e in kb.list_events(conn, task_id))
+        assert stray.read_bytes() == b"draft"
+
+
 def test_review_bound_handoff_preserves_declared_artifacts(kanban_home):
     """A review-bound card's declared files must outlive the reviewer's
     completion — that completion is what cleans the scratch workspace up."""
