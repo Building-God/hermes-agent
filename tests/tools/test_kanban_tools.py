@@ -96,6 +96,7 @@ def test_create_exposes_and_persists_bounded_retry_limit(worker_env):
         "title": "bounded child", "assignee": "test-worker", "max_retries": 1,
     }))
     assert created["ok"] is True
+    assert created["max_retries"] == 1
     with kbc.connect_closing() as conn:
         assert kb.get_task(conn, created["task_id"]).max_retries == 1
 
