@@ -890,6 +890,10 @@ class CheckpointCorruptionError(RuntimeError):
     """A stored checkpoint failed version, JSON-canonicality, or digest validation."""
 
 
+class UserOriginIdempotencyError(ValueError):
+    """A model idempotency key was reused for a different user request."""
+
+
 # --- Schema ---
 
 SCHEMA_SQL = """
@@ -1009,6 +1013,38 @@ CREATE TABLE IF NOT EXISTS task_comments (
     body       TEXT NOT NULL,
     created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS task_user_origins (
+    task_id    TEXT PRIMARY KEY,
+    platform   TEXT NOT NULL,
+    chat_id    TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    user_id    TEXT NOT NULL,
+    text       TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    UNIQUE (platform, chat_id, message_id, user_id)
+);
+
+CREATE TRIGGER IF NOT EXISTS task_user_origins_immutable_update
+BEFORE UPDATE ON task_user_origins
+BEGIN
+    SELECT RAISE(ABORT, 'task user origin is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS task_user_origins_immutable_delete
+BEFORE DELETE ON task_user_origins
+WHEN EXISTS (SELECT 1 FROM tasks WHERE id = OLD.task_id)
+BEGIN
+    SELECT RAISE(ABORT, 'task user origin is immutable while its task exists');
+END;
+
+-- A direct task-row delete must preserve the same privacy-purge contract as
+-- delete_archived_task: after its task is gone, delete immutable provenance.
+CREATE TRIGGER IF NOT EXISTS task_user_origins_purge_with_task
+AFTER DELETE ON tasks
+BEGIN
+    DELETE FROM task_user_origins WHERE task_id = OLD.id;
+END;
 
 CREATE TABLE IF NOT EXISTS task_events (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1249,6 +1285,31 @@ def _project_from_source_task(
     return project_obj, project_repo
 
 
+def _user_origin_values(origin: Any) -> tuple[str, str, str, str, str] | None:
+    """Validate a task-local gateway origin without importing gateway into DB code."""
+    if origin is None:
+        return None
+    platform, chat_id, message_id, user_id, text = (
+        str(getattr(origin, field, "") or "")
+        for field in ("platform", "chat_id", "message_id", "user_id", "text")
+    )
+    values = (platform, chat_id, message_id, user_id, text)
+    return values if all(values) else None
+
+
+def _origin_task_id(conn: sqlite3.Connection, origin: tuple[str, str, str, str, str]) -> str | None:
+    row = conn.execute(
+        "SELECT task_id, text FROM task_user_origins "
+        "WHERE platform = ? AND chat_id = ? AND message_id = ? AND user_id = ?",
+        origin[:4],
+    ).fetchone()
+    if row is None:
+        return None
+    if row["text"] != origin[4]:
+        raise UserOriginIdempotencyError("authenticated message identity conflicts with stored user request")
+    return row["task_id"]
+
+
 def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str]]:
     """Strip/dedupe a skills list. Commas are refused (a comma-joined string must
     not land in one argv slot); toolset names are rejected all at once because
@@ -1303,6 +1364,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    user_origin: Any = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1356,6 +1418,14 @@ def create_task(
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
+    origin = _user_origin_values(user_origin)
+
+    # A delivery replay is determined by its authenticated transport identity, not
+    # mutable model arguments. This lookup happens before idempotency-key reuse.
+    if origin:
+        existing_origin_task_id = _origin_task_id(conn, origin)
+        if existing_origin_task_id:
+            return existing_origin_task_id
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
@@ -1366,6 +1436,15 @@ def create_task(
             "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
         ).fetchone()
         if row:
+            if origin:
+                existing_origin = conn.execute(
+                    "SELECT platform, chat_id, message_id, user_id, text FROM task_user_origins WHERE task_id = ?",
+                    (row["id"],),
+                ).fetchone()
+                if (existing_origin is None or tuple(existing_origin) != origin):
+                    raise UserOriginIdempotencyError(
+                        "idempotency key is already bound to a different user request"
+                    )
             return row["id"]
 
     now = int(time.time())
@@ -1415,6 +1494,13 @@ def create_task(
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
                     ),
                 )
+                if origin:
+                    conn.execute(
+                        "INSERT INTO task_user_origins "
+                        "(task_id, platform, chat_id, message_id, user_id, text, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (task_id, *origin, now),
+                    )
                 for pid in parents:
                     _link(conn, pid, task_id)
                 _append_event(
@@ -1460,6 +1546,11 @@ def create_task(
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
+            # A concurrent replay may have won the unique authenticated-origin insert.
+            if origin:
+                existing_origin_task_id = _origin_task_id(conn, origin)
+                if existing_origin_task_id:
+                    return existing_origin_task_id
             if attempt == 1:
                 raise
     raise RuntimeError("unreachable")
@@ -4209,13 +4300,19 @@ def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
 
 
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete an ARCHIVED task (+ related rows); anything else must be
-    archived first so data loss takes two deliberate actions."""
+    """Privacy-purge an archived task and its provenance in one transaction.
+
+    Provenance is immutable while its task exists.  Once the archived task row
+    is gone, its authenticated origin is deleted before commit so a replay can
+    create a fresh, valid task rather than resolve a deleted id.
+    """
     with write_txn(conn):
         if _task_status(conn, task_id) != "archived":
             return False
         _delete_task_relations(conn, task_id)
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        # task_user_origins_purge_with_task removes immutable provenance in the
+        # same transaction, including for direct task-row deletes.
         return cur.rowcount == 1
 
 
@@ -4275,6 +4372,23 @@ def schedule_task(
 
 # --- Worker context builder (what a spawned worker sees) ---
 
+def _task_user_origin(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT platform, chat_id, message_id, user_id, text FROM task_user_origins WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+
+
+def task_goal_text(conn: sqlite3.Connection, task: Task) -> str:
+    """Return immutable authenticated request before editable model-authored card text."""
+    origin = _task_user_origin(conn, task.id)
+    parts: list[str] = []
+    if origin:
+        parts.append("Authenticated original request (immutable):\n" + origin["text"])
+    parts.extend(part for part in (task.title or "", task.body or "") if part)
+    return "\n\n".join(parts).strip()
+
+
 def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     """Everything a worker should read about its task: header, body,
     attachments, prior attempts, done-parent handoffs, the assignee's recent
@@ -4286,7 +4400,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # One clock reading so every relative age in this rendering agrees.
     now = int(time.time())
     lines: list[str] = []
-    _ctx_header(lines, task)
+    _ctx_header(lines, conn, task)
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_checkpoint(lines, conn, task_id)
     _ctx_prior_attempts(lines, conn, task_id, now)
@@ -4333,7 +4447,7 @@ def _ctx_tail(items: list, cap: int, noun: str) -> tuple[list, Optional[str]]:
     )
 
 
-def _ctx_header(lines: list[str], task: Task) -> None:
+def _ctx_header(lines: list[str], conn: sqlite3.Connection, task: Task) -> None:
     lines.append(f"# Kanban task {task.id}: {task.title}")
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
@@ -4352,8 +4466,14 @@ def _ctx_header(lines: list[str], task: Task) -> None:
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
+    origin = _task_user_origin(conn, task.id)
+    if origin:
+        lines.append("## Authenticated original request (immutable)")
+        lines.append("This exact admitted user request takes precedence over the agent-authored card below.")
+        lines.append(origin["text"])
+        lines.append("")
     if task.body and task.body.strip():
-        lines.append("## Body")
+        lines.append("## Body (agent-authored)")
         lines.append(_ctx_cap(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
 

@@ -222,10 +222,28 @@ class GatewayInboundMixin:
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
         # counting internal/system events would keep a genuinely idle gateway awake.
         self._scale_to_zero_note_real_inbound()
+        # Preserve normalized inbound text before a plugin can rewrite model-facing event.text.
+        # This stays local until all authorization/admission gates below have passed.
+        inbound_user_text = event.text
+        inbound_platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
+        inbound_source = (str(inbound_platform), str(getattr(source, "chat_id", "") or ""),
+                          str(getattr(event, "message_id", None) or getattr(source, "message_id", "") or ""),
+                          str(getattr(source, "user_id", "") or ""))
         event = self._hm_pre_gateway_dispatch_hook(event, source)
         if event is None:
             return None
+        event._user_task_origin_text = inbound_user_text
+        event._user_task_origin_source = inbound_source
         source = event.source
+        rewritten_platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
+        rewritten_source = (str(rewritten_platform), str(getattr(source, "chat_id", "") or ""),
+                            str(getattr(event, "message_id", None) or getattr(source, "message_id", "") or ""),
+                            str(getattr(source, "user_id", "") or ""))
+        if rewritten_source != inbound_source:
+            # A plugin may rewrite the model message but cannot transfer authenticated provenance
+            # across principals or delivery identities.
+            event._user_task_origin_text = None
+            event._user_task_origin_source = None
 
         if not self._is_user_authorized_for_source(source):
             if source.user_id is None:
@@ -251,6 +269,11 @@ class GatewayInboundMixin:
         # The busy path charged this event on arrival; a drained follow-up must not pay twice.
         if not getattr(event, "_bot_loop_admitted", False) and not self._admit_bot_message_for_source(source):
             return None
+        # This receipt is distinct from transport scheduling: only an authorized event
+        # whose original source/text survived pre-dispatch rewriting can carry provenance.
+        event._user_task_origin_admitted = (
+            event._user_task_origin_text is not None and event._user_task_origin_source is not None
+        )
         return event, source, False
 
     def _hm_estop_turn_allowed(self, event: "MessageEvent", source: SessionSource) -> bool:

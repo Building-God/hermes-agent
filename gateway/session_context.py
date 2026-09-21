@@ -8,6 +8,7 @@ other's routing ids.  ``get_session_env`` is a drop-in for ``os.getenv``.
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any, Iterator
 
 # "Never set here" (falls back to os.environ for CLI/cron) vs "" = explicitly cleared (no fallback).
@@ -55,6 +56,64 @@ _SESSION_ASYNC_DELIVERY = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_U
 # Request-local proof that the client resumes SessionDB history. No env fallback
 # or child-process export: a bound id alone cannot authorize detached delivery.
 _SESSION_HISTORY_DELIVERY = ContextVar("HERMES_SESSION_HISTORY_DELIVERY", default=_UNSET)
+
+
+@dataclass
+class UserTaskOrigin:
+    """Authenticated inbound request retained only for this active gateway turn."""
+
+    platform: str
+    chat_id: str
+    message_id: str
+    user_id: str
+    text: str
+    active: bool = True
+
+
+_USER_TASK_ORIGIN: ContextVar[UserTaskOrigin | None] = ContextVar("HERMES_USER_TASK_ORIGIN", default=None)
+
+
+def _clear_user_task_origin() -> None:
+    origin = _USER_TASK_ORIGIN.get()
+    if origin is not None:
+        origin.active = False
+    _USER_TASK_ORIGIN.set(None)
+
+
+def bind_inbound_user_task_origin(event: Any, source: Any) -> None:
+    """Bind a real admitted user message for a Kanban create in this turn only.
+
+    Internal and bot-originated events deliberately clear the binding; there is no
+    environment fallback because a process may serve concurrent conversations.
+    """
+    if (getattr(event, "_user_task_origin_admitted", False) is not True
+            or bool(getattr(event, "internal", False)) or bool(getattr(source, "is_bot", False))):
+        _clear_user_task_origin()
+        return
+    origin_source = getattr(event, "_user_task_origin_source", None)
+    if origin_source is not None:
+        platform, chat_id, message_id, user_id = origin_source
+    else:
+        platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
+        chat_id = getattr(source, "chat_id", None)
+        message_id = getattr(event, "message_id", None) or getattr(source, "message_id", None)
+        user_id = getattr(source, "user_id", None)
+    text = getattr(event, "_user_task_origin_text", getattr(event, "text", None))
+    if not all(value is not None and str(value) for value in (platform, chat_id, message_id, user_id, text)):
+        _clear_user_task_origin()
+        return
+    _clear_user_task_origin()
+    _USER_TASK_ORIGIN.set(UserTaskOrigin(
+        platform=str(platform), chat_id=str(chat_id), message_id=str(message_id),
+        user_id=str(user_id), text=str(text),
+    ))
+
+
+def get_user_task_origin() -> UserTaskOrigin | None:
+    """Return the active turn's authenticated user request, if one was admitted."""
+    origin = _USER_TASK_ORIGIN.get()
+    return origin if origin is not None and origin.active else None
+
 
 # Cron auto-delivery vars, set per-job in run_job() so concurrent jobs don't clobber.
 _CRON_AUTO_DELIVER_PLATFORM = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
@@ -154,6 +213,7 @@ def clear_session_vars(tokens: list) -> None:
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _clear_user_task_origin()
     _runtime_cwd("clear_session_cwd")
 
 
@@ -167,6 +227,7 @@ def reset_session_vars() -> None:
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _clear_user_task_origin()
     _runtime_cwd("clear_session_cwd")
 
 

@@ -729,6 +729,7 @@ def connect(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> s
             if resolved not in _INITIALIZED_PATHS:
                 conn.executescript(_kb.SCHEMA_SQL)
                 _migrate_add_optional_columns(conn)
+                _migrate_user_origin_delete_trigger(conn)
                 _INITIALIZED_PATHS.add(resolved)
 
         conn, _ = _open_configured(path, _init_if_needed)
@@ -866,6 +867,32 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
     return conn.execute(
         f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'"
     ).fetchone() is not None
+
+
+def _migrate_user_origin_delete_trigger(conn: sqlite3.Connection) -> None:
+    """Upgrade the named provenance trigger without touching unrelated triggers.
+
+    Pre-M20 boards reject every origin-row deletion.  The current contract keeps
+    origin rows immutable while their task exists, but permits the transactional
+    privacy purge after the archived task row has been removed.
+    """
+    conn.execute("DROP TRIGGER IF EXISTS task_user_origins_immutable_delete")
+    conn.execute("DROP TRIGGER IF EXISTS task_user_origins_purge_with_task")
+    conn.execute("""
+        CREATE TRIGGER task_user_origins_immutable_delete
+        BEFORE DELETE ON task_user_origins
+        WHEN EXISTS (SELECT 1 FROM tasks WHERE id = OLD.task_id)
+        BEGIN
+            SELECT RAISE(ABORT, 'task user origin is immutable while its task exists');
+        END
+    """)
+    conn.execute("""
+        CREATE TRIGGER task_user_origins_purge_with_task
+        AFTER DELETE ON tasks
+        BEGIN
+            DELETE FROM task_user_origins WHERE task_id = OLD.id;
+        END
+    """)
 
 
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:

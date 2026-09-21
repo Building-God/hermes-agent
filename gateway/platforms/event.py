@@ -91,6 +91,14 @@ class MessageEvent:
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
+    # Original normalized text, retained through pre-dispatch rewriting until a turn binds provenance.
+    _user_task_origin_text: Optional[str] = field(default=None, init=False, repr=False, compare=False)
+    # Original source identity paired with the text above across pre-dispatch event replacement.
+    _user_task_origin_source: Optional[tuple[str, str, str, str]] = field(
+        default=None, init=False, repr=False, compare=False,
+    )
+    # Fresh post-auth admission receipt; never serialized and not interchangeable with transport scheduling.
+    _user_task_origin_admitted: bool = field(default=False, init=False, repr=False, compare=False)
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
 

@@ -2060,12 +2060,21 @@ class GatewayTurnMixin:
         if _was_auto_reset:
             await self._hmwa_deliver_auto_reset_notice(session_entry, source, turn_sidecar_notes)
 
+        # A direct test/internal caller may bypass ingress; retain its text only when no
+        # pre-dispatch snapshot was captured. Normal gateway events keep the original wire text.
+        if getattr(event, "_user_task_origin_text", None) is None:
+            event._user_task_origin_text = event.text
+
         # Auto-load bound skill(s) only on NEW sessions; ongoing ones carry the content in history.
         _auto = getattr(event, "auto_skill", None)
         if _is_new_session and _auto:
             self._hmwa_auto_load_skills(event, _auto, _quick_key, session_key)
 
         await self._hmwa_acquire_turn_lease(_quick_key, run_generation, session_entry, _session_env_tokens)
+        # Bind provenance only once every admission/session/lease gate has passed. The broad
+        # turn finally clears this ContextVar before another event can run in this task.
+        from gateway.session_context import bind_inbound_user_task_origin
+        bind_inbound_user_task_origin(event, source)
 
         # A turn becomes durable recovery work only after it owns the per-session lease; marking
         # earlier would falsely recover a message that never began processing.

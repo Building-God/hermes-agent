@@ -72,10 +72,10 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str, run_turn=None
     # Goal text = title + body (the acceptance criteria the judge evaluates against).
     with _kbc.connect_closing() as conn:
         task = _kb.get_task(conn, task_id)
+        goal_text = _kb.task_goal_text(conn, task) if task is not None else ""
     if task is None:
         return
 
-    goal_text = "\n\n".join(p for p in (task.title or "", task.body) if p).strip()
     if not goal_text:
         return
 
