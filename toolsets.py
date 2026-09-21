@@ -151,9 +151,9 @@ TOOLSETS = {
         "inside the gateway by default; see `kanban.dispatch_in_gateway` in "
         "config.yaml. Lets workers mark tasks done with structured handoffs, enter "
         "first-class review (request_review — not a block), return review changes, "
-        "block for human input, heartbeat during long ops, comment on threads, attach "
-        "files, and (for orchestrators) list, unblock, and fan out tasks.",
-        [t for t in _HERMES_CORE_TOOLS if t.startswith("kanban_")],
+        "block for human input, save/load durable owned-run checkpoints, heartbeat during long ops, comment on "
+        "threads, attach files, and (for orchestrators) list, unblock, and fan out tasks.",
+        [t for t in _HERMES_CORE_TOOLS if t.startswith("kanban_")] + ["kanban_checkpoint"],
     ),
     "discord": _ts("Discord read and participate tools (fetch messages, search members, create threads)", ["discord"]),
     "discord_admin": _ts("Discord server management (list channels/roles, pin messages, assign roles)", ["discord_admin"]),

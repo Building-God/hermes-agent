@@ -4159,6 +4159,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     lines: list[str] = []
     _ctx_header(lines, task)
     _ctx_attachments(lines, list_attachments(conn, task_id))
+    _ctx_checkpoint(lines, conn, task_id)
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
     _ctx_role_history(lines, conn, task, now)
@@ -4226,6 +4227,27 @@ def _ctx_header(lines: list[str], task: Task) -> None:
         lines.append("## Body")
         lines.append(_ctx_cap(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
+
+
+def _ctx_checkpoint(lines: list[str], conn: sqlite3.Connection, task_id: str) -> None:
+    """Surface checkpoint identity without injecting its potentially large payload.
+
+    ``load_task_checkpoint`` deliberately validates the row; corruption propagates
+    to the worker context build instead of being treated as an absent checkpoint.
+    """
+    checkpoint = load_task_checkpoint(conn, task_id)
+    if checkpoint is None:
+        return
+    lines.append("## Durable checkpoint")
+    lines.append(
+        f"Latest checkpoint: sequence {checkpoint.sequence}; source run {checkpoint.run_id}; "
+        f"SHA-256 `{checkpoint.payload_sha256}`; saved at {checkpoint.created_at}."
+    )
+    lines.append(
+        "Checkpoint progress is intentionally not injected into worker context. "
+        "Use `kanban_checkpoint(action='load')` to retrieve the validated full progress for this task."
+    )
+    lines.append("")
 
 
 def _ctx_attachments(lines: list[str], attachments: list[Attachment]) -> None:

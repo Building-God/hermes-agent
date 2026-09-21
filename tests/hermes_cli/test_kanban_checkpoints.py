@@ -143,3 +143,18 @@ def test_checkpoint_rejects_non_object_and_oversized_progress(checkpoint_conn):
         kb.save_task_checkpoint(
             checkpoint_conn, task_id, expected_run_id=run_id, progress={"large": "x" * (64 * 1024)},
         )
+
+
+def test_worker_context_surfaces_checkpoint_metadata_not_progress(checkpoint_conn):
+    task_id, run_id = _claim(checkpoint_conn)
+    kb.save_task_checkpoint(
+        checkpoint_conn, task_id, expected_run_id=run_id,
+        progress={"private_progress": "do-not-inject"},
+    )
+
+    context = kb.build_worker_context(checkpoint_conn, task_id)
+
+    assert "## Durable checkpoint" in context
+    assert "Latest checkpoint: sequence 1; source run" in context
+    assert "kanban_checkpoint(action='load')" in context
+    assert "do-not-inject" not in context

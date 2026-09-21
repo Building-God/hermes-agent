@@ -13,7 +13,7 @@ import logging
 import os
 import time
 from contextlib import contextmanager
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, cast
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
@@ -21,8 +21,8 @@ from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
-    KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
-    KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
+    KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_CHECKPOINT_SCHEMA,
+    KANBAN_COMMENT_SCHEMA, KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_STATUS_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
     KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
 
@@ -94,6 +94,16 @@ def _visible(*, to_env_worker: bool) -> bool:
 def _check_kanban_mode() -> bool:
     """Lifecycle tools: dispatcher workers + profiles with the ``kanban`` toolset."""
     return _visible(to_env_worker=True)
+
+
+@no_cache_check_fn
+def _check_kanban_checkpoint_mode() -> bool:
+    """Checkpoint state is meaningful only inside a dispatcher-owned worker."""
+    return bool(
+        os.environ.get("HERMES_KANBAN_TASK")
+        and not _is_delegated_child_context()
+        and _is_dispatcher_owned_worker()
+    )
 
 
 @no_cache_check_fn
@@ -257,6 +267,34 @@ def _worker_guard(tool_name: str, args: dict) -> str:
             "expected_run_id."
         )
     return tid
+
+
+def _checkpoint_worker_identity() -> tuple[str, int]:
+    """Return the dispatcher-owned task/run identity required by checkpoints.
+
+    Unlike ordinary Kanban tools this surface intentionally has no caller-selected
+    task or board.  A run id alone is insufficient after reclaim, so handlers also
+    compare it to the task's current running attempt before reads and writes.
+    """
+    _reject_delegated_child_mutation("kanban_checkpoint")
+    task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if not task_id or not _is_dispatcher_owned_worker():
+        raise _Reject("kanban_checkpoint refused: it is available only to a dispatcher-owned worker task")
+    run_id = _worker_run_id(task_id)
+    if run_id is None:
+        raise _Reject("kanban_checkpoint refused: this worker cannot resolve its HERMES_KANBAN_RUN_ID")
+    board_db = (os.environ.get("HERMES_KANBAN_DB") or "").strip()
+    if not board_db:
+        raise _Reject("kanban_checkpoint refused: this worker has no dispatcher-pinned HERMES_KANBAN_DB")
+    return task_id, run_id
+
+
+def _require_current_checkpoint_owner(kb, conn, task_id: str, run_id: int) -> None:
+    task = kb.get_task(conn, task_id)
+    _check(
+        task is not None and task.status == "running" and task.current_run_id == run_id,
+        "kanban_checkpoint refused: this worker no longer owns the task's current running attempt",
+    )
 
 
 def _require_orchestrator_tool(tool_name: str) -> None:
@@ -601,6 +639,45 @@ def inject_new_comments_from_env(agent: Any) -> bool:
 
 
 # --- Handlers ---
+
+@_kanban_handler("kanban_checkpoint")
+def _handle_checkpoint(args: dict, **kw) -> str:
+    """Save/load progress only for this live dispatcher worker attempt."""
+    task_id, run_id = _checkpoint_worker_identity()
+    action = args.get("action")
+    _check(action in {"save", "load"}, "kanban_checkpoint: action must be 'save' or 'load'")
+    progress: dict = {}
+    if action == "save":
+        supplied_progress = args.get("progress")
+        _check(isinstance(supplied_progress, dict), "kanban_checkpoint: progress must be a JSON object when action is save")
+        progress = cast(dict, supplied_progress)
+    else:
+        _check("progress" not in args and "idempotency_key" not in args,
+               "kanban_checkpoint: progress and idempotency_key are save-only")
+    with _board(None) as (kb, conn):
+        _require_current_checkpoint_owner(kb, conn, task_id, run_id)
+        if action == "save":
+            checkpoint = kb.save_task_checkpoint(
+                conn, task_id, expected_run_id=run_id, progress=progress,
+                idempotency_key=args.get("idempotency_key"),
+            )
+        else:
+            checkpoint = kb.load_task_checkpoint(conn, task_id)
+            if checkpoint is None:
+                return _ok(task_id=task_id, checkpoint=None)
+        return _ok(
+            task_id=task_id,
+            checkpoint={
+                "sequence": checkpoint.sequence,
+                "prior_run_id": checkpoint.run_id,
+                "payload_sha256": checkpoint.payload_sha256,
+                "version": checkpoint.version,
+                "idempotency_key": checkpoint.idempotency_key,
+                "created_at": checkpoint.created_at,
+                "progress": checkpoint.progress,
+            },
+        )
+
 
 @_kanban_handler("kanban_show")
 def _handle_show(args: dict, **kw) -> str:
@@ -1187,6 +1264,7 @@ def _handle_link(args: dict, **kw) -> str:
 # kanban_list / kanban_unblock route the board and are hidden from task workers.
 _ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_status", "kanban_unblock"})
 _TOOLS = (
+    ("kanban_checkpoint", KANBAN_CHECKPOINT_SCHEMA, _handle_checkpoint, "💾"),
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
     ("kanban_status", KANBAN_STATUS_SCHEMA, _handle_status, "📊"),
@@ -1204,6 +1282,10 @@ _TOOLS = (
     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
-    _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode
+    _gate = (
+        _check_kanban_checkpoint_mode if _name == "kanban_checkpoint"
+        else _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS
+        else _check_kanban_mode
+    )
     registry.register(name=_name, toolset="kanban", schema=_sch, handler=_handler, emoji=_emoji,
                       check_fn=_gate)

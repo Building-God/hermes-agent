@@ -530,6 +530,37 @@ KANBAN_CREATE_SCHEMA = _schema(
     ["title", "assignee"],
 )
 
+KANBAN_CHECKPOINT_SCHEMA = {
+    "name": "kanban_checkpoint",
+    "description": (
+        "Save or load a durable progress checkpoint for the dispatcher task you currently own. "
+        "This tool never accepts a task id or board: it is fenced to the current dispatcher run. "
+        "Use save with a bounded JSON progress object before an interruption-prone operation or "
+        "after a verified external-effect receipt. Use load on a later attempt to retrieve the latest "
+        "validated checkpoint; integrity errors are reported rather than silently ignored."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["save", "load"],
+                "description": "save appends the supplied progress for this owned run; load returns the latest validated checkpoint.",
+            },
+            "progress": {
+                "type": "object",
+                "description": "Required for save: bounded JSON object describing durable progress and verified receipts.",
+            },
+            "idempotency_key": {
+                "type": "string",
+                "description": "Optional save-only retry key. Reusing it with different progress is rejected.",
+            },
+        },
+        "required": ["action"],
+    },
+}
+
+
 KANBAN_UNBLOCK_SCHEMA = _schema(
     "kanban_unblock",
     (

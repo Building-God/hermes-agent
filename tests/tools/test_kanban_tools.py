@@ -68,6 +68,7 @@ def worker_env(monkeypatch, tmp_path):
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path()))
     # A real dispatcher always pins the worker's run id; simulate that so the
     # run-lifecycle tools can prove ownership (see test_unbound_worker_cannot_mutate_card).
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
@@ -83,6 +84,46 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert d["task"]["status"] == "running"
     assert "worker_context" in d
     assert "runs" in d
+
+
+
+
+def test_checkpoint_saves_and_loads_only_the_owned_dispatcher_task(worker_env):
+    from tools import kanban_tools as kt
+    from tools.kanban_tools_schemas import KANBAN_CHECKPOINT_SCHEMA
+    from tools.registry import registry
+    from toolsets import TOOLSETS, _HERMES_CORE_TOOLS
+
+    properties = KANBAN_CHECKPOINT_SCHEMA["parameters"]["properties"]
+    assert set(properties) == {"action", "progress", "idempotency_key"}
+    assert "kanban_checkpoint" not in _HERMES_CORE_TOOLS
+    assert "kanban_checkpoint" in TOOLSETS["kanban"]["tools"]
+    registered = registry.get_definitions(set(TOOLSETS["kanban"]["tools"]), quiet=True)
+    assert "kanban_checkpoint" in {item["function"]["name"] for item in registered}
+    saved = json.loads(kt._handle_checkpoint({
+        "action": "save", "progress": {"receipt": "verified", "step": 2}, "idempotency_key": "save-2",
+    }))
+    assert saved["ok"] is True
+    assert saved["task_id"] == worker_env
+    assert saved["checkpoint"]["sequence"] == 1
+    assert saved["checkpoint"]["prior_run_id"]
+    assert saved["checkpoint"]["progress"] == {"receipt": "verified", "step": 2}
+
+    loaded = json.loads(kt._handle_checkpoint({"action": "load"}))
+    assert loaded["checkpoint"] == saved["checkpoint"]
+
+
+def test_checkpoint_refuses_unbound_or_unpinned_worker(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID")
+    unbound = json.loads(kt._handle_checkpoint({"action": "load"}))
+    assert "refused" in unbound["error"]
+
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
+    monkeypatch.delenv("HERMES_KANBAN_DB")
+    unpinned = json.loads(kt._handle_checkpoint({"action": "load"}))
+    assert "dispatcher-pinned" in unpinned["error"]
 
 
 def test_create_exposes_and_persists_bounded_retry_limit(worker_env):
