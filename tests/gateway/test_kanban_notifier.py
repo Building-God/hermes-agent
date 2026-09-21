@@ -84,6 +84,50 @@ def _unseen_terminal_events(tid):
         conn.close()
 
 
+def test_discord_completion_delivers_full_result_to_origin_thread_once(tmp_path, monkeypatch):
+    db_path = tmp_path / "discord-full-result.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    summary = (
+        "Two cards are blocked.\n"
+        "Source map: preserve as failure evidence, do not retry blindly.\n"
+        "Next action: test a new tracked Discord task without repeating the original request."
+    )
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="Board blocker report", assignee="pilot")
+        kbn.add_notify_sub(
+            conn, task_id=tid, platform="discord", chat_id="origin-channel",
+            thread_id="origin-thread", chat_type="thread", delivery_mode="notify",
+            delivery_metadata={"chat_type": "thread", "parent_chat_id": "origin-channel"},
+        )
+        assert kb.complete_task(conn, tid, summary=summary)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner.adapters = {Platform.DISCORD: adapter}
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["chat_id"] == "origin-channel"
+    assert adapter.sent[0]["metadata"]["thread_id"] == "origin-thread"
+    assert summary in adapter.sent[0]["text"]
+    conn = kbc.connect()
+    try:
+        subs = kbn.list_notify_subs(conn, tid)
+        assert len(subs) == 1
+        assert subs[0]["last_ping_event_id"] > 0
+    finally:
+        conn.close()
+
+    runner = _make_runner(adapter)
+    runner.adapters = {Platform.DISCORD: adapter}
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+
+
 def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):
     db_path = tmp_path / "dm-topic-metadata.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))

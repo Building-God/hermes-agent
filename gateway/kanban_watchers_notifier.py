@@ -304,9 +304,22 @@ class _Collector:
         if not events:
             return None
         task = self.kb.get_task(conn, sub["task_id"])
+        # Completion event payloads deliberately contain only a 400-character
+        # first-line preview. Resolve the closing run's durable full summary for
+        # the user-facing notice while this board connection is already open.
+        run_summaries = {}
+        for ev in events:
+            if ev.kind == "completed" and ev.run_id is not None:
+                row = conn.execute(
+                    "SELECT summary FROM task_runs WHERE id = ? AND task_id = ?",
+                    (ev.run_id, sub["task_id"]),
+                ).fetchone()
+                if row and row["summary"]:
+                    run_summaries[ev.id] = row["summary"]
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events,
+                "task": task, "board": slug, "run_summaries": run_summaries}
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -375,16 +388,46 @@ def _first_line(text: str, limit: int) -> str:
     return lines[0][:limit] if lines else text[:limit]
 
 
+def _verified_exact_receipt(payload: Any) -> str:
+    """Render only a structurally valid exact-artifact receipt."""
+    if not isinstance(payload, dict) or payload.get("status") != "verified":
+        return ""
+    name, size, digest = payload.get("relative_path"), payload.get("size"), payload.get("sha256")
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9._/-]{1,160}", name):
+        return ""
+    if name.startswith("/") or ".." in name.split("/"):
+        return ""
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        return ""
+    if not isinstance(digest, str) or not re.fullmatch(r"[a-fA-F0-9]{64}", digest):
+        return ""
+    return f"{name} · {size} bytes · SHA-256 {digest.lower()}"
+
+
 def _fmt_completed(ev, n) -> tuple:
-    # Prefer the run summary from the event payload; fall back to task.result for legacy rows.
-    wake_handoff = None
-    payload_summary = _payload(ev, "summary")
-    if payload_summary:
-        wake_handoff = _first_line(str(payload_summary), 200)
-    elif n.task and n.task.result:
-        wake_handoff = _first_line(n.task.result, 160)
-    handoff = f"\n{wake_handoff}" if wake_handoff is not None else ""
-    return f"✔ {n.head} done — {n.title}{handoff}", wake_handoff, None
+    # The passive notice is the result for notify-only subscriptions. A 200-character
+    # first-line excerpt hid the actual outcome/next action while still advancing the
+    # delivery cursor. Keep the wake context short, but deliver a bounded full summary.
+    run_summary = getattr(n, "run_summaries", {}).get(getattr(ev, "id", None))
+    summary = run_summary or (n.task.result if n.task and n.task.result else "") or _payload(ev, "summary") or ""
+    from agent.redact import redact_sensitive_text
+    safe_summary = redact_sensitive_text(str(summary), force=True, redact_url_credentials=True).strip()
+    receipt = _verified_exact_receipt((ev.payload or {}).get("exact_artifact"))
+    header = f"✔ {n.head} done — {str(n.title)[:300]}"
+    # Leave room below Discord's 2,000-character text limit even for a long title.
+    available = max(0, 1800 - len(header) - 1)
+    include_receipt = bool(receipt and receipt not in safe_summary)
+    summary_budget = max(0, available - (len(receipt) + 1 if include_receipt else 0))
+    if len(safe_summary) > summary_budget:
+        safe_summary = safe_summary[: max(0, summary_budget - 1)].rstrip() + "…"
+    detail = f"{safe_summary}\n{receipt}" if include_receipt and safe_summary else (
+        receipt if include_receipt else safe_summary
+    )
+    message = f"{header}\n{detail}" if detail else header
+    wake_handoff = _first_line(safe_summary, 200) if safe_summary else None
+    if receipt and (not wake_handoff or receipt not in wake_handoff):
+        wake_handoff = f"{_first_line(safe_summary, 120)}; {receipt}" if safe_summary else receipt
+    return message, wake_handoff, None
 
 
 def _fmt_review_requested(ev, n) -> tuple:
@@ -490,6 +533,7 @@ class _KanbanNotification:
         self.sub = sub = d["sub"]
         self.task = task = d["task"]
         self.board_slug = d.get("board")
+        self.run_summaries = d.get("run_summaries") or {}
         self.platform_str = (sub["platform"] or "").lower()
         self.task_id = sub["task_id"]
         self.sub_profile = sub.get("notifier_profile") or ""
