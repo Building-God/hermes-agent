@@ -22,6 +22,12 @@ logger = logging.getLogger("gateway.stream_consumer")
 _MAX_EDIT_BACKOFF_SECS = 30.0
 
 
+def _safe_stream_text(adapter: Any, text: str) -> str:
+    """Apply only the raw-tool guard to streamed frames, preserving stream-frame semantics."""
+    from gateway.run import _sanitize_gateway_tool_markup
+    return _sanitize_gateway_tool_markup(getattr(adapter, "platform", None), text)
+
+
 class StreamTransportMixin:
     """Send/edit/frame primitives and the transport-ordered ``_send_or_edit``."""
 
@@ -29,6 +35,7 @@ class StreamTransportMixin:
 
     async def _edit_message(self, *, message_id: str, content: str, finalize: bool = False):
         """Edit via the adapter, passing routing metadata when supported."""
+        content = _safe_stream_text(self.adapter, content)
         # Contract: adapters must accept finalize= even when False (test-guarded).
         kwargs = dict(chat_id=self.chat_id, message_id=message_id, content=content,
                       finalize=finalize)
@@ -64,6 +71,7 @@ class StreamTransportMixin:
 
     async def _send_frame(self, text: str, *, finalize: bool):
         """One native-stream frame; every frame carries the same chat/reply/turn routing."""
+        text = _safe_stream_text(self.adapter, text)
         return await self.adapter.send_stream_frame(
             text, finalize=finalize, chat_id=self.chat_id, reply_to=self._initial_reply_to_id,
             turn_id=self._turn_id)
@@ -171,7 +179,7 @@ class StreamTransportMixin:
             return False
         try:
             result = await self.adapter.send_draft(
-                chat_id=self.chat_id, draft_id=self._draft_id, content=text,
+                chat_id=self.chat_id, draft_id=self._draft_id, content=_safe_stream_text(self.adapter, text),
                 metadata=self._draft_metadata())
         except Exception as e:
             logger.debug("send_draft raised, disabling draft transport for this run: %s", e)
@@ -281,7 +289,8 @@ class StreamTransportMixin:
         stale_ids = self._stale_preview_ids()
         try:
             result = await self.adapter.send(
-                chat_id=self.chat_id, content=text, metadata=self._metadata_for_send(final=True))
+                chat_id=self.chat_id, content=_safe_stream_text(self.adapter, text),
+                metadata=self._metadata_for_send(final=True))
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
             return False
@@ -313,7 +322,7 @@ class StreamTransportMixin:
         """Send or edit the streaming message; True if delivered.  ``finalize`` marks the
         last edit.  Transport order: native frame → draft frame → edit existing → first
         send; a transport returns None to fall through to the next."""
-        text = self._clean_for_display(text)
+        text = _safe_stream_text(self.adapter, self._clean_for_display(text))
         # Stream-is-the-message draft frames must stay prefix-stable: a closing ```
         # on a mid-code-block frame makes frame N not a prefix of N+1 and the
         # connector re-appends the whole snapshot.  The final is still fence-closed.

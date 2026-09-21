@@ -10,6 +10,7 @@ from typing import Any, Callable, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.stream_consumer_fences import ensure_closed_code_fences
+from gateway.stream_consumer_transport import _safe_stream_text
 
 logger = logging.getLogger("gateway.stream_consumer")
 
@@ -20,7 +21,7 @@ class StreamFallbackMixin:
     async def _send_new_chunk(self, text: str, reply_to_id: Optional[str], *,
                               final: bool = False) -> Optional[str]:
         """Send a new chunk threaded to ``reply_to_id``; returns the new message_id."""
-        text = self._clean_for_display(text)
+        text = _safe_stream_text(self.adapter, self._clean_for_display(text))
         if not text.strip():
             return reply_to_id
         try:
@@ -106,7 +107,8 @@ class StreamFallbackMixin:
             return
         # Balance fences BEFORE computing the continuation so the closing fence
         # reaches the user even when only the tail is delivered.
-        final_text = ensure_closed_code_fences(self._clean_for_display(text))
+        final_text = ensure_closed_code_fences(_safe_stream_text(
+            self.adapter, self._clean_for_display(text)))
         continuation = self._continuation_text(final_text)
         self._fallback_final_send = False
         if not continuation.strip():

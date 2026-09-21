@@ -4203,6 +4203,10 @@ class BasePlatformAdapter(ABC):
         Returns the result with the adapter that sent it: that adapter owns ``result.message_id``
         (an ephemeral delete must go to the same transport)."""
         delivery_adapter = self._final_delivery_adapter(event.source)
+        # This is the last durable chat-final boundary: it protects direct/queued callers
+        # that did not pass through GatewayTurnMixin and ensures retries retain only safe text.
+        from gateway.run import _sanitize_gateway_final_response
+        text_content = _sanitize_gateway_final_response(event.source.platform, text_content)
         logger.info("[%s] Sending response (%d chars) to %s", delivery_adapter.name,
                     len(text_content), event.source.chat_id)
         obligation_id = await self._record_delivery_obligation(

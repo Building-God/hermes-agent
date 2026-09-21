@@ -8,6 +8,7 @@ import pytest
 
 from agent.think_scrubber import THINK_CLOSE_TAGS, THINK_OPEN_TAGS, THINK_TAG_NAMES
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
+from gateway.stream_consumer_transport import _safe_stream_text
 from gateway.stream_consumer_think import StreamThinkFilterMixin
 from hermes_cli import cli_stream_mixin
 
@@ -28,7 +29,34 @@ def test_stream_send_metadata_carries_original_reply_anchor():
     }
 
 
-# ── _clean_for_display unit tests ────────────────────────────────────────
+def test_stream_guard_leaves_non_tool_content_byte_stable():
+    """Frame guarding must not apply full final-response redaction/transforms to normal streams."""
+    adapter = SimpleNamespace(platform=SimpleNamespace(value="discord"))
+    content = "API call failed after 3 retries: HTTP 400 (quoted diagnostic example)"
+
+    assert _safe_stream_text(adapter, content) == content
+
+
+@pytest.mark.asyncio
+async def test_streaming_split_tool_marker_never_reaches_transport():
+    """A partial marker must be replaced before a later frame can complete it."""
+    adapter = MagicMock()
+    adapter.platform = SimpleNamespace(value="discord")
+    adapter.REQUIRES_EDIT_FINALIZE = False
+    adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
+    adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    consumer = GatewayStreamConsumer(adapter, "chat_123")
+
+    await consumer._send_or_edit("<|tool")
+    await consumer._send_or_edit("<|tool_call:start|>kanban_attach")
+
+    sent = [call.kwargs["content"] for call in adapter.send.await_args_list]
+    edited = [call.kwargs["content"] for call in adapter.edit_message.await_args_list]
+    assert sent and all("<|tool" not in content for content in sent)
+    assert all("<|tool" not in content for content in edited)
+    assert all("couldn't safely deliver" in content for content in sent + edited)
+
 
 
 class TestCleanForDisplay:

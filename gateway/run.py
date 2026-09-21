@@ -669,6 +669,17 @@ _GATEWAY_PROVIDER_ERROR_SHAPE_RE = re.compile(
     + "|".join(_PROVIDER_ERROR_MARKERS + _CONNECTION_ERROR_MARKERS[:8] + (r"all\s+connection\s+attempts\s+failed",))
     + ")",
     re.IGNORECASE)
+# Model tool protocol markers are never user prose on chat surfaces.  The payload that follows
+# can contain base64-encoded attachment bytes, so this must replace the whole response rather
+# than merely strip the delimiters.
+_RAW_TOOL_CALL_CONTROL_RE = re.compile(r"<\|tool_(?:call|arg):(?:start|end)\|>")
+# A stream may split a marker before its terminator.  Treat its recognizable prefix as unsafe
+# too, so a native append-only transport never gets a frame that later completes the protocol.
+_RAW_TOOL_CALL_PREFIX_RE = re.compile(r"<\|tool(?:_|$)")
+_RAW_TOOL_CALL_FAILURE_REPLY = (
+    "⚠️ I couldn't safely deliver the model response because it contained internal tool-call data. "
+    "Please try again."
+)
 
 
 def _looks_like_gateway_provider_error(text: str) -> bool:
@@ -681,6 +692,23 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     if len(body) > 400 or body.count("\n") > 4:
         return False
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
+
+
+def _sanitize_gateway_tool_markup(platform: Any, text: str) -> str:
+    """Replace leaked model tool protocol markup on chat surfaces only.
+
+    Streaming calls this narrow guard per frame; it deliberately does not apply the broader
+    provider-error/redaction transforms, which would make cumulative native frames non-prefix-stable.
+    """
+    if not text or _gateway_surface_passes_raw_text(platform):
+        return text
+    if _RAW_TOOL_CALL_CONTROL_RE.search(text) or _RAW_TOOL_CALL_PREFIX_RE.search(text):
+        logger.warning(
+            "Suppressed raw model tool-call markup at chat egress (platform=%s, chars=%d)",
+            getattr(platform, "value", platform), len(text),
+        )
+        return _RAW_TOOL_CALL_FAILURE_REPLY
+    return text
 
 
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
@@ -699,6 +727,9 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     from agent.message_sanitization import _sanitize_surrogates
 
     text = _sanitize_surrogates(str(text))
+    text = _sanitize_gateway_tool_markup(platform, text)
+    if text == _RAW_TOOL_CALL_FAILURE_REPLY:
+        return text
 
     # Some OpenAI-compatible providers leak their exact end-of-sequence control token into
     # ``final_response`` even though finish_reason is already ``stop``.  It is transport metadata,

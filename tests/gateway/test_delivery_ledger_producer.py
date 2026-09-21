@@ -113,6 +113,23 @@ class TestProducerHook:
         assert rows[0][2] == "final answer"
 
     @pytest.mark.asyncio
+    async def test_raw_tool_call_final_is_replaced_before_ledger_and_send(self):
+        """The real final-delivery path must retain only the truthful safe fallback for retries."""
+        adapter = _Adapter()
+        payload = "c2Vuc2l0aXZlLWZpeHR1cmUtcGF5bG9hZA=="
+        raw = f"<|tool_call:start|>kanban_attach<|tool_arg:start|>content_base64{payload}"
+
+        await _run(adapter, _event(), response=raw)
+
+        assert len(adapter.sent) == 1
+        assert "<|tool_" not in adapter.sent[0]
+        assert payload not in adapter.sent[0]
+        assert "couldn't safely deliver" in adapter.sent[0]
+        rows = _rows()
+        assert len(rows) == 1
+        assert rows[0][2] == adapter.sent[0]
+
+    @pytest.mark.asyncio
     async def test_send_failure_leaves_failed_row(self):
         adapter = _Adapter()
         adapter.send = AsyncMock(
