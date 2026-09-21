@@ -850,6 +850,42 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     ]
 
 
+def test_worker_cannot_complete_with_profile_cache_scratch_artifact(kanban_home, monkeypatch):
+    """A profile-cache deliverable must not create a false completed receipt."""
+    profile_scratch = kanban_home / "cache" / "scratch"
+    profile_scratch.mkdir(parents=True)
+    stray = profile_scratch / "review.md"
+    stray.write_text("REJECT\n", encoding="utf-8")
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="review source mapping")
+        workspace = kbw.resolve_workspace(kb.get_task(conn, task_id))
+        kbw.set_workspace_path(conn, task_id, workspace)
+        kb.claim_task(conn, task_id)
+        run_id = kb.get_task(conn, task_id).current_run_id
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+
+        with pytest.raises(kb.ArtifactPreservationError, match="not durable"):
+            kb.complete_task(
+                conn, task_id, summary="review finished",
+                metadata={"artifacts": [str(stray)]}, expected_run_id=run_id,
+            )
+        assert kb.get_task(conn, task_id).status == "running"
+        assert not kb.list_attachments(conn, task_id)
+        assert not any(e.kind == "completed" for e in kb.list_events(conn, task_id))
+        assert stray.read_text(encoding="utf-8") == "REJECT\n"
+
+        delivered = workspace / "review.md"
+        delivered.write_bytes(stray.read_bytes())
+        assert kb.complete_task(
+            conn, task_id, summary="review finished",
+            metadata={"artifacts": [str(delivered)]}, expected_run_id=run_id,
+        )
+        attachments = kb.list_attachments(conn, task_id)
+        assert len(attachments) == 1
+        assert Path(attachments[0].stored_path).read_bytes() == stray.read_bytes()
+
+
 def test_review_bound_handoff_preserves_declared_artifacts(kanban_home):
     """A review-bound card's declared files must outlive the reviewer's
     completion — that completion is what cleans the scratch workspace up."""

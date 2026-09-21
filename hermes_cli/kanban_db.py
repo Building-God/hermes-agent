@@ -3019,6 +3019,12 @@ def _persist_scratch_completion_artifacts(
         return
 
     attachment_dir = task_attachments_dir(task_id, board=board)
+    # A worker's profile cache is ephemeral, just like its task workspace, but
+    # only the latter is staged by this function. Do not report completion with
+    # a cache/scratch path that will not become a durable board attachment.
+    profile_scratch: Optional[Path] = None
+    if os.environ.get("HERMES_KANBAN_TASK") == task_id and os.environ.get("HERMES_HOME"):
+        profile_scratch = (Path(os.environ["HERMES_HOME"]) / "cache" / "scratch").resolve()
     persisted: list[str] = []
     used_destinations: set[Path] = set()
     changed = False
@@ -3038,6 +3044,12 @@ def _persist_scratch_completion_artifacts(
             continue
 
         if not resolved_src.is_relative_to(workspace_root):
+            if profile_scratch is not None and resolved_src.is_relative_to(profile_scratch):
+                _discard_copies()
+                raise ArtifactPreservationError(
+                    f"declared worker profile-scratch artifact is not durable: {artifact}; "
+                    "copy it into HERMES_KANBAN_WORKSPACE and declare that path"
+                )
             persisted.append(artifact)
             continue
 
