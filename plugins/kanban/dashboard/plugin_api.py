@@ -705,6 +705,21 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
     running<->ready) + a ``status`` event. Leaving ``running`` closes the run as 'reclaimed'
     so attempt history isn't orphaned; the worker is killed only AFTER the txn commits."""
     terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
+    # Capture and fence a dashboard-owned running worker before opening the
+    # status transaction. A failed termination leaves its running claim intact.
+    preflight = conn.execute(
+        "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if preflight is None:
+        return False
+    fenced_lock = None
+    if preflight["status"] == "running" and new_status != "running":
+        fenced, _termination = kanban_db._fence_running_release(
+            conn, task_id, preflight, reason="dashboard_status_worker_tree_alive",
+        )
+        if not fenced:
+            return False
+        fenced_lock = preflight["claim_lock"]
     effective_status = new_status
     with kanban_db.write_txn(conn):
         prev = conn.execute(
@@ -720,7 +735,11 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
         # dispatcher spawns a child whose upstream work hasn't completed.
         if effective_status == "ready" and not kanban_db._parents_satisfied(conn, task_id):
             return False
+        if prev["status"] != preflight["status"]:
+            return False
         was_running = prev["status"] == "running"
+        if fenced_lock is not None and (not was_running or prev["claim_lock"] != fenced_lock):
+            return False
         reopening_satisfied_parent = prev["status"] in {"done", "archived"} and effective_status not in {"done", "archived"}
         cur = conn.execute(
             "UPDATE tasks SET status = ?, "
@@ -745,8 +764,8 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             # back worker terminations to perform post-commit.
             result = kanban_db.invalidate_descendants_for_parent_reopen(conn, task_id, author="dashboard")
             terminations.extend(result["terminations"])
-    for pid, claim_lock, started_at in terminations:
-        kanban_db._terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
+    # Every running release was fenced before its claim was cleared; do not
+    # repeat PID-directed effects after the state transaction.
     # Re-opening something may have made children stale.
     if effective_status in {"done", "ready", "review"}:
         kanban_db.recompute_ready(conn)

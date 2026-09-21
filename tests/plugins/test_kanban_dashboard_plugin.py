@@ -467,6 +467,13 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
 def test_delete_task(client):
     t = client.post("/api/plugins/kanban/tasks", json={"title": "to-delete"}).json()["task"]
     r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
+    assert r.status_code == 404
+    archived = client.post(
+        "/api/plugins/kanban/tasks/bulk", json={"ids": [t["id"]], "archive": True},
+    )
+    assert archived.status_code == 200, archived.text
+    assert archived.json()["results"] == [{"id": t["id"], "ok": True}]
+    r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
     assert r.status_code == 200
     assert r.json()["deleted"] is True
     assert r.json()["task_id"] == t["id"]
@@ -848,6 +855,12 @@ def test_dashboard_confirm_dispatches_expected_delete(client):
     """
     t = client.post("/api/plugins/kanban/tasks",
                     json={"title": "x"}).json()["task"]
+    refused = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
+    assert refused.status_code == 404
+    archived = client.post(
+        "/api/plugins/kanban/tasks/bulk", json={"ids": [t["id"]], "archive": True},
+    )
+    assert archived.status_code == 200, archived.text
     r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
     assert r.status_code == 200, r.text
     # 404 on the now-deleted task confirms removal.

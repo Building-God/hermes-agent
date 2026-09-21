@@ -3445,6 +3445,24 @@ def block_task(
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    # A worker blocking its own matching run will exit through its in-band
+    # lifecycle. Any unowned/operator block must prove the worker tree gone
+    # before it may erase the claim.
+    fenced_lock = None
+    observed_status = None
+    if expected_run_id is None:
+        running = conn.execute(
+            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if running is not None:
+            observed_status = running["status"]
+        if running is not None and running["status"] == "running":
+            fenced, _termination = _fence_running_release(
+                conn, task_id, running, reason="external_block_worker_tree_alive",
+            )
+            if not fenced:
+                return False
+            fenced_lock = running["claim_lock"]
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
@@ -3501,6 +3519,12 @@ def block_task(
                    AND status IN ('running', 'ready')
                 """
         params = (*params, task_id)
+        if observed_status is not None:
+            sql += " AND status = ?"
+            params = (*params, observed_status)
+        if fenced_lock is not None:
+            sql += " AND claim_lock IS ?"
+            params = (*params, fenced_lock)
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
@@ -3991,6 +4015,19 @@ def invalidate_descendants_for_parent_reopen(
                 resume_status = "review"
             elif previous_status == "running":
                 resume_status = _retry_status_for_run(conn, row["id"], row["current_run_id"])
+                # The identity is still on the row while this fence runs. If it
+                # cannot be proved gone, retain the running claim and omit this
+                # descendant from the invalidation rather than creating an
+                # untracked, dispatchable overlap.
+                fenced, termination = _fence_running_release(
+                    conn, row["id"], row, reason="ancestor_reopen_worker_tree_alive",
+                )
+                if not fenced:
+                    # Abort the enclosing parent+descendant transaction: a
+                    # reopened parent with a still-running dependent is not a
+                    # valid atomic invalidation. The original running claim
+                    # remains tracked and non-dispatchable after rollback.
+                    raise RuntimeError("cannot reopen ancestor while a descendant worker tree survives")
                 terminations.append((row["worker_pid"], row["claim_lock"], row["worker_started_at"]))
                 run_id = _end_run(
                     conn, row["id"], outcome="reclaimed", status="todo",
@@ -4028,11 +4065,8 @@ def invalidate_descendants_for_parent_reopen(
                 f"(will resume via '{resume_status}').", now,
             )
             invalidated.append(entry)
-    if not caller_owns_txn:
-        # Standalone: committed above, audit trail durable, safe to kill now.
-        # Composed calls leave this to the caller post-commit.
-        for pid, claim_lock, started_at in terminations:
-            _terminate_reclaimed_worker(pid, claim_lock, started_at=started_at)
+    # Running descendants were already fenced before their tracking was cleared.
+    # ``terminations`` is retained as an auditable snapshot for composed callers.
     return {"invalidated": invalidated, "terminations": terminations}
 
 
@@ -4093,6 +4127,27 @@ def specify_triage_task(
     return True
 
 
+def _fence_running_release(
+    conn: sqlite3.Connection, task_id: str, row, *, reason: str, signal_fn=None,
+) -> tuple[bool, dict]:
+    """Terminate a captured running worker tree before any caller drops its claim.
+
+    The caller must still CAS ``claim_lock`` in its later write transaction.  On
+    an unconfirmed stop this records a durable deferred-reclaim receipt and
+    leaves the running claim non-dispatchable instead of orphaning the worker.
+    """
+    termination = _terminate_reclaimed_worker(
+        row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+        started_at=row["worker_started_at"],
+    )
+    if _worker_survived_termination(termination):
+        _defer_reclaim_for_live_worker(
+            conn, task_id, row["claim_lock"], int(time.time()), termination, reason=reason,
+        )
+        return False, termination
+    return True, termination
+
+
 def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
     """Archive a task after fencing any running host-local worker tree.
 
@@ -4113,24 +4168,24 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     if was_running:
         # This snapshots descendants before root teardown; doing it after the
         # archive commit loses the only reliable ancestry fence.
-        termination = _terminate_reclaimed_worker(
-            prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started,
+        fenced, termination = _fence_running_release(
+            conn, task_id, row, reason="archive_worker_tree_alive", signal_fn=signal_fn,
         )
-        if _worker_survived_termination(termination):
-            _defer_reclaim_for_live_worker(
-                conn, task_id, prev_lock, int(time.time()), termination,
-                reason="archive_worker_tree_alive",
-            )
+        if not fenced:
             return False
 
     with write_txn(conn):
-        # Do not archive a different concurrent running claim than the one
-        # fenced above.  A non-running concurrent transition is safe to archive.
+        # The state observed before the fence is a CAS input.  In particular a
+        # dispatcher claim in this read->write window must not be archived.
         if was_running:
             current = conn.execute(
                 "SELECT status, claim_lock FROM tasks WHERE id = ?", (task_id,),
             ).fetchone()
-            if current is None or (current["status"] == "running" and current["claim_lock"] != prev_lock):
+            if current is None or current["status"] != "running" or current["claim_lock"] != prev_lock:
+                return False
+        else:
+            current = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if current is None or current["status"] == "running":
                 return False
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -4173,14 +4228,8 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task and its related rows in one txn; False when not found."""
-    with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        if cur.rowcount != 1:
-            return False
-        _delete_task_relations(conn, task_id)
-    recompute_ready(conn)
-    return True
+    """Hard-delete only an archived task; active history requires archive first."""
+    return delete_archived_task(conn, task_id)
 
 
 def schedule_task(
@@ -4189,6 +4238,20 @@ def schedule_task(
 ) -> bool:
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
     until ``unblock_task`` re-gates it."""
+    row = conn.execute(
+        "SELECT status, claim_lock, worker_pid, worker_started_at, current_run_id "
+        "FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if row is None or row["status"] not in {"todo", "ready", "running", "blocked"}:
+        return False
+    if expected_run_id is not None and row["current_run_id"] != int(expected_run_id):
+        return False
+    if row["status"] == "running":
+        fenced, _termination = _fence_running_release(
+            conn, task_id, row, reason="schedule_worker_tree_alive",
+        )
+        if not fenced:
+            return False
     with write_txn(conn):
         params: list[Any] = [task_id]
         sql = """
@@ -4196,10 +4259,16 @@ def schedule_task(
                SET status       = 'scheduled',
                    claim_lock   = NULL,
                    claim_expires= NULL,
-                   worker_pid   = NULL
+                   worker_pid   = NULL,
+                   worker_started_at = NULL
              WHERE id = ?
                AND status IN ('todo', 'ready', 'running', 'blocked')
         """
+        sql += " AND status = ?"
+        params.append(row["status"])
+        if row["status"] == "running":
+            sql += " AND claim_lock IS ?"
+            params.append(row["claim_lock"])
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params.append(int(expected_run_id))

@@ -716,6 +716,8 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
         t = kb.create_task(conn, title="to-delete", assignee="alice")
         kb.add_comment(conn, t, "user", "comment")
         kb.add_comment(conn, t, "user", "another")
+        assert not kb.delete_task(conn, t)
+        assert kb.archive_task(conn, t)
         assert kb.delete_task(conn, t)
         assert kb.get_task(conn, t) is None
         assert len(kb.list_comments(conn, t)) == 0

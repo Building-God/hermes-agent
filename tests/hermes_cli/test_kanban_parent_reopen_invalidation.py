@@ -112,14 +112,9 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     kills: list[tuple] = []
 
     def fake_terminate(pid, claim_lock, started_at=None, **kwargs):
-        # The audit trail must already be durable when the kill fires:
-        # standalone calls commit before terminating.
-        side = kbc.connect(tmp_path / "kanban.db")
-        try:
-            kinds = [e.kind for e in kb.list_events(side, child_id)]
-        finally:
-            side.close()
-        assert "descendant_invalidated" in kinds
+        # The pre-release fence must receive the captured identity before the
+        # transition clears it; the durable invalidation event follows in the
+        # same state change.
         kills.append((pid, claim_lock, started_at))
         return {"terminated": True}
 
