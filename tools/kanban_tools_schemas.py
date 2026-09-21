@@ -89,17 +89,18 @@ KANBAN_COMPLETE_SCHEMA = _schema(
     "kanban_complete",
     (
         "Mark your current task done with a structured handoff for "
-        "downstream workers and humans. Prefer ``summary`` for a "
-        "human-readable 1-3 sentence description of what you did; put "
+        "downstream workers and humans. Use ``summary`` for a "
+        "human-readable outcome and exact next action; put "
         "machine-readable facts in ``metadata`` (changed_files, "
         "tests_run, decisions, findings, etc). At least one of "
         "``summary`` or ``result`` is required. If you created new "
         "tasks via ``kanban_create`` during this run, list their ids "
         "in ``created_cards`` — the kernel verifies them so phantom "
         "references are caught before they leak into downstream "
-        "automation. If you produced deliverable files (charts, PDFs, "
+        "automation. If you produced local deliverable files (charts, PDFs, "
         "spreadsheets, generated images), list their absolute paths "
-        "in ``artifacts`` — the gateway notifier will upload them as "
+        "in ``artifacts`` instead of base64-encoding them into kanban_attach. "
+        "Completion stages them before scratch cleanup; the gateway uploads them as "
         "native attachments to the human who subscribed to the task, "
         "so the deliverable lands in their chat alongside the summary "
         "instead of being a path they have to fetch by hand."
@@ -107,7 +108,7 @@ KANBAN_COMPLETE_SCHEMA = _schema(
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
         "summary": _prop("string", (
-                "Human-readable handoff, 1-3 sentences. Appears in "
+                "Human-readable outcome and next action. Appears in "
                 "Run History on the dashboard and in downstream "
                 "workers' context."
         )),
@@ -310,9 +311,10 @@ KANBAN_COMMENT_SCHEMA = _schema(
 KANBAN_ATTACH_SCHEMA = _schema(
     "kanban_attach",
     (
-        "Attach a file to a task by passing its bytes inline (base64). "
-        "Use for genuine file artifacts the next worker or a human should "
-        "be able to download — generated reports, images, exports. The "
+        "Attach small inline bytes to a task (base64). For a local file in "
+        "the current task workspace, use kanban_complete.artifacts or "
+        "kanban_request_review.artifacts to stage it durably before scratch "
+        "cleanup without copying base64 through model context. The "
         "file is stored as a real attachment (not a comment link) under "
         "the task's attachments dir, capped at 25 MB. Prefer "
         "kanban_attach_url when you only have a URL."
