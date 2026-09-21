@@ -440,6 +440,44 @@ def _sigkill(kill, pid: int) -> bool:
         return False
 
 
+def _snapshot_worker_descendants(pid: int) -> tuple[dict[int, str], bool]:
+    """Capture verified descendants before their worker root can be reparented.
+
+    A PID alone is never sufficient evidence after the root exits.  Each child
+    carries the same reboot-stable fingerprint as the worker root; an unreadable
+    tree is deliberately a failed fence, not permission to retry beside it.
+    """
+    try:
+        import psutil
+        children = psutil.Process(pid).children(recursive=True)
+    except (ImportError, OSError):
+        return {}, False
+    except Exception:  # psutil's access/no-such variants are platform-specific.
+        return {}, False
+    descendants: dict[int, str] = {}
+    for child in children:
+        fingerprint = _process_fingerprint(child.pid)
+        if fingerprint is None:
+            return {}, False
+        descendants[child.pid] = fingerprint
+    return descendants, True
+
+
+def _verified_descendant_survivors(descendants: Mapping[int, str]) -> list[int]:
+    """Return snapshot members still bearing their captured identity."""
+    return [pid for pid, fingerprint in descendants.items()
+            if _kb._pid_alive(pid) and _process_fingerprint(pid) == fingerprint]
+
+
+def _poll_descendant_exit(descendants: Mapping[int, str]) -> list[int]:
+    for _ in range(10):
+        survivors = _verified_descendant_survivors(descendants)
+        if not survivors:
+            return []
+        time.sleep(0.5)
+    return _verified_descendant_survivors(descendants)
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
@@ -459,6 +497,7 @@ def _terminate_reclaimed_worker(
         "termination_attempted": False,
         "terminated": False,
         "sigkill": False,
+        "descendant_pids": [],
     }
     if not pid or pid <= 0 or not claim_lock:
         return info
@@ -468,6 +507,8 @@ def _terminate_reclaimed_worker(
 
     kill = _kill_fn(signal_fn)
     if kill is None:
+        info["termination_unavailable"] = True
+        info["termination_error"] = "no host signal helper available"
         return info
     if started_at == UNVERIFIED_WORKER_FINGERPRINT:
         # Never signal by bare number: a dead PID is "gone" (reclaim proceeds), a live one is held.
@@ -475,29 +516,109 @@ def _terminate_reclaimed_worker(
         info["terminated"] = not _kb._pid_alive(pid)
         return info
     if _kb._pid_alive(pid) and _pid_recycled(pid, started_at):
-        info["terminated"] = True
+        # Once the root identity changed we cannot reconstruct its former
+        # ancestry. Never release a claim on root death alone: its original
+        # children may still be effect-capable orphans.
         info["pid_recycled"] = True
+        info["tree_snapshot_failed"] = True
+        info["termination_error"] = "worker root identity changed before descendant snapshot"
+        return info
+
+    descendants, snapshot_verified = _snapshot_worker_descendants(int(pid))
+    info["descendant_pids"] = sorted(descendants)
+    if not snapshot_verified:
+        # Test hooks often model a worker with a synthetic PID. Keep their
+        # historical root-only contract, but only release once the hook proves
+        # that root has gone; production cannot make that inference safely.
+        if signal_fn is not None:
+            info["termination_attempted"] = True
+            with contextlib.suppress(ProcessLookupError, OSError):
+                kill(int(pid), signal.SIGTERM)
+            info["terminated"] = not _worker_alive(pid, started_at)
+            return info
+        # A root exit erases PPID ancestry.  Without a before-kill verified snapshot
+        # we cannot prove a retry will not overlap an effect-capable orphan.
+        info["tree_snapshot_failed"] = True
+        info["termination_error"] = "could not snapshot verified descendant identities before root exit"
         return info
 
     info["termination_attempted"] = True
-    try:
-        kill(int(pid), signal.SIGTERM)
-    except ProcessLookupError:
-        # Already gone = successful termination. Leaving terminated=False would
-        # make the reclaim guard misread a dead worker as alive and defer forever.
-        info["terminated"] = True
-        return info
-    except OSError:
-        return info
-
-    if _poll_worker_exit(pid, started_at):
-        info["terminated"] = True
-        return info
-    if _worker_alive(pid, started_at):
-        if not _sigkill(kill, pid):
+    # Re-check immediately before the destructive host call. A recycled root
+    # itself is not killed, but its already-verified snapshot remains ours to
+    # sweep below; do not discard that fence just because PPID ancestry vanished.
+    root_recycled = _kb._pid_alive(pid) and _pid_recycled(pid, started_at)
+    if root_recycled:
+        info["pid_recycled"] = True
+    elif sys.platform == "win32" and signal_fn is None:
+        # Git Bash/vnev shims do not reliably propagate os.kill; taskkill /T reaches
+        # the worker's complete Windows process tree in one host-native operation.
+        try:
+            from hermes_cli._subprocess_compat import windows_hide_flags
+            result = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"], stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                errors="replace", timeout=10, creationflags=windows_hide_flags(),
+            )
+            if result.returncode != 0 and _worker_alive(pid, started_at):
+                info["termination_error"] = (result.stderr or result.stdout or "taskkill failed").strip()
+                return info
+            info["sigkill"] = True
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+            info["termination_error"] = str(exc)
             return info
-        info["sigkill"] = True
-    info["terminated"] = not _worker_alive(pid, started_at)
+    elif not root_recycled:
+        try:
+            kill(int(pid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # already gone; its snapshot remains the orphan fence below
+        except OSError as exc:
+            info["termination_error"] = str(exc)
+            return info
+        if _worker_alive(pid, started_at):
+            _poll_worker_exit(pid, started_at)
+        if _worker_alive(pid, started_at):
+            if not _sigkill(kill, pid):
+                return info
+            info["sigkill"] = True
+
+    survivors = _poll_descendant_exit(descendants)
+    if survivors and sys.platform == "win32" and signal_fn is None:
+        from hermes_cli._subprocess_compat import windows_hide_flags
+
+        # A taskkill /T race can leave a descendant after the root has exited.
+        # The pre-kill snapshot is now the only safe ownership proof, so sweep
+        # every still-matching identity individually rather than losing it when
+        # its PPID is reparented before the next dispatcher tick.
+        survivor_errors: dict[int, str] = {}
+        for descendant in survivors:
+            if _process_fingerprint(descendant) != descendants[descendant]:
+                continue
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/PID", str(descendant), "/T", "/F"], stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                    errors="replace", timeout=10, creationflags=windows_hide_flags(),
+                )
+                if result.returncode != 0 and _process_fingerprint(descendant) == descendants[descendant]:
+                    survivor_errors[descendant] = (result.stderr or result.stdout or "taskkill failed").strip()
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
+                survivor_errors[descendant] = str(exc)
+        survivors = _poll_descendant_exit(descendants)
+        if survivor_errors:
+            info["descendant_termination_errors"] = survivor_errors
+    if survivors and sys.platform != "win32":
+        # Parent got its graceful window first. Only snapshot identities still
+        # matching are ours; a recycled number is never signalled.
+        for descendant in survivors:
+            with contextlib.suppress(ProcessLookupError, OSError):
+                kill(descendant, signal.SIGTERM)
+        survivors = _poll_descendant_exit(descendants)
+        if survivors:
+            for descendant in survivors:
+                _sigkill(kill, descendant)
+            survivors = _poll_descendant_exit(descendants)
+    info["surviving_descendant_pids"] = survivors
+    info["terminated"] = not _worker_alive(pid, started_at) and not survivors
     return info
 
 
@@ -569,7 +690,8 @@ def _worker_survived_termination(termination: dict) -> bool:
     """
     return bool(
         termination.get("host_local")
-        and (termination.get("termination_attempted") or termination.get("signal_refused"))
+        and (termination.get("termination_attempted") or termination.get("signal_refused")
+             or termination.get("tree_snapshot_failed") or termination.get("termination_unavailable"))
         and not termination.get("terminated")
     )
 
@@ -687,18 +809,19 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             _kb._log.warning("kanban: task %s worker pid %s exceeded max runtime but has no verified "
                              "identity; not signalled", tid, pid)
             continue
-        # SIGTERM then SIGKILL after 5 s grace; workers wanting a cleaner
-        # shutdown install their own SIGTERM handler. A recycled PID (fingerprint
-        # mismatch) is never signalled: the worker is already gone.
-        killed = False
-        kill = _kill_fn(signal_fn)
-        if kill is not None and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at)):
-            with contextlib.suppress(ProcessLookupError, OSError):
-                kill(pid, signal.SIGTERM)
-            # Short polling wait — no time.sleep on the write txn.
-            _poll_worker_exit(pid, started_at)
-            if _worker_alive(pid, started_at):
-                killed = _sigkill(kill, pid)
+        # Snapshot and terminate the entire verified worker tree before releasing
+        # the claim. A root-only kill can orphan a shell/runtime child and let a
+        # retry perform overlapping external effects.
+        termination = _terminate_reclaimed_worker(
+            pid, row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
+        )
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, tid, row["claim_lock"], now, termination,
+                reason="max_runtime_worker_tree_alive",
+            )
+            continue
+        killed = bool(termination.get("sigkill"))
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):
@@ -719,6 +842,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     "sigkill": killed,
                     "retry_status": retry_status,
                 }
+                payload.update(termination)
                 run_id = _kb._end_run(
                     conn, tid, outcome="timed_out", status="timed_out",
                     error=error, metadata=payload,

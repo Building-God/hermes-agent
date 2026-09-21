@@ -41,23 +41,25 @@ def _claimed_running(conn, *, pid: int, started_at, max_runtime=None) -> str:
 
 
 def test_recycled_pid_is_reclaimed_without_being_signalled(board):
-    """Our own live PID with a foreign fingerprint models a post-reboot recycle: the claim is released
-    (dead worker), no signal is sent, and max-runtime enforcement does not SIGTERM the stranger either."""
+    """A recycled root is never signalled or treated as whole-tree proof: its claim
+    stays fenced until an operator can inspect possible pre-recycle descendants."""
     conn = board
     killed = []
     stranger_fingerprint = 1  # no live process started at tick 1
     tid = _claimed_running(conn, pid=os.getpid(), started_at=stranger_fingerprint, max_runtime=1)
 
     assert kbd._worker_alive(os.getpid(), stranger_fingerprint) is False
-    assert tid in kbd.enforce_max_runtime(conn, signal_fn=lambda pid, sig: killed.append((pid, sig)))
+    assert kbd.enforce_max_runtime(conn, signal_fn=lambda pid, sig: killed.append((pid, sig))) == []
     assert killed == []
     task = kb.get_task(conn, tid)
-    assert task.status == "ready" and task.worker_pid is None
+    assert task is not None and task.status == "running" and task.worker_pid == os.getpid()
+    assert any(event.kind == "reclaim_deferred" for event in kb.list_events(conn, tid))
 
     tid2 = _claimed_running(conn, pid=os.getpid(), started_at=stranger_fingerprint)
-    assert kb.release_stale_claims(conn, signal_fn=lambda pid, sig: killed.append((pid, sig))) == 1
+    assert kb.release_stale_claims(conn, signal_fn=lambda pid, sig: killed.append((pid, sig))) == 0
     assert killed == []
-    assert kb.get_task(conn, tid2).status == "ready"
+    task2 = kb.get_task(conn, tid2)
+    assert task2 is not None and task2.status == "running"
 
 
 def test_matching_fingerprint_keeps_the_live_worker(board):
@@ -99,10 +101,11 @@ def test_same_pid_and_start_tick_on_another_boot_is_foreign(board, monkeypatch):
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET worker_started_at = ? WHERE id = ?", (other_boot, tid))
     assert kbd._worker_alive(os.getpid(), other_boot) is False
-    assert tid in kbd.enforce_max_runtime(conn, signal_fn=lambda pid, sig: killed.append((pid, sig)))
+    assert kbd.enforce_max_runtime(conn, signal_fn=lambda pid, sig: killed.append((pid, sig))) == []
     assert killed == []
     task = kb.get_task(conn, tid)
-    assert task.status == "ready" and task.worker_pid is None
+    assert task is not None and task.status == "running" and task.worker_pid == os.getpid()
+    assert any(event.kind == "reclaim_deferred" for event in kb.list_events(conn, tid))
 
     # The same value re-derived on THIS boot still identifies our worker (the witness is stable
     # within a boot, unlike the recorded epoch of a previous one).
