@@ -12,6 +12,7 @@ locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attach
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -863,6 +864,32 @@ class Event:
         )
 
 
+@dataclass(frozen=True)
+class TaskCheckpoint:
+    """Validated, durable progress snapshot written by one owned task run."""
+
+    task_id: str
+    sequence: int
+    run_id: int
+    progress: dict
+    payload_sha256: str
+    version: int
+    idempotency_key: Optional[str]
+    created_at: int
+
+
+class CheckpointOwnershipError(RuntimeError):
+    """The caller no longer owns this task's current running attempt."""
+
+
+class CheckpointIdempotencyError(ValueError):
+    """An idempotency key was reused for different checkpoint content."""
+
+
+class CheckpointCorruptionError(RuntimeError):
+    """A stored checkpoint failed version, JSON-canonicality, or digest validation."""
+
+
 # --- Schema ---
 
 SCHEMA_SQL = """
@@ -1025,6 +1052,21 @@ CREATE TABLE IF NOT EXISTS task_runs (
     error               TEXT
 );
 
+-- Append-only, task-scoped progress snapshots. ``sequence`` is monotonic per
+-- task across retries; a writer must prove it owns the live task_runs row.
+CREATE TABLE IF NOT EXISTS task_checkpoints (
+    task_id             TEXT NOT NULL,
+    sequence            INTEGER NOT NULL,
+    run_id              INTEGER NOT NULL,
+    progress_json       TEXT NOT NULL,
+    payload_sha256      TEXT NOT NULL,
+    version             INTEGER NOT NULL,
+    idempotency_key     TEXT,
+    created_at          INTEGER NOT NULL,
+    PRIMARY KEY (task_id, sequence),
+    UNIQUE (task_id, run_id, idempotency_key)
+);
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
@@ -1070,6 +1112,7 @@ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, c
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+CREATE INDEX IF NOT EXISTS idx_checkpoints_latest    ON task_checkpoints(task_id, sequence DESC);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
@@ -2005,6 +2048,117 @@ def _task_status(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
 def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     row = conn.execute("SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
+
+
+_CHECKPOINT_VERSION = 1
+_CHECKPOINT_MAX_PAYLOAD_BYTES = 64 * 1024
+_CHECKPOINT_MAX_IDEMPOTENCY_KEY_CHARS = 256
+
+
+def _canonical_checkpoint_payload(progress: dict) -> str:
+    """Encode a bounded progress object deterministically for hashing and replay."""
+    if not isinstance(progress, dict):
+        raise ValueError("checkpoint progress must be a JSON object")
+    try:
+        payload = json.dumps(
+            progress, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("checkpoint progress must be JSON-serializable") from exc
+    if len(payload.encode("utf-8")) > _CHECKPOINT_MAX_PAYLOAD_BYTES:
+        raise ValueError(f"checkpoint progress exceeds {_CHECKPOINT_MAX_PAYLOAD_BYTES} bytes")
+    return payload
+
+
+def _checkpoint_from_row(row: sqlite3.Row, task_id: str) -> TaskCheckpoint:
+    """Validate one row completely; never surface a partial/corrupt checkpoint."""
+    if row["task_id"] != task_id:
+        raise CheckpointCorruptionError("checkpoint task id did not match requested task")
+    try:
+        version = int(row["version"])
+        sequence = int(row["sequence"])
+        run_id = int(row["run_id"])
+        created_at = int(row["created_at"])
+    except (TypeError, ValueError) as exc:
+        raise CheckpointCorruptionError("checkpoint has invalid numeric fields") from exc
+    if version != _CHECKPOINT_VERSION or sequence < 1 or run_id < 1:
+        raise CheckpointCorruptionError("checkpoint has an unsupported version or invalid identity")
+    payload = _lossy_text(row["progress_json"])
+    digest = _lossy_text(row["payload_sha256"])
+    if not isinstance(payload, str) or not isinstance(digest, str):
+        raise CheckpointCorruptionError("checkpoint payload or digest is invalid")
+    try:
+        progress = json.loads(payload)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise CheckpointCorruptionError("checkpoint payload is not valid JSON") from exc
+    try:
+        canonical = _canonical_checkpoint_payload(progress)
+    except ValueError as exc:
+        raise CheckpointCorruptionError("checkpoint payload is not a valid bounded progress object") from exc
+    expected_digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if payload != canonical or digest != expected_digest:
+        raise CheckpointCorruptionError("checkpoint integrity validation failed")
+    key = _lossy_text(row["idempotency_key"])
+    return TaskCheckpoint(task_id, sequence, run_id, progress, digest, version, key, created_at)
+
+
+def save_task_checkpoint(
+    conn: sqlite3.Connection, task_id: str, *, expected_run_id: int, progress: dict,
+    idempotency_key: Optional[str] = None,
+) -> TaskCheckpoint:
+    """Append progress for the caller's current running attempt.
+
+    The task/run fence rejects stale or reclaimed workers. Retrying an identical
+    idempotency key during that same run returns its original append; a changed
+    payload is rejected rather than silently creating another checkpoint.
+    """
+    canonical = _canonical_checkpoint_payload(progress)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if not isinstance(expected_run_id, int) or isinstance(expected_run_id, bool) or expected_run_id < 1:
+        raise ValueError("expected_run_id must be a positive integer")
+    if idempotency_key is not None:
+        if not isinstance(idempotency_key, str) or not idempotency_key:
+            raise ValueError("idempotency_key must be a non-empty string when provided")
+        if len(idempotency_key) > _CHECKPOINT_MAX_IDEMPOTENCY_KEY_CHARS:
+            raise ValueError("idempotency_key is too long")
+    with write_txn(conn):
+        owner = conn.execute(
+            "SELECT t.status, t.current_run_id, r.task_id AS run_task_id, r.status AS run_status "
+            "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id WHERE t.id = ?",
+            (task_id,),
+        ).fetchone()
+        if not owner or owner["status"] != "running" or owner["current_run_id"] != expected_run_id \
+                or owner["run_task_id"] != task_id or owner["run_status"] != "running":
+            raise CheckpointOwnershipError(f"{task_id} is not running under run {expected_run_id}")
+        if idempotency_key is not None:
+            existing = conn.execute(
+                "SELECT * FROM task_checkpoints WHERE task_id = ? AND run_id = ? AND idempotency_key = ?",
+                (task_id, expected_run_id, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                checkpoint = _checkpoint_from_row(existing, task_id)
+                if checkpoint.progress != progress:
+                    raise CheckpointIdempotencyError("idempotency_key was already used with different progress")
+                return checkpoint
+        sequence = int(conn.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM task_checkpoints WHERE task_id = ?", (task_id,),
+        ).fetchone()[0])
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_checkpoints "
+            "(task_id, sequence, run_id, progress_json, payload_sha256, version, idempotency_key, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (task_id, sequence, expected_run_id, canonical, digest, _CHECKPOINT_VERSION, idempotency_key, now),
+        )
+    return TaskCheckpoint(task_id, sequence, expected_run_id, progress, digest, _CHECKPOINT_VERSION, idempotency_key, now)
+
+
+def load_task_checkpoint(conn: sqlite3.Connection, task_id: str) -> Optional[TaskCheckpoint]:
+    """Return the latest valid checkpoint for exactly ``task_id`` across attempts."""
+    row = conn.execute(
+        "SELECT * FROM task_checkpoints WHERE task_id = ? ORDER BY sequence DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    return _checkpoint_from_row(row, task_id) if row is not None else None
 
 
 # Distinguishes "caller named the acting profile" (which may legitimately be
