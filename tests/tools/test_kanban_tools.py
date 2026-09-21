@@ -85,6 +85,21 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
+def test_create_exposes_and_persists_bounded_retry_limit(worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+    from tools.kanban_tools_schemas import KANBAN_CREATE_SCHEMA
+
+    assert "max_retries" in KANBAN_CREATE_SCHEMA["parameters"]["properties"]
+    created = json.loads(kt._handle_create({
+        "title": "bounded child", "assignee": "test-worker", "max_retries": 1,
+    }))
+    assert created["ok"] is True
+    with kbc.connect_closing() as conn:
+        assert kb.get_task(conn, created["task_id"]).max_retries == 1
+
+
 def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
@@ -202,7 +217,7 @@ def test_complete_reports_registered_attachments(worker_env):
 def test_request_review_rejects_unknown_reviewer_without_mutation(monkeypatch, worker_env, tmp_path):
     """#106163: a non-profile ``reviewer`` (e.g. the literal "reviewer") must be
     refused with an error the model sees, leaving the task running under the
-    implementer — never parked in ``review`` on an assignee nobody can spawn."""
+    implementer - never parked in ``review`` on an assignee nobody can spawn."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     from tools import kanban_tools as kt
@@ -251,7 +266,7 @@ def test_unbound_worker_cannot_mutate_card(monkeypatch, worker_env):
     from tools import kanban_tools as kt
 
     # Worker is scoped to the task (HERMES_KANBAN_TASK set by the fixture) but
-    # has NO run id — the unbound state the dispatcher never produces.
+    # has NO run id - the unbound state the dispatcher never produces.
     monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
 
     for handler, args in [
@@ -269,7 +284,7 @@ def test_unbound_worker_cannot_mutate_card(monkeypatch, worker_env):
         assert task.status == "running"
         assert task.current_run_id is not None
 
-    # A bound worker (run id present) still completes normally — the guard only
+    # A bound worker (run id present) still completes normally - the guard only
     # fires on the unbound state, never on the legitimate dispatcher path.
     with kbc.connect() as conn:
         run_id = kb.get_task(conn, worker_env).current_run_id
@@ -462,7 +477,7 @@ def test_block_dependency_without_open_parent_is_rekinded(worker_env):
 
 def test_heartbeat_extends_claim_expires(worker_env):
     """The kanban_heartbeat tool MUST extend claim_expires, not just
-    update last_heartbeat_at — otherwise long-running workers loop the
+    update last_heartbeat_at - otherwise long-running workers loop the
     heartbeat tool diligently and still get reclaimed by
     release_stale_claims at DEFAULT_CLAIM_TTL_SECONDS.
 
@@ -714,7 +729,7 @@ def test_worker_lifecycle_through_tools(worker_env):
     the dispatcher/notifier expect."""
     from tools import kanban_tools as kt
 
-    # 1. show — worker orientation
+    # 1. show - worker orientation
     show = json.loads(kt._handle_show({}))
     assert show["task"]["id"] == worker_env
 
@@ -754,7 +769,7 @@ def test_worker_lifecycle_through_tools(worker_env):
         assert run.outcome == "completed"
         assert run.metadata == {"child_task": child_out["task_id"]}
         # Child is todo (parent just finished, but recompute_ready may
-        # have promoted it — complete_task runs recompute internally).
+        # have promoted it - complete_task runs recompute internally).
         child = kb.get_task(conn, child_out["task_id"])
         assert child.status == "ready", (
             f"child should be ready after parent done, got {child.status}"
@@ -785,7 +800,7 @@ def test_kanban_guidance_prompt_size_bounded():
 
     assert len(KANBAN_GUIDANCE) < 8000, (
         f"KANBAN_GUIDANCE is {len(KANBAN_GUIDANCE)} chars; it is injected into "
-        "every kanban worker's system prompt — trim it or consciously re-bound "
+        "every kanban worker's system prompt - trim it or consciously re-bound "
         "this invariant with justification."
     )
 
@@ -814,7 +829,7 @@ def test_kanban_guidance_orchestrator_decision_ownership():
 # are unrestricted.
 #
 # Orchestrator profiles (no HERMES_KANBAN_TASK in env) are intentionally
-# exempt — their job is routing, and they sometimes close out child
+# exempt - their job is routing, and they sometimes close out child
 # tasks on behalf of the child.
 
 
@@ -848,7 +863,7 @@ def test_worker_can_comment_on_foreign_task(worker_env):
     """Cross-task commenting must remain unrestricted (#19713 policy).
 
     The author-forgery hardening removed args['author'] but deliberately
-    did NOT add an ownership gate to kanban_comment — comments are the
+    did NOT add an ownership gate to kanban_comment - comments are the
     documented handoff channel between tasks. This test pins that policy
     so a future change accidentally adding ``_enforce_worker_task_ownership``
     to ``_handle_comment`` would fail CI immediately.
@@ -870,7 +885,7 @@ def test_worker_can_comment_on_foreign_task(worker_env):
     assert d.get("ok") is True, f"cross-task comment must succeed: {d}"
 
     # The comment lands on the foreign task, attributed to the worker's
-    # HERMES_PROFILE — never to a caller-controlled string.
+    # HERMES_PROFILE - never to a caller-controlled string.
     conn = kbc.connect()
     try:
         comments = kb.list_comments(conn, other)
@@ -882,11 +897,11 @@ def test_worker_can_comment_on_foreign_task(worker_env):
 
 
 def test_worker_unblock_rejects_foreign_task_id(worker_env):
-    """A worker cannot unblock any task — kanban_unblock is orchestrator-only.
+    """A worker cannot unblock any task - kanban_unblock is orchestrator-only.
 
     The check fires before the per-task ownership check, so the error
     surface is the orchestrator-only refusal rather than the
-    cross-task-ownership refusal. Either is fine — the property we're
+    cross-task-ownership refusal. Either is fine - the property we're
     pinning is "worker cannot mutate foreign task via kanban_unblock".
     """
     from hermes_cli import kanban_db as kb
@@ -942,7 +957,7 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Optional ``board`` parameter — per-call DB override
+# Optional ``board`` parameter - per-call DB override
 # ---------------------------------------------------------------------------
 #
 # The dispatcher pins the active board via HERMES_KANBAN_BOARD env var,
@@ -959,14 +974,14 @@ def multi_board_env(monkeypatch, tmp_path):
 
     Returns ``("default", "alt")`` slugs. The default board has one
     pre-existing task ``seed_default``; ``alt`` has ``seed_alt``. No
-    HERMES_KANBAN_TASK is pinned (orchestrator context) — workers test
+    HERMES_KANBAN_TASK is pinned (orchestrator context) - workers test
     the env-task case via the existing ``worker_env`` fixture.
     """
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     # Make sure neither HERMES_KANBAN_DB nor HERMES_KANBAN_BOARD pin a
-    # board — the test is specifically about the per-call override.
+    # board - the test is specifically about the per-call override.
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
@@ -977,7 +992,7 @@ def multi_board_env(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     kb._INITIALIZED_PATHS.clear()
-    # Default board — implicit
+    # Default board - implicit
     conn = kbc.connect()
     try:
         seed_default = kb.create_task(
@@ -985,7 +1000,7 @@ def multi_board_env(monkeypatch, tmp_path):
         )
     finally:
         conn.close()
-    # Alt board — explicit slug routes the connection to a separate DB
+    # Alt board - explicit slug routes the connection to a separate DB
     conn = kbc.connect(board="alt")
     try:
         seed_alt = kb.create_task(
@@ -1003,7 +1018,7 @@ def multi_board_env(monkeypatch, tmp_path):
 
 def test_board_param_none_falls_back_to_env(worker_env):
     """When ``board`` is omitted or None, behaviour is unchanged from
-    before this feature — calls land on whatever the env resolves to.
+    before this feature - calls land on whatever the env resolves to.
     Regression guard against accidentally rewiring default resolution."""
     from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
@@ -1154,7 +1169,7 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     """The config gate kanban.auto_subscribe_on_create=false must
     suppress auto-subscription even when the session has a delivery
     channel. This is the knob that addresses the upstream design
-    concern from PR #19718 (reverted in #19721) — users who want
+    concern from PR #19718 (reverted in #19721) - users who want
     explicit kanban_notify-subscribe calls per task get that."""
     # worker_env already created <tmp>/.hermes; use a fresh sibling
     # home to avoid mkdir() colliding with the worker's directory.
@@ -1206,7 +1221,7 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
 
 
 # ---------------------------------------------------------------------------
-# Attachments — kanban_attach / kanban_attach_url / kanban_attachments
+# Attachments - kanban_attach / kanban_attach_url / kanban_attachments
 # ---------------------------------------------------------------------------
 
 
@@ -1236,7 +1251,7 @@ def test_attach_url_rejects_non_http_scheme(worker_env):
 
 
 # ---------------------------------------------------------------------------
-# kanban_attach_url — SSRF guard (tools/url_safety.is_safe_url per hop)
+# kanban_attach_url - SSRF guard (tools/url_safety.is_safe_url per hop)
 # ---------------------------------------------------------------------------
 
 
@@ -1280,7 +1295,7 @@ def test_attach_url_blocks_loopback(worker_env, default_url_guard):
 
 def _fake_public_dns(monkeypatch, mapping):
     """Patch url_safety's getaddrinfo so hostnames in ``mapping`` resolve to
-    the given (public) IPs and literal IPs resolve to themselves — no real
+    the given (public) IPs and literal IPs resolve to themselves - no real
     DNS or network traffic."""
     import ipaddress
     import socket as _socket
