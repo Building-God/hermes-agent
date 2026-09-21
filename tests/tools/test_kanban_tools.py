@@ -253,6 +253,88 @@ def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
         conn.close()
 
 
+def test_explicit_complete_artifact_stages_from_dir_workspace(worker_env, tmp_path):
+    """A model-declared file in a persistent dir workspace must still attach."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    workspace = tmp_path / "owned-dir"
+    workspace.mkdir()
+    artifact = workspace / "report.txt"
+    artifact.write_text("durable", encoding="utf-8")
+    with kbc.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET workspace_kind = 'dir', workspace_path = ? WHERE id = ?",
+            (str(workspace), worker_env),
+        )
+    out = json.loads(kt._handle_complete({"summary": "done", "artifacts": [str(artifact)]}))
+
+    assert out["ok"] is True, out
+    assert [(a["filename"], a["size"]) for a in out["attachments"]] == [("report.txt", 7)]
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "done"
+
+
+def test_explicit_review_artifact_outside_workspace_refuses_without_transition(worker_env, tmp_path):
+    """Explicit review evidence cannot silently remain an ephemeral profile file."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_workspace as kbw
+    from tools import kanban_tools as kt
+
+    profile_scratch = tmp_path / ".hermes" / "cache" / "scratch"
+    profile_scratch.mkdir(parents=True)
+    stray = profile_scratch / "report.txt"
+    stray.write_text("ephemeral", encoding="utf-8")
+    with kbc.connect() as conn:
+        workspace = kbw.resolve_workspace(kb.get_task(conn, worker_env))
+        kbw.set_workspace_path(conn, worker_env, workspace)
+    out = json.loads(kt._handle_request_review({
+        "summary": "ready", "artifacts": [str(stray)],
+    }))
+
+    assert "HERMES_KANBAN_WORKSPACE" in out["error"]
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+        assert kb.list_attachments(conn, worker_env) == []
+
+
+def test_explicit_artifact_failures_leave_tool_task_in_flight(worker_env, tmp_path, monkeypatch):
+    """Missing, oversized, and symlink-escape evidence cannot yield empty success."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_workspace as kbw
+    from tools import kanban_tools as kt
+
+    with kbc.connect() as conn:
+        workspace = kbw.resolve_workspace(kb.get_task(conn, worker_env))
+        kbw.set_workspace_path(conn, worker_env, workspace)
+    missing = workspace / "missing.txt"
+    missing_out = json.loads(kt._handle_complete({"summary": "done", "artifacts": [str(missing)]}))
+    assert "regular file" in missing_out["error"]
+
+    monkeypatch.setattr(kb, "KANBAN_ATTACHMENT_MAX_BYTES", 1)
+    oversized = workspace / "oversized.txt"
+    oversized.write_bytes(b"12")
+    out = json.loads(kt._handle_complete({"summary": "done", "artifacts": [str(oversized)]}))
+
+    assert "limit" in out["error"]
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"x")
+    link = workspace / "escape.txt"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pass  # Windows developer-mode symlink privilege is not available in all CI hosts.
+    else:
+        escaped = json.loads(kt._handle_complete({"summary": "done", "artifacts": [str(link)]}))
+        assert "outside HERMES_KANBAN_WORKSPACE" in escaped["error"]
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "running"
+        assert kb.list_attachments(conn, worker_env) == []
+
+
 def test_complete_reports_registered_attachments(worker_env):
     """#117360: artifact staging is atomic with the completion write, so the
     worker's pre-completion `kanban_attachments` readback is always empty and

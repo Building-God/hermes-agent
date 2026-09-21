@@ -762,6 +762,7 @@ def _handle_complete(args: dict, **kw) -> str:
     artifacts = _coerce_str_list(args.get("artifacts"), "artifacts", "file paths", strip=True)
     if artifacts:
         metadata = _merge_artifacts(metadata, artifacts)
+        metadata["_explicit_artifacts"] = list(artifacts)
     _check(summary or result, "provide at least one of: summary (preferred), result")
     _require_dict_metadata(metadata)
     metadata = _stamp_worker_session_metadata(tid, metadata)
@@ -889,6 +890,7 @@ def _handle_request_review(args: dict, **kw) -> str:
     artifacts = _coerce_str_list(args.get("artifacts"), "artifacts", "file paths", strip=True)
     if artifacts:
         metadata = _merge_artifacts(metadata, artifacts)
+        metadata["_explicit_artifacts"] = list(artifacts)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     # Reviewer is model-supplied free text stored durably on the event payload.
     reviewer = _redact_opt(args.get("reviewer") or None)

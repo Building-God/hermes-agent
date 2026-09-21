@@ -3155,21 +3155,45 @@ def _merge_completion_prose_artifacts(
 def _persist_scratch_completion_artifacts(
     conn: sqlite3.Connection, task_id: str, metadata: dict,
 ) -> None:
-    """Copy scratch-workspace completion artifacts before cleanup removes them."""
+    """Stage declared worker artifacts without trusting paths outside its workspace.
+
+    ``_explicit_artifacts`` is an internal marker placed only by the model-tool
+    surface.  Those paths are a delivery contract: every one must become an
+    attachment or the lifecycle transition rolls back.  Historical metadata
+    and prose-derived references retain their best-effort behavior.
+    """
     raw_artifacts = metadata.get("artifacts")
+    explicit_artifacts = metadata.pop("_explicit_artifacts", None)
+    explicit = isinstance(explicit_artifacts, (list, tuple))
+    if explicit:
+        raw_artifacts = explicit_artifacts
     if not isinstance(raw_artifacts, (list, tuple)):
         return
 
-    workspace = _scratch_workspace(conn, task_id)
-    if workspace is None:
+    row = conn.execute(
+        "SELECT workspace_path FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    workspace_path = row["workspace_path"] if row else None
+    if not workspace_path:
+        if explicit:
+            raise ArtifactPreservationError(
+                "declared artifact cannot be staged because this task has no resolved "
+                "HERMES_KANBAN_WORKSPACE; copy it into HERMES_KANBAN_WORKSPACE and retry"
+            )
         return
+    workspace = Path(workspace_path).expanduser()
     is_managed, board = _managed_scratch_path_info(workspace)
-    if not is_managed:
-        return
 
     try:
         workspace_root = workspace.resolve()
-    except OSError:
+    except OSError as exc:
+        if explicit:
+            raise ArtifactPreservationError(
+                "declared artifact cannot be staged because HERMES_KANBAN_WORKSPACE "
+                f"cannot be resolved: {exc}"
+            ) from exc
+        return
+    if not explicit and not is_managed:
         return
 
     attachment_dir = task_attachments_dir(task_id, board=board)
@@ -3193,26 +3217,34 @@ def _persist_scratch_completion_artifacts(
         src = Path(artifact).expanduser()
         try:
             resolved_src = src.resolve()
-        except OSError:
+        except OSError as exc:
+            if explicit:
+                _discard_copies()
+                raise ArtifactPreservationError(
+                    f"declared artifact cannot be resolved: {artifact}; copy it into "
+                    f"HERMES_KANBAN_WORKSPACE and retry ({exc})"
+                ) from exc
             persisted.append(artifact)
             continue
 
         if not resolved_src.is_relative_to(workspace_root):
-            if profile_scratch is not None and resolved_src.is_relative_to(profile_scratch):
+            if explicit or (profile_scratch is not None and resolved_src.is_relative_to(profile_scratch)):
                 _discard_copies()
                 raise ArtifactPreservationError(
-                    f"declared worker profile-scratch artifact is not durable: {artifact}; "
+                    f"declared artifact is outside HERMES_KANBAN_WORKSPACE and is not durable: {artifact}; "
                     "copy it into HERMES_KANBAN_WORKSPACE and declare that path"
                 )
             persisted.append(artifact)
             continue
 
         problem = None
-        if not src.is_file():
-            problem = f"declared scratch artifact is unavailable or not a regular file: {artifact}"
+        if src.is_symlink():
+            problem = f"declared artifact must not be a symlink: {artifact}"
+        elif not src.is_file():
+            problem = f"declared artifact is unavailable or not a regular file: {artifact}"
         elif resolved_src.stat().st_size > KANBAN_ATTACHMENT_MAX_BYTES:
             problem = (
-                f"declared scratch artifact exceeds the "
+                f"declared artifact exceeds the "
                 f"{KANBAN_ATTACHMENT_MAX_BYTES}-byte limit: {artifact}"
             )
         if problem:
