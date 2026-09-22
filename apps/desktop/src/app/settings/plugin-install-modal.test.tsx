@@ -3,7 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-// The host tab lists installed plugins on mount; only an `install` action counts as installing.
+// The shared action row opens the modal; requests below belong to the install flow.
 const { requestGateway } = vi.hoisted(() => ({
   requestGateway: vi.fn(async (_method: string, _params?: Record<string, unknown>): Promise<unknown> => ({
     plugins: []
@@ -193,7 +193,7 @@ describe('Install from Git entry flow', () => {
     )
   })
 
-  it('offers Connect now for deferred MCP servers and reloads them on click', async () => {
+  it.each(['default', 'research'])('connects deferred MCP servers and refreshes the %s profile', async profile => {
     const { $notifications, dismissNotification } = await import('@/store/notifications')
     probePluginRepo.mockResolvedValue({ ok: true, agent: true, desktop: false, warnings: [] })
     requestGateway.mockImplementation(async (method: string, params?: { action?: unknown }) => {
@@ -210,7 +210,7 @@ describe('Install from Git entry flow', () => {
       return { plugins: [] }
     })
     renderFlow()
-    act(() => openPluginInstallRequest({ repo: 'https://github.com/example/nvidia-app' }))
+    act(() => openPluginInstallRequest({ profile, repo: 'https://github.com/example/nvidia-app' }))
     fireEvent.click(await screen.findByRole('button', { name: 'Install' }))
 
     await waitFor(() => {
@@ -220,12 +220,17 @@ describe('Install from Git entry flow', () => {
     })
 
     const toast = $notifications.get().find(item => item.action?.label === 'Connect now')
+
+    // Do not let the install's earlier list refresh satisfy the post-connect assertion.
+    requestGateway.mockClear()
     toast?.action?.onClick()
 
     await waitFor(() =>
-      expect(requestGateway).toHaveBeenCalledWith('reload.mcp', expect.objectContaining({ confirm: true }))
+      expect(requestGateway).toHaveBeenNthCalledWith(1, 'reload.mcp', expect.objectContaining({ confirm: true }))
     )
-    await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('plugins.manage', { action: 'list' }))
+    await waitFor(() =>
+      expect(requestGateway).toHaveBeenNthCalledWith(2, 'plugins.manage', { action: 'list', profile })
+    )
 
     for (const item of $notifications.get()) {
       dismissNotification(item.id)
