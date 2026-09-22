@@ -318,8 +318,26 @@ def _select_tool_names(enabled_toolsets: Optional[List[str]], disabled_toolsets:
         enabled = list(enabled_toolsets)
         # Dispatcher-spawned kanban workers always get the lifecycle handoff
         # tools, even when the assignee profile restricts its chat toolsets.
+        # BUT: if the profile already opted into a narrower kanban-family toolset
+        # (kanban_reviewer, or any future kanban_* variant that carries the
+        # lifecycle tools it needs), force-adding the full "kanban" toolset
+        # would defeat that narrowing and re-expose kanban_block / kanban_create
+        # / kanban_link / kanban_unblock — exactly the regression channel from
+        # t_ac1771f3 (reviewer projecting internal review ambiguity onto the
+        # Harry needs_input surface). Skip force-add when any already-enabled
+        # toolset resolves to at least one kanban_* tool, on the reasoning that
+        # the profile author has taken responsibility for the kanban surface.
+        def _already_has_kanban() -> bool:
+            for _name in enabled:
+                try:
+                    if any(t.startswith("kanban_") for t in resolve_toolset(_name)):
+                        return True
+                except Exception:
+                    continue
+            return False
         if (os.environ.get("HERMES_KANBAN_TASK") and not _is_delegated_child_context()
-                and _is_dispatcher_owned_worker() and "kanban" not in enabled):
+                and _is_dispatcher_owned_worker() and "kanban" not in enabled
+                and not _already_has_kanban()):
             enabled.append("kanban")
         _apply_toolset_selection(tools, enabled, quiet_mode, disable=False)
     else:
