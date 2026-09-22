@@ -69,7 +69,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = kbd._positive_int(
             _kanban_cfg.get("max_in_progress_per_profile"), None
         )
-        # Memory-derived default when unset — same fallback the gateway applies.
+        # Memory-derived default when unset - same fallback the gateway applies.
         max_in_progress = kbd.resolve_max_in_progress(
             kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
         )
@@ -143,7 +143,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"Deferred ({who} at per-profile cap, {current} running): {tid}")
     if res.skipped_nonspawnable:
         print(
-            f"Skipped (non-spawnable assignee — terminal lane, OK): "
+            f"Skipped (non-spawnable assignee - terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
     for tid, reason in res.respawn_guarded:
@@ -158,7 +158,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
 
 
 _DAEMON_DEPRECATED = (
-    "hermes kanban daemon: DEPRECATED — the dispatcher now runs\ninside the gateway. To use "
+    "hermes kanban daemon: DEPRECATED - the dispatcher now runs\ninside the gateway. To use "
     "kanban:\n\n    hermes gateway start       # starts the gateway + embedded dispatcher\n\nReady "
     "tasks will be picked up on the next dispatcher tick\n(default: every 60 seconds). Configure "
     "via config.yaml:\n\n    kanban:\n      dispatch_in_gateway: true      # default\n      "
@@ -170,7 +170,7 @@ _DAEMON_DEPRECATED = (
 
 
 def _cmd_daemon(args: argparse.Namespace) -> int:
-    """Deprecated — the dispatcher now runs inside the gateway. Kept so old
+    """Deprecated - the dispatcher now runs inside the gateway. Kept so old
     scripts/systemd units get a clear migration message; ``--force`` (hidden
     from --help) keeps the standalone loop for hosts that truly cannot run the
     gateway. The default path exits 2 so nobody accidentally runs two
@@ -199,7 +199,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     )
 
     # Health telemetry: warn when every tick finds ready work but spawns
-    # nothing (broken profile, PATH drift, missing venv, credential loss) —
+    # nothing (broken profile, PATH drift, missing venv, credential loss) -
     # the per-task breaker auto-blocks quietly, so the operator needs a signal.
     HEALTH_WINDOW = 6  # ticks (default 30s at interval=5)
     health_state = {"bad_ticks": 0, "last_warn_at": 0}
@@ -215,7 +215,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
 
     def _on_tick(res):
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
-        if ready_pending and not res.spawned:
+        if ready_pending and not res.spawned and not kbd.held_by_capacity([res]):
             health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0
@@ -369,10 +369,10 @@ def _cmd_repair(args: argparse.Namespace) -> int:
         return 0 if report.status in {"ok", "repaired", "missing"} else 1
 
     if report.status == "missing":
-        print(f"No kanban DB at {report.db_path} — nothing to repair.")
+        print(f"No kanban DB at {report.db_path} - nothing to repair.")
         return 0
     if report.status == "ok":
-        print(f"{report.db_path}: integrity_check ok — no repair needed.")
+        print(f"{report.db_path}: integrity_check ok - no repair needed.")
         return 0
     if report.status == "repaired":
         print(f"{report.db_path}: repaired.")
@@ -393,12 +393,12 @@ def _cmd_repair(args: argparse.Namespace) -> int:
         for line in (report.post_repair_messages or [])[:10]:
             err(f"    {line}")
     else:
-        err("  Not an index-only failure — automatic REINDEX repair does not apply (fail-closed).")
+        err("  Not an index-only failure - automatic REINDEX repair does not apply (fail-closed).")
     if report.backup_path:
         err(f"  corrupt copy quarantined at: {report.backup_path}")
     err(
         "  Recover manually (copy kanban.db aside FIRST, then run "
-        "`sqlite3 <copy> \".recover\"` into a fresh file — never against "
+        "`sqlite3 <copy> \".recover\"` into a fresh file - never against "
         "the live path, a WAL-reset-vulnerable sqlite3 CLI can corrupt it "
         "further) or move the file aside to start a new board."
     )

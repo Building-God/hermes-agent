@@ -63,8 +63,8 @@ class GatewayKanbanWatchersMixin:
         Per subscription, claims ``task_events`` newer than the stored cursor
         (kinds in TERMINAL_KINDS), sends one message per event, then advances
         the cursor. The subscription is removed only when the task is
-        ``archived``: ``done`` is reversible, so the cursor — not unsubscribing
-        — is the dedup mechanism (unsub-on-terminal dropped users when the
+        ``archived``: ``done`` is reversible, so the cursor - not unsubscribing
+        - is the dedup mechanism (unsub-on-terminal dropped users when the
         dispatcher respawned a crashed task). All SQLite work runs in a thread;
         one tick's failure never stops the next.
         """
@@ -249,7 +249,7 @@ class GatewayKanbanWatchersMixin:
         return _load_config, _kb, kanban_cfg
 
     async def _kanban_dispatcher_watcher(self) -> None:
-        """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
+        """Embedded kanban dispatcher - one tick every `dispatch_interval_seconds`.
 
         Gated by `kanban.dispatch_in_gateway` (default True); when false the
         loop exits and an external `hermes kanban daemon` is expected. Each
@@ -268,7 +268,7 @@ class GatewayKanbanWatchersMixin:
         await asyncio.sleep(5)
 
         # Health telemetry (mirrors `_cmd_daemon`): warn when the ready queue
-        # is non-empty but spawns are 0 for N consecutive ticks — usually a
+        # is non-empty but spawns are 0 for N consecutive ticks - usually a
         # broken PATH, missing venv, or credential loss.
         bad_ticks = 0
         last_warn_at = 0
@@ -302,7 +302,8 @@ class GatewayKanbanWatchersMixin:
                     results = await _to_thread_process_service(dispatcher.tick_once)
                     any_spawned = _log_spawn_results(results)
                     ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
-                    bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned else 0
+                    busy = _kbd.held_by_capacity(res for _slug, res in (results or []))
+                    bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned and not busy else 0
                 now = int(time.time())
                 if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
                     held = _kbd.describe_suppression(res for _slug, res in (results or []))
@@ -342,7 +343,7 @@ _PLUGIN_COMPAT_LAZY = {
 }
 
 
-def __getattr__(name):  # PEP 562 — lazy so no import cycles
+def __getattr__(name):  # PEP 562 - lazy so no import cycles
     target = _PLUGIN_COMPAT_LAZY.get(name)
     if target is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
