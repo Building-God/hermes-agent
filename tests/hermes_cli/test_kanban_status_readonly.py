@@ -205,6 +205,8 @@ def test_idle_board_and_bounded_results(board):
     snapshot = build_snapshot(board, board="fixture")
     assert snapshot["summary"] == {
         "open": 0, "done": 12, "blocked": 0, "running": 0, "ready": 0, "idle": True,
+        "actionable_open_shown": 0, "actionable_running": 0,
+        "any_actionable_work_running": False,
         "open_shown": 0, "open_truncated": False,
     }
     assert len(snapshot["recent_results"]) == 10
@@ -384,3 +386,91 @@ def test_old_schema_reports_typed_checkpoint_as_unavailable_not_absent(board):
     task = snapshot["open_tasks"][0]
     assert task["typed_checkpoint"] == {"status": "unavailable"}
     assert "typed durable checkpoint unavailable" in render_status(snapshot)
+
+
+# --- Status-question truthful-answer contract (t_a5271120) ---
+
+def test_actionable_split_excludes_assignee_none_ledger_triage(board):
+    """Board with only an internal ledger (assignee=NULL, triage) must not
+    read as 'work running' — the operator sees "Are you working?" as a
+    question about actionable agent work, not internal bookkeeping."""
+    # Internal Scout inbox: triage row with no assignee, the dispatcher never spawns it.
+    board.execute(
+        "INSERT INTO tasks (id, title, status, assignee, created_at) "
+        "VALUES ('t_ledger', 'Scout inbox', 'triage', NULL, 1)"
+    )
+    snapshot = build_snapshot(board, board="fixture")
+    summary = snapshot["summary"]
+    assert summary["open"] == 1  # raw count still reports the ledger row
+    assert summary["running"] == 0
+    assert summary["actionable_open_shown"] == 0
+    assert summary["actionable_running"] == 0
+    assert summary["any_actionable_work_running"] is False
+    assert summary["idle"] is True
+    assert "Gateway online" in snapshot["gateway_vs_work_caveat"]
+
+
+def test_actionable_running_flags_true_when_a_worker_is_active(board):
+    """One assigned running card => actionable work is running, gateway_vs_work
+    caveat is still present so a renderer never conflates online with running."""
+    _task(board, "t_run")  # assignee='pilot' by _task; status='running'
+    snapshot = build_snapshot(board, board="fixture")
+    summary = snapshot["summary"]
+    assert summary["running"] == 1
+    assert summary["actionable_running"] == 1
+    assert summary["any_actionable_work_running"] is True
+    assert summary["idle"] is False
+    assert "Gateway online" in snapshot["gateway_vs_work_caveat"]
+
+
+def test_mixed_running_and_ledger_only_counts_assigned_as_actionable(board):
+    _task(board, "t_run")  # running, assigned
+    board.execute(
+        "INSERT INTO tasks (id, title, status, assignee, created_at) "
+        "VALUES ('t_ledger', 'Scout inbox', 'triage', '', 1)"
+    )
+    summary = build_snapshot(board, board="fixture")["summary"]
+    assert summary["open"] == 2
+    # Whitespace-only assignee treated as ledger too.
+    assert summary["actionable_open_shown"] == 1
+    assert summary["actionable_running"] == 1
+    assert summary["any_actionable_work_running"] is True
+
+
+# --- Tool availability contract: kanban_status must ship where kanban_list ships ---
+
+def test_kanban_status_and_list_ship_together_in_the_kanban_toolset(monkeypatch):
+    """Regression for t_a5271120: on default Discord the prompt named
+    kanban_status but only kanban_list/kanban_show reached the model schema.
+    Assert the toolset-level invariant: whenever kanban_list is exposed
+    kanban_status is too — same gate, same visibility. Without this, a prompt
+    saying 'use kanban_status for status questions' silently calls an absent tool."""
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    # Both belong to the 'kanban' toolset entry so they cannot drift apart.
+    from toolsets import TOOLSETS, _HERMES_CORE_TOOLS
+    assert "kanban_status" in _HERMES_CORE_TOOLS
+    kanban_bundle = TOOLSETS["kanban"]["tools"]
+    assert "kanban_list" in kanban_bundle
+    assert "kanban_status" in kanban_bundle
+    # And their check_fns must return the same visibility answer, so an
+    # operator-status question never sees kanban_list without kanban_status.
+    from tools.kanban_tools import _check_kanban_orchestrator_mode
+    from tools.registry import registry
+    # Both tools resolve to the same gate (kanban_orchestrator_mode); this asserts it.
+    status_entry = next(e for e in registry.get_all_entries() if e.name == "kanban_status")
+    list_entry = next(e for e in registry.get_all_entries() if e.name == "kanban_list")
+    assert status_entry.check_fn is list_entry.check_fn is _check_kanban_orchestrator_mode
+
+
+def test_kanban_status_schema_teaches_status_question_intent():
+    """The schema description must name the natural-language variants and the
+    online-vs-running caveat so a model reading only the tool schema (no
+    external prompt) still picks kanban_status for a status question."""
+    from tools.kanban_tools_schemas import KANBAN_STATUS_SCHEMA
+    description = KANBAN_STATUS_SCHEMA["description"].lower()
+    assert "are you working" in description
+    assert "what is happening" in description or "what's happening" in description or "is anything running" in description
+    assert "gateway online" in description
+    # Guardrail against the ledger-triage answer failure that started this task.
+    assert "ledger" in description or "assignee" in description

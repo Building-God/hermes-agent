@@ -88,12 +88,20 @@ KANBAN_LIST_SCHEMA = _schema(
 KANBAN_STATUS_SCHEMA = _schema(
     "kanban_status",
     (
-        "Answer an operator's 'what is happening?' question from a bounded, "
-        "read-only board snapshot. Includes open/done counts, open task titles "
-        "and event/checkpoint times, preserved-result sources, and notifier "
-        "cursor state. Heartbeats mean liveness, not useful progress; a settled "
-        "notifier cursor does not prove platform delivery or human receipt. "
-        "Does not return task bodies, comments, run prose, or log content."
+        "Call this FIRST for any operator question about live agent work — "
+        "'Are you working?', 'What is happening?', 'Is anything running?', "
+        "'What are you doing right now?', 'Anything in progress?'. Returns a "
+        "bounded, read-only board snapshot: open/done counts, running vs "
+        "blocked vs ready split, open task titles with event/checkpoint "
+        "times, preserved-result sources, and notifier cursor state. Gateway "
+        "online is not the same as work running — a board with zero running "
+        "cards means no active agent work even if you are answering. When "
+        "reporting to the operator, exclude 'ledger' / assignee-empty triage "
+        "cards from actionable work; those are internal-only rows the "
+        "dispatcher never spawns. Heartbeats mean liveness, not useful "
+        "progress; a settled notifier cursor does not prove platform delivery "
+        "or human receipt. Does not return task bodies, comments, run prose, "
+        "or log content."
     ),
     {
         "open_limit": _prop("integer", "Maximum open tasks returned (default 10, max 100)."),

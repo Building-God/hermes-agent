@@ -265,6 +265,19 @@ def build_snapshot(
         "ORDER BY t.completed_at DESC, t.id DESC LIMIT ?", (completed_limit,),
     ).fetchall()
     open_total = sum(counts[status] for status in OPEN_STATUSES)
+    # Rows with no assignee are internal ledger entries the dispatcher never
+    # spawns (e.g. a Scout inbox in ``triage``). An operator asking "are you
+    # working?" wants the ACTIONABLE count — anything the dispatcher can pick
+    # up or a worker is currently on. Preserve the raw counts for callers that
+    # need them; add explicit "actionable_*" splits so a status renderer never
+    # has to re-derive the distinction from titles.
+    actionable_open = sum(
+        1 for row in open_rows if (row["assignee"] or "").strip()
+    )
+    running_actionable = sum(
+        1 for row in open_rows
+        if row["status"] == "running" and (row["assignee"] or "").strip()
+    )
     return {
         "board": board,
         "summary": {
@@ -272,11 +285,21 @@ def build_snapshot(
             "running": counts["running"], "ready": counts["ready"],
             # Blocked records stay open, but are not a runnable queue or live work.
             "idle": counts["running"] == 0 and counts["ready"] == 0,
+            # ``actionable_*`` excludes assignee-empty ledger rows a dispatcher
+            # never spawns; this is the honest "is any work happening?" signal.
+            "actionable_open_shown": actionable_open,
+            "actionable_running": running_actionable,
+            "any_actionable_work_running": running_actionable > 0,
             "open_shown": len(open_rows), "open_truncated": open_total > len(open_rows),
         },
         "open_tasks": [_task_row(conn, task, completed=False, board=board) for task in open_rows],
         "recent_results": [_task_row(conn, task, completed=True, board=board) for task in done_rows],
         "delivery_caveat": "Notifier cursor state is not provider delivery or human receipt.",
+        "gateway_vs_work_caveat": (
+            "Gateway online (this tool answered) is not the same as agent work "
+            "running. Use summary.any_actionable_work_running / running to state "
+            "whether cards are currently executing."
+        ),
     }
 
 
