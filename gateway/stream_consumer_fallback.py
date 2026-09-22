@@ -338,7 +338,7 @@ class StreamFallbackMixin:
 
     async def _send_commentary(self, text: str) -> bool:
         """Send a completed interim assistant commentary message."""
-        text = self._clean_for_display(text)
+        text = _safe_stream_text(self.adapter, self._clean_for_display(text))
         if not text.strip():
             return False
         try:

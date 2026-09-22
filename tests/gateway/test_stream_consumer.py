@@ -890,6 +890,47 @@ class TestEditOverflowSplitAndDeliver:
 
 class TestInterimCommentaryMessages:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("commentary", "safe"),
+        [
+            ("<|tool_call:start|>kanban_attach", False),
+            ("<|tool", False),
+            (
+                "<|tool_call:start|>kanban_attach<|tool_arg:start|>"
+                "content_base64c2Vuc2l0aXZlLWZpeHR1cmUtcGF5bG9hZA==",
+                False,
+            ),
+            ("I'll inspect the repository first.", True),
+        ],
+    )
+    async def test_commentary_egress_sanitizes_raw_tool_markup(
+        self, commentary, safe,
+    ):
+        """Completed model commentary must use the same last-egress guard as stream frames."""
+        adapter = MagicMock()
+        payload = "c2Vuc2l0aXZlLWZpeHR1cmUtcGF5bG9hZA=="
+        adapter.platform = SimpleNamespace(value="discord")
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="msg_1"))
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        consumer = GatewayStreamConsumer(adapter, "chat_123")
+
+        consumer.on_commentary(commentary)
+        consumer.finish()
+        await consumer.run()
+
+        sent = adapter.send.await_args_list
+        assert len(sent) == 1
+        content = sent[0].kwargs["content"]
+        assert sent[0].kwargs["metadata"]["_interim_send"] is True
+        if safe:
+            assert content == commentary
+        else:
+            assert "<|tool" not in content
+            assert payload not in content
+            assert "couldn't safely deliver" in content
+
+    @pytest.mark.asyncio
     async def test_commentary_message_stays_separate_from_final_stream(self):
         adapter = MagicMock()
         adapter.send = AsyncMock(side_effect=[

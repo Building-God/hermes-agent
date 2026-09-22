@@ -634,6 +634,33 @@ async def test_empty_fallback_final_after_split_records_only_what_survives():
 
 
 @pytest.mark.asyncio
+async def test_stale_finalize_reconciliation_edit_sanitizes_raw_tool_markup():
+    """The direct reconciliation edit is a model-text egress, not trusted metadata."""
+    adapter = FinalizeCaptureAdapter(Platform.DISCORD)
+    runner = _make_runner(adapter)
+    source = SessionSource(platform=Platform.DISCORD, chat_id="discord-chat", chat_type="group")
+    payload = "c2Vuc2l0aXZlLWZpeHR1cmUtcGF5bG9hZA=="
+    response = {}
+    consumer = SimpleNamespace(adapter=adapter, message_id="stream-message")
+
+    await runner._run_agent_edit_streamed_message(
+        consumer,
+        source,
+        response,
+        f"<|tool_call:start|>kanban_attach content_base64{payload}",
+        _sk="agent:main:discord:group:discord-chat",
+        ok=("ok",),
+        fail_result="failed %s %s",
+        fail_exc="failed %s %s",
+    )
+
+    assert response["already_sent"] is True
+    content = adapter.edits[-1]["content"]
+    assert "<|tool" not in content and payload not in content
+    assert "couldn't safely deliver" in content
+
+
+@pytest.mark.asyncio
 async def test_flood_retry_never_resends_full_payload_after_partial_split_delivery(monkeypatch):
     """A short-wait flood result that carries ``partial_overflow`` means the head of a split
     payload is already on screen: the fallback flood retry must NOT sleep and re-send the whole

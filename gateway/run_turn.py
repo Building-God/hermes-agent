@@ -3952,8 +3952,10 @@ class GatewayTurnMixin:
         ``response["already_sent"]`` and log ``ok``. ``fail_result`` (None = trust the call) logs a
         returned failure as ``(session, error)``; ``fail_exc`` logs an exception as ``(session, exc)``."""
         try:
+            from gateway.stream_consumer_transport import _safe_stream_text
             _res = await _sc.adapter.edit_message(
-                chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,
+                chat_id=source.chat_id, message_id=_sc.message_id,
+                content=_safe_stream_text(_sc.adapter, content), finalize=True,
             )
         except Exception as _edit_err:
             logger.warning(fail_exc, _sk, _edit_err)
