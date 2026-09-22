@@ -67,6 +67,7 @@ CONFIGURABLE_TOOLSETS = [
     ("skills",          "📚 Skills",                    "list, view, manage"),
     ("todo",            "📋 Task Planning",             "todo_list"),
     ("kanban",          "📌 Kanban",                    "opt-in task board tools for this platform"),
+    ("kanban_reviewer", "🧐 Kanban (reviewer)",         "reviewer-narrow: verdict + evidence only, no block/unblock/create/link"),
     ("memory",          "💾 Memory",                    "persistent memory across sessions"),
     ("context_engine",  "🧩 Context Engine",            "runtime tools from the active context engine"),
     ("session_search",  "🔎 Session Search",            "search past conversations"),
@@ -95,7 +96,7 @@ def gui_toolset_label(label: str) -> str:
 
 # OFF by default for new installs (still in _HERMES_CORE_TOOLS; the checklist won't pre-select them). x_search
 # auto-enables when xAI creds exist (mirrors HASS_TOKEN → homeassistant); its check_fn still gates the schema.
-_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a", "kanban"}
+_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "a2a", "kanban", "kanban_reviewer"}
 
 # Config-only capabilities: provider setup in `hermes tools` (TOOL_CATEGORIES) but not model toolsets — zero
 # schemas, own switch (``stt.enabled``), never in ``platform_toolsets`` or the per-platform checklist.

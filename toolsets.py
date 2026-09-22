@@ -153,6 +153,28 @@ TOOLSETS = {
     "code_execution": _ts("Run Python scripts that call tools programmatically (reduces LLM round trips)", ["execute_code"]),
     "delegation": _ts("Spawn subagents with isolated context for complex subtasks", ["delegate_task"]),
     "homeassistant": _ts("Home Assistant smart home control and monitoring", _HA_TOOLS),
+    # Reviewer-narrow kanban surface. Independent-child reviewers must not be able to
+    # convert internal review ambiguity into a Harry question by calling
+    # kanban_block(kind=needs_input) (t_f8c942b9 — R5 projects any blocked-with-reason
+    # onto the dashboard question surface). Keep verdict tools (complete /
+    # request_changes) and evidence tools (comment / attach); omit block, unblock,
+    # create, link — genuine human-only escalation flows through a separately
+    # authored card, not a reviewer-emitted needs_input block. Active when the agent
+    # is spawned by the kanban dispatcher (HERMES_KANBAN_TASK env set).
+    "kanban_reviewer": _ts(
+        "Reviewer-narrow Kanban surface: show/list/status/comment/attach/complete/"
+        "request_review/request_changes/heartbeat/checkpoint. Omits kanban_block "
+        "(and kanban_unblock/kanban_create/kanban_link) so a reviewer cannot convert "
+        "internal review ambiguity into a Harry needs_input question; genuine "
+        "human-only escalation flows through a separately authored card.",
+        [
+            "kanban_show", "kanban_list", "kanban_status",
+            "kanban_complete", "kanban_request_review", "kanban_request_changes",
+            "kanban_heartbeat", "kanban_comment",
+            "kanban_attach", "kanban_attach_url", "kanban_attachments",
+            "kanban_checkpoint",
+        ],
+    ),
     "kanban": _ts(
         "Kanban multi-agent coordination — only active when the agent is spawned by "
         "the kanban dispatcher (HERMES_KANBAN_TASK env set). The dispatcher runs "
