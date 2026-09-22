@@ -31,7 +31,7 @@ from gateway.response_filters import (
     is_intentional_silence_response as _is_intentional_silence_response,
     is_partial_silence_marker as _is_partial_silence_marker)
 from gateway.stream_consumer_fences import ensure_closed_code_fences
-from gateway.stream_consumer_transport import StreamTransportMixin
+from gateway.stream_consumer_transport import StreamTransportMixin, _safe_stream_text
 from gateway.stream_consumer_fallback import StreamFallbackMixin
 from gateway.stream_consumer_think import StreamThinkFilterMixin
 
@@ -515,7 +515,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                        "falling back to send() for pre-prompt text (chat=%s)",
                        _reason, self.chat_id)
         try:
-            if getattr(await self.adapter.send(self.chat_id, finalize_text), "success", False):
+            if getattr(await self.adapter.send(
+                    self.chat_id, _safe_stream_text(self.adapter, finalize_text)), "success", False):
                 return True
         except Exception as send_err:
             logger.warning("%s boundary: fallback send also failed: %s", _reason, send_err)

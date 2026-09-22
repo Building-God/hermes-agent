@@ -59,6 +59,24 @@ async def test_streaming_split_tool_marker_never_reaches_transport():
 
 
 
+@pytest.mark.asyncio
+async def test_native_boundary_fallback_send_sanitizes_raw_tool_markup():
+    """A failed native-stream finalize must sanitize its direct plain-send fallback."""
+    adapter = MagicMock()
+    payload = "c2Vuc2l0aXZlLWZpeHR1cmUtcGF5bG9hZA=="
+    adapter.platform = SimpleNamespace(value="discord")
+    adapter.send_stream_frame = AsyncMock(return_value=False)
+    adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="m1"))
+    consumer = GatewayStreamConsumer(adapter, "chat_123")
+    consumer._accumulated = f"<|tool_call:start|>kanban_attach content_base64{payload}"
+
+    assert await consumer._finalize_boundary_stream("approval") is True
+
+    content = adapter.send.await_args.args[1]
+    assert "<|tool" not in content
+    assert payload not in content
+    assert "couldn't safely deliver" in content
+
 class TestCleanForDisplay:
     """Verify MEDIA: directives and internal markers are stripped from display text."""
 
@@ -414,6 +432,41 @@ class TestSegmentBreakOnToolBoundary:
         # The undelivered "world" tail must reach the user, and the next
         # segment must not duplicate "Hello" that was already visible.
         assert sent_texts == ["Hello ▉", "world", "Next segment"]
+
+    @pytest.mark.asyncio
+    async def test_segment_break_after_edit_failure_sanitizes_raw_tool_tail(self):
+        """The direct tail send after a failed edit must not bypass egress sanitization."""
+        adapter = MagicMock()
+        payload = "c2Vuc2l0aXZlLWZpeHR1cmUtcGF5bG9hZA=="
+        raw_tail = f" <|tool_call:start|>kanban_attach<|tool_arg:start|>content_base64{payload}"
+        adapter.platform = SimpleNamespace(value="discord")
+        adapter.send = AsyncMock(side_effect=[
+            SimpleNamespace(success=True, message_id="msg_1"),
+            SimpleNamespace(success=True, message_id="msg_2"),
+            SimpleNamespace(success=True, message_id="msg_3"),
+        ])
+        adapter.edit_message = AsyncMock(
+            return_value=SimpleNamespace(success=False, error="flood_control:6")
+        )
+        adapter.MAX_MESSAGE_LENGTH = 4096
+        consumer = GatewayStreamConsumer(
+            adapter, "chat_123", StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5)
+        )
+
+        consumer.on_delta("Hello")
+        task = asyncio.create_task(consumer.run())
+        await asyncio.sleep(0.08)
+        consumer.on_delta(raw_tail)
+        await asyncio.sleep(0.08)
+        consumer.on_delta(None)
+        consumer.on_delta("Next segment")
+        consumer.finish()
+        await task
+
+        sent = [call.kwargs["content"] for call in adapter.send.await_args_list]
+        assert all("<|tool" not in content and payload not in content for content in sent)
+        assert any("couldn't safely deliver" in content for content in sent)
+
 
     @pytest.mark.asyncio
     async def test_segment_break_after_mid_stream_edit_failure_preserves_tail(self):

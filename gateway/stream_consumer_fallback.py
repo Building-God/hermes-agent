@@ -313,7 +313,7 @@ class StreamFallbackMixin:
         tail = self._accumulated
         if visible and tail.startswith(visible):
             tail = tail[len(visible):].lstrip()
-        tail = self._clean_for_display(tail)
+        tail = _safe_stream_text(self.adapter, self._clean_for_display(tail))
         if not tail.strip():
             return
         try:
