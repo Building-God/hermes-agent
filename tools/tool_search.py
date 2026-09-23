@@ -1,9 +1,9 @@
 """Progressive tool disclosure ("tool search"): MCP/plugin tools and a curated set of
-event-triggered core tools are replaced in the model-visible array by three bridge tools —
+event-triggered core tools are replaced in the model-visible array by three bridge tools -
 tool_search / tool_describe / tool_call. Invariants: core tools (``toolsets._HERMES_CORE_TOOLS``)
 and session-gated GUI toolsets never defer unless named in ``defer``; ANY deferrable tool
 activates the bridge (the listing scales with budget, not activation); the catalog is
-stateless — rebuilt from the live tool-defs every assembly (a session-keyed one drifts and
+stateless - rebuilt from the live tool-defs every assembly (a session-keyed one drifts and
 silently drops tools); bridge calls route through ``model_tools.handle_function_call``."""
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ _MAX_DESCRIBE_NAMES_PER_CALL = 10
 @dataclass(frozen=True)
 class ToolSearchConfig:
     """Resolved, validated tool-search configuration for a single assembly."""
-    enabled: str  # "auto" | "on" | "off" — "auto" is an alias of "on" today
+    enabled: str  # "auto" | "on" | "off" - "auto" is an alias of "on" today
     # Listing budget as % of context; does NOT gate activation, only bounds how much
     # the embedded manifest may consume before it degrades (full -> names -> bare).
     threshold_pct: float  # 0..100
@@ -57,14 +57,14 @@ class ToolSearchConfig:
     @classmethod
     def from_raw(cls, raw: Any) -> "ToolSearchConfig":
         """Build from a raw dict / legacy bool / None; every field is clamped and unknown
-        values fall back to safe defaults — a config typo must not break the agent."""
+        values fall back to safe defaults - a config typo must not break the agent."""
         if not isinstance(raw, dict):  # legacy bool / None
             raw = {"enabled": "off" if raw is False else "auto"}
         max_search_limit = _clamped_int(raw.get("max_search_limit"), 25, 1, 50)
         defer_raw = raw.get("defer")
         if defer_raw is not None and not isinstance(defer_raw, (list, tuple, set)):
             # Loud, then the curated default: a scalar here means the user tried to shrink the
-            # tool surface and got nothing — never silently ignore it (#116404).
+            # tool surface and got nothing - never silently ignore it (#116404).
             logger.warning(
                 "tools.tool_search.defer is %r, expected a YAML list of tool names "
                 "(e.g. [todo_list, computer_use]; [] keeps every tool eager) - "
@@ -134,12 +134,17 @@ def _core_tool_names() -> frozenset[str]:
 
 # Session-gated GUI toolsets: off ``_HERMES_CORE_TOOLS`` so non-GUI clients never pay
 # their schema; once enabled they stay direct unless the deferral list names them.
-_DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project"})
+# ``mcp-jarvis`` joins this list (2026-09-23 t_e5398c71): Harry's dash chat routes
+# through A2A → default profile, and the jarvis verb family (calendar_read,
+# mail_read, camera_snapshot, clips_list, get_prompt, list_prompts,
+# list_resources, read_resource) is a session-affordance in the same class as
+# desktop_ui/project - it must be ambient, not hidden behind tool_search.
+_DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project", "mcp-jarvis"})
 
 # Event-triggered tools deferred BY DEFAULT (a catalog stub suffices). Keep the curated
 # list in DEFAULT_CONFIG so config discovery and runtime behavior cannot drift. An explicit
 # ``defer`` list replaces this wholesale ([] = everything eager). ``clarify`` is deliberately
-# absent: A/B showed deferring it collapsed structured-clarify usage (18/18 -> 7/18) — the
+# absent: A/B showed deferring it collapsed structured-clarify usage (18/18 -> 7/18) - the
 # ask-the-user affordance must be ambient, a stub is not enough.
 _DEFAULT_DEFERRED_TOOLS = frozenset(DEFAULT_CONFIG["tools"]["tool_search"]["defer"])
 
@@ -155,8 +160,14 @@ def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) 
     if name in _core_tool_names():
         return False
     toolset = _registry_toolset(name)  # None (unregistered/malformed) never defers
-    return toolset is not None and (
-        toolset.startswith("mcp-") or toolset not in _DIRECT_SURFACE_TOOLSETS)
+    if toolset is None:
+        return False
+    # Session-gated GUI toolsets AND explicitly-direct MCP servers (e.g. ``mcp-jarvis``)
+    # stay eager even though their name starts with ``mcp-``: the direct surface list is
+    # authoritative for what must be present in the model's tool array (t_e5398c71).
+    if toolset in _DIRECT_SURFACE_TOOLSETS:
+        return False
+    return toolset.startswith("mcp-") or toolset not in _DIRECT_SURFACE_TOOLSETS
 
 
 def _tool_def_names(tool_defs: Iterable[Dict[str, Any]]) -> Iterable[str]:
@@ -194,7 +205,7 @@ def estimate_tokens_from_schemas(tool_defs: Iterable[Dict[str, Any]]) -> int:
 def should_activate(config: ToolSearchConfig, deferrable_tokens: int,
                     context_length: Optional[int], *, connections_granted: bool = False) -> bool:
     """``"off"`` never activates; ``"on"``/``"auto"`` activate whenever any deferrable tool
-    exists ("auto" is reserved for a future budget-gated mode — do not distinguish them
+    exists ("auto" is reserved for a future budget-gated mode - do not distinguish them
     without that design). ``context_length`` is kept for caller compatibility."""
     if config.enabled == "off":
         return False
@@ -248,25 +259,25 @@ def _search_description(deferred_count: int, listing: Optional[str], listing_for
         return desc + (
             "\n\nThe servers below are connected and their tools ARE available "
             "through this bridge. For any request in these domains, search "
-            "here FIRST — do not claim the capability is unavailable and do "
+            "here FIRST - do not claim the capability is unavailable and do "
             "not substitute a generic tool (terminal/browser) without "
             "searching.\n\n" + listing)
     desc += (
         "\n\nEvery deferred capability is listed below. If a tool name "
-        "appears here, do NOT claim it is unavailable — load it with "
+        "appears here, do NOT claim it is unavailable - load it with "
         f"`{TOOL_DESCRIBE_NAME}` (skip `{TOOL_SEARCH_NAME}` when you "
         "already see the exact name).")
     if listing_form == "mixed":
         desc += (
             " For servers marked 'names not listed', the tools exist "
-            f"too — find them with `{TOOL_SEARCH_NAME}` before "
+            f"too - find them with `{TOOL_SEARCH_NAME}` before "
             "concluding anything is missing.")
     return desc + "\n\n" + listing
 
 
 def bridge_tool_schemas(deferred_count: int, listing: Optional[str] = None,
                         listing_form: str = "", connections_granted: bool = False) -> List[Dict[str, Any]]:
-    """Bridge tool schemas injected in place of deferred tools; kept short — every byte is paid
+    """Bridge tool schemas injected in place of deferred tools; kept short - every byte is paid
     every turn. ``listing`` is embedded in the tool_search description; per-tool forms say
     "skip search when you see the exact name", "groups" says search is mandatory."""
     return [
@@ -303,7 +314,7 @@ def bridge_tool_schemas(deferred_count: int, listing: Optional[str] = None,
         _bridge_schema(
             TOOL_CALL_NAME,
             "Invoke deferred tools. Takes `calls`, an array of {name, arguments} "
-            "— one entry per invocation; a single call is an array of one. "
+            "- one entry per invocation; a single call is an array of one. "
             "Local tools require one entry per tool_call. Only connectors__ names "
             "may be batched together; mixed and multi-local batches are rejected. "
             "Connector entries execute individually with results in input order. "
@@ -344,7 +355,7 @@ class AssemblyResult:
 def assemble_tool_defs(tool_defs: List[Dict[str, Any]], *, context_length: Optional[int] = None,
                        config: Optional[ToolSearchConfig] = None) -> AssemblyResult:
     """Tool-defs the model should see: passthrough when inactive, else deferrable tools
-    replaced by the three bridge tools. Idempotent — existing bridge tools are stripped first."""
+    replaced by the three bridge tools. Idempotent - existing bridge tools are stripped first."""
     config = config or load_config()
     incoming = [td for td, name in zip(tool_defs, _tool_def_names(tool_defs))
                 if name not in BRIDGE_TOOL_NAMES]
@@ -387,11 +398,11 @@ def _clip_description(text: str, cap: int = 500) -> str:
     """Cap a record description, marking the cut so it reads as deliberate.
 
     A bare slice ends mid-word ("apply exponential bac") and looks like
-    corruption; the ellipsis says "there is more — tool_describe has it".
+    corruption; the ellipsis says "there is more - tool_describe has it".
     500 keeps 9 in 10 vendor connector descriptions whole and every first
     sentence (measured p90 575, first-sentence max 329 over 353 tools).
     """
-    return text if len(text) <= cap else text[:cap] + "…"
+    return text if len(text) <= cap else text[:cap] + "..."
 
 
 def _shared_tool_record(entry: CatalogEntry) -> Dict[str, Any]:
@@ -525,7 +536,7 @@ def dispatch_tool_describe(args: Dict[str, Any], *, current_tool_defs: List[Dict
 
 
 def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
-    """Deferrable names in the *pre-assembly* ``tool_defs`` of the session scope — the
+    """Deferrable names in the *pre-assembly* ``tool_defs`` of the session scope - the
     universe ``tool_call`` may reach. Gates bridge dispatch AND the executor unwrap so a
     restricted session cannot invoke an out-of-scope tool via the bridge."""
     defer_tools = load_config_readonly().effective_defer_tools
@@ -594,7 +605,7 @@ def build_catalog_listing(
 ) -> Optional[str]:
     """Render a skills-style manifest of the deferred catalog.
 
-    One line per tool — ``name: short description`` — grouped under a
+    One line per tool - ``name: short description`` - grouped under a
     heading per source (MCP server / plugin toolset), exactly like the
     bundled-skills listing in the system prompt:
 
@@ -604,17 +615,17 @@ def build_catalog_listing(
         ...
 
     Ordering is deterministic (groups and tools sorted by name) so the
-    rendered block is byte-stable across assemblies of the same catalog —
+    rendered block is byte-stable across assemblies of the same catalog -
     this keeps the request prefix cacheable across turns.
 
     Token-budget fallbacks (cheap chars/4 estimate, same rule as the
     activation gate):
       1. full listing (names + short descriptions)
       2. names-only listing, still grouped
-      3. server-level summary — one line per MCP server / plugin toolset
+      3. server-level summary - one line per MCP server / plugin toolset
          (name + tool count), so the model always knows WHICH domains are
          reachable through the bridge even when per-tool names don't fit
-      4. ``None`` — only when the summary itself exceeds the budget
+      4. ``None`` - only when the summary itself exceeds the budget
     """
     text, _form = build_catalog_listing_with_form(deferrable, max_tokens=max_tokens)
     return text

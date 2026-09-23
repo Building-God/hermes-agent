@@ -232,17 +232,33 @@ def filter_inbound(text: str) -> str:
     return text
 
 
+def _is_loopback_peer(peer: str) -> bool:
+    """True when the authenticated identity is a loopback client (``ip:127.*``, ``ip:::1``,
+    ``ip:local``). Loopback traffic is Harry's own dash/CLI on this box - not a remote
+    peer - and must not be framed as untrusted external input, which would make the
+    agent refuse to touch Harry's calendar/mail even when Harry asked (t_e5398c71).
+    """
+    if not peer or not peer.startswith("ip:"):
+        return False
+    addr = peer[3:].strip().lower()
+    return addr in {"127.0.0.1", "::1", "local", "unknown"} or addr.startswith("127.")
+
+
 def wrap_inbound(peer: str, text: str, identity: Optional[PeerIdentity] = None) -> str:
-    """Filter + frame inbound task text. EVERY message is framed - including "/..." text:
-    remote peers must never reach the gateway's operator slash commands.
+    """Filter + frame inbound task text. EVERY remote message is framed - including "/..."
+    text: remote peers must never reach the gateway's operator slash commands.
 
     When ``identity`` is a config-declared operator (``frame == 'operator'``), the OPERATOR
-    prefix replaces PRIVACY_PREFIX so the agent knows the speaker is Harry, not a stranger.
+    prefix replaces PRIVACY_PREFIX so the agent knows the speaker is Harry, not a stranger
+    (t_c460c635). Loopback peers without a declared identity (``ip:127.*``) skip the
+    untrusted prefix - they are the local operator's own surfaces (t_e5398c71).
     Injection-defang runs either way.
     """
     body = filter_inbound((text or "").strip())
     if identity is not None and identity.is_operator:
         return OPERATOR_PREFIX.format(user_name=identity.user_name, peer=peer or "unknown") + body
+    if _is_loopback_peer(peer):
+        return body
     return PRIVACY_PREFIX.format(peer=peer or "unknown") + body
 
 

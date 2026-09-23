@@ -1,6 +1,6 @@
-"""Tests for tools/tool_search.py — progressive tool disclosure.
+"""Tests for tools/tool_search.py - progressive tool disclosure.
 
-Coverage targets — these mirror the issues called out in the OpenClaw tool
+Coverage targets - these mirror the issues called out in the OpenClaw tool
 search report. Every test that names an OpenClaw issue is the regression
 guard that would have caught that specific failure mode.
 """
@@ -82,7 +82,7 @@ class TestConfigParsing:
 
 
 # ---------------------------------------------------------------------------
-# Classification — the hard invariant: core tools NEVER defer.
+# Classification - the hard invariant: core tools NEVER defer.
 # ---------------------------------------------------------------------------
 
 
@@ -114,6 +114,28 @@ class TestClassification:
         for name in ("read_window_below", "apply_layout", "project_list"):
             assert not is_deferrable_tool_name(name), name
             assert name not in _HERMES_CORE_TOOLS
+
+    def test_mcp_jarvis_tools_stay_eager(self):
+        """t_e5398c71: the mcp-jarvis toolset (Harry's verb family - calendar_read,
+        mail_read, camera_snapshot, clips_list, list_prompts, list_resources,
+        read_resource, get_prompt) must load eagerly on the dash surface, not be
+        hidden behind tool_search. Verified by stubbing the registry lookup so this
+        test does not require the MCP server to be up during pytest."""
+        from tools import tool_search as ts
+
+        saved = ts._registry_toolset
+        ts._registry_toolset = lambda n: (
+            "mcp-jarvis" if n.startswith("mcp__jarvis__")
+            else ("mcp-somethingelse" if n.startswith("mcp__somethingelse__") else None)
+        )
+        try:
+            for name in ("mcp__jarvis__calendar_read", "mcp__jarvis__mail_read",
+                         "mcp__jarvis__camera_snapshot", "mcp__jarvis__clips_list"):
+                assert not ts.is_deferrable_tool_name(name), name
+            # Other MCP servers stay deferrable - the exemption is narrow.
+            assert ts.is_deferrable_tool_name("mcp__somethingelse__foo")
+        finally:
+            ts._registry_toolset = saved
 
     def test_gui_surface_defers_by_default(self):
         """2026-08 core-deferral reversal: the curated defer set (GUI surface
@@ -154,7 +176,7 @@ class TestClassification:
 
     def test_core_working_set_never_defers_even_with_mcp_active(self):
         """The bridge activates for MCP, but working-set core tools (terminal,
-        files, memory...) stay direct — the deferral set is the CURATED list,
+        files, memory...) stay direct - the deferral set is the CURATED list,
         not all of core."""
         from tools.registry import discover_builtin_tools, registry
         from tools.tool_search import (
@@ -195,7 +217,7 @@ class TestClassification:
         """PR #97979 A/B verdict (288 runs, 3 model tiers): clarify deferred
         collapsed structured ask-the-user usage 18/18 → 7/18 (gpt-terra 0/6);
         models fell back to plain-text questions. The ask-the-user affordance
-        must stay ambient — clarify is NOT in the curated default defer set,
+        must stay ambient - clarify is NOT in the curated default defer set,
         and assembles as a direct tool even when the bridge is active."""
         from tools.registry import discover_builtin_tools
         from tools.tool_search import (
@@ -228,7 +250,7 @@ class TestClassification:
         assert not is_deferrable_tool_name("xx_definitely_not_a_tool_xx")
 
     def test_classify_keeps_unknown_in_visible(self):
-        """A tool we can't classify stays visible — never silently dropped.
+        """A tool we can't classify stays visible - never silently dropped.
 
         This is the OpenClaw #84141 regression guard (cron lost ``exec``
         because it wasn't in the catalog).
@@ -331,7 +353,7 @@ class TestRelevanceFloor:
             _td("slack_send_message", "Post a message into a Slack channel",
                 {"channel": {"type": "string"}, "text": {"type": "string"}}),
             # Every hunt word below is answerable by SOME document, none by one
-            # document — the production catalog shape behind the 216-search trace.
+            # document - the production catalog shape behind the 216-search trace.
             _td("gist_save_snippet", "Save a shell command snippet as a gist",
                 {"content": {"type": "string"}}),
             _td("codeql_scan", "Scan code for vulnerabilities and execute analysis",
@@ -368,7 +390,7 @@ class TestRelevanceFloor:
 
 
 # ---------------------------------------------------------------------------
-# Assembly — the full passthrough/activate decision.
+# Assembly - the full passthrough/activate decision.
 # ---------------------------------------------------------------------------
 
 
@@ -567,7 +589,7 @@ class TestRegression_OpenClawCron84141:
     """Regression guard for the OpenClaw cron-tool-loss class of bug.
 
     OpenClaw #84141: ``toolsAllow: ["exec"]`` on an isolated cron turn
-    resulted in the agent receiving only ``sessions_send`` — the catalog
+    resulted in the agent receiving only ``sessions_send`` - the catalog
     builder silently dropped the requested core tool.
 
     Our defense: core tools are NEVER deferred. This test exercises the
@@ -582,7 +604,7 @@ class TestRegression_OpenClawCron84141:
         )
         # 1 core tool + 50 unknown/MCP-shaped tools (deferrable).
         defs = [_td("terminal", "Run shell commands")]
-        # Pad with fake "deferrable" tools — without registry registration,
+        # Pad with fake "deferrable" tools - without registry registration,
         # classify_tools puts them in 'visible'. So instead, we just verify
         # the core-tool side: terminal stays in visible regardless.
         visible, deferrable = classify_tools(defs)
@@ -662,7 +684,7 @@ class TestRegression_ToolsetScoping:
         parsed = json.loads(result)
         assert parsed["total_available"] == 12, (
             f"expected scoped catalog of 12, got {parsed['total_available']} "
-            "— catalog leaked tools outside the session's toolsets"
+            "- catalog leaked tools outside the session's toolsets"
         )
         hit_names = set(parsed["tools"])
         assert hit_names == {n for g in parsed["results"] for n in g["matches"]}
@@ -738,7 +760,7 @@ class TestCatalogListing:
         long = "word " * 40
         s = _short_desc(long)
         assert len(s) <= 61  # 60 + ellipsis char
-        assert s.endswith("…")
+        assert s.endswith("...")
         assert _short_desc("") == ""
 
 
