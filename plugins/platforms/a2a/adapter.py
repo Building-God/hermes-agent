@@ -535,7 +535,11 @@ class A2AAdapter(BasePlatformAdapter):
         turn = self._turns.track(context_id)
         max_turns = protocol.max_pingpong_turns()
         rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
-        if turn > max_turns:
+        # Anti-loop guards agent<->agent ping-pong. An operator peer (Harry's dash, one
+        # stable contextId per thread since t_dd7c0990) is a human typing - never reject
+        # the sixth message (t_c460c635; Harry 2026-09-23 22:48 "anti ping pong something").
+        _ident = self._security_context.resolve_identity(peer)
+        if turn > max_turns and not (_ident is not None and _ident.is_operator):
             protocol.metrics.anti_loop_triggers += 1
             logger.warning("A2A: anti-loop triggered for context %s (turn %d > %d)", context_id, turn, max_turns)
             return self._end_task(rec, protocol.STATE_REJECTED, f"Anti-loop protection: context {context_id} exceeded "
