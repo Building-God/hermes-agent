@@ -1,4 +1,4 @@
-"""Tests for the A2A (Agent-to-Agent) platform plugin — protocol v1.0.
+"""Tests for the A2A (Agent-to-Agent) platform plugin - protocol v1.0.
 
 Covers security primitives (peer-token identity, injection filtering,
 redaction), v1.0 protocol shapes (Agent Card, Task, Part, roles, error codes),
@@ -230,7 +230,7 @@ class TestAgentCardV1:
             description="test", skills=[], streaming=False, auth_required=False,
         )
         assert card["name"] == "hermes-test"
-        # v1.0: no top-level protocolVersion / preferredTransport —
+        # v1.0: no top-level protocolVersion / preferredTransport -
         # consolidated into supportedInterfaces[].
         assert "protocolVersion" not in card
         assert "preferredTransport" not in card
@@ -705,7 +705,7 @@ class TestTaskRpcHandlers:
 
     def test_tasks_cancel_resets_turns_for_context(self):
         """Cancel must reset anti-loop turns for the task's CONTEXT (the old
-        code passed the task_id into a context-keyed map — silent no-op)."""
+        code passed the task_id into a context-keyed map - silent no-op)."""
         adapter = _bare_adapter()
         for _ in range(4):
             adapter._turns.track("ctx-loopy")
@@ -991,7 +991,7 @@ class TestInboundRoundTrip:
 
     def test_mixed_parts_delivered_to_agent(self, monkeypatch):
         """A message with text + file + data Parts delivers all content to the
-        agent — file URLs and data JSON are rendered into the text stream."""
+        agent - file URLs and data JSON are rendered into the text stream."""
         monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
         monkeypatch.delenv("A2A_PEER_TOKENS", raising=False)
 
@@ -1670,7 +1670,7 @@ print('fake reply')
 # __init__'s port/advertised-toolsets reads and _load_served_agents's
 # description default all previously read raw A2A_* env vars unconditionally.
 # Under a multiplexed secondary profile, os.environ holds the DEFAULT
-# profile's YAML-to-env bridge output — a secondary profile with its own
+# profile's YAML-to-env bridge output - a secondary profile with its own
 # (different, or absent) A2A config would silently borrow the default
 # profile's port, toolset advertisement, agent name, or Agent Card
 # description. Mirrors the Buzz/SimpleX fix for #98738.
@@ -1741,7 +1741,7 @@ class TestMultiplexConstructionScope:
         assert adapter.port == _DEFAULT_PORT
         assert adapter.agent_name != "default-profile-agent"
         assert adapter._agents[""]["description"] == (
-            "Hermes Agent — a general-purpose agent reachable over A2A."
+            "Hermes Agent - a general-purpose agent reachable over A2A."
         )
         # _public_url was captured at construction time via a bare os.getenv, missed by the
         # scoped retrofit the sibling fields above already got.
@@ -1778,3 +1778,83 @@ def test_load_conversation_skips_non_dict_lines(monkeypatch, tmp_path):
         f.write("42\n")
     convo = protocol.load_conversation("ctx-mixed")
     assert len(convo) == 1 and convo[0]["text"] == "hello"
+
+
+# --------------------------------------------------------------------------
+# Operator identity path: authenticated peer -> config-declared operator identity.
+# The A2A adapter frames dash/voice/device-chat turns as OPERATOR (Harry), not as
+# "untrusted remote agent". Credential still binds - config alone can't promote a
+# stranger. Regression net for the "he doesn't know who I am" bug (t_c460c635).
+# --------------------------------------------------------------------------
+
+class TestOperatorIdentity:
+    def _patch_config(self, monkeypatch, cfg):
+        # security._configured_peer_identities imports load_config lazily; patch at source.
+        import hermes_cli.config as hcfg
+        monkeypatch.setattr(hcfg, "load_config", lambda: cfg)
+
+    def test_no_config_no_identity(self, monkeypatch):
+        self._patch_config(monkeypatch, {})
+        ctx = security.A2ASecurityContext.capture()
+        assert ctx.resolve_identity("jarvis-dash") is None
+
+    def test_operator_identity_from_config(self, monkeypatch):
+        self._patch_config(monkeypatch, {"a2a": {"peer_identities": {
+            "jarvis-dash": {"user": "938599234989617222", "user_name": "Harry", "frame": "operator"},
+        }}})
+        ident = security.A2ASecurityContext.capture().resolve_identity("jarvis-dash")
+        assert ident is not None
+        assert ident.is_operator is True
+        assert ident.user == "938599234989617222"
+        assert ident.user_name == "Harry"
+
+    def test_wrap_inbound_uses_operator_frame(self, monkeypatch):
+        self._patch_config(monkeypatch, {"a2a": {"peer_identities": {
+            "jarvis-dash": {"user": "harry-id", "user_name": "Harry", "frame": "operator"},
+        }}})
+        ctx = security.A2ASecurityContext.capture()
+        wrapped = security.wrap_inbound("jarvis-dash", "who am I?", identity=ctx.resolve_identity("jarvis-dash"))
+        assert "Operator message from Harry" in wrapped
+        assert "remote agent peer" not in wrapped
+        assert "who am I?" in wrapped
+
+    def test_wrap_inbound_defaults_to_privacy_prefix(self, monkeypatch):
+        # Unknown peer OR no config: MUST keep the untrusted-peer frame.
+        self._patch_config(monkeypatch, {"a2a": {"peer_identities": {
+            "jarvis-dash": {"user": "harry-id", "user_name": "Harry", "frame": "operator"},
+        }}})
+        ctx = security.A2ASecurityContext.capture()
+        wrapped = security.wrap_inbound("stranger", "hi", identity=ctx.resolve_identity("stranger"))
+        assert "remote agent peer" in wrapped
+        assert "Operator message" not in wrapped
+
+    def test_non_operator_frame_stays_peer(self, monkeypatch):
+        # frame != "operator" (typo / explicit peer) MUST NOT promote to operator.
+        self._patch_config(monkeypatch, {"a2a": {"peer_identities": {
+            "some-bot": {"user": "bot-1", "user_name": "SomeBot", "frame": "peer"},
+        }}})
+        ctx = security.A2ASecurityContext.capture()
+        ident = ctx.resolve_identity("some-bot")
+        assert ident is not None and ident.is_operator is False
+        wrapped = security.wrap_inbound("some-bot", "hi", identity=ident)
+        assert "remote agent peer" in wrapped
+        assert "Operator message" not in wrapped
+
+    def test_identity_is_keyed_by_authenticated_peer_name(self, monkeypatch):
+        # A2A_PEER_TOKENS binds the peer name to the credential; matching happens on
+        # that authenticated name, not anything from the request body.
+        monkeypatch.setenv("A2A_PEER_TOKENS", "jarvis-dash:dash-tok,mallory:mal-tok")
+        monkeypatch.delenv("A2A_BEARER_TOKEN", raising=False)
+        self._patch_config(monkeypatch, {"a2a": {"peer_identities": {
+            "jarvis-dash": {"user": "harry-id", "user_name": "Harry", "frame": "operator"},
+        }}})
+        ctx = security.A2ASecurityContext.capture()
+        # Dash's token -> "jarvis-dash" -> operator identity.
+        assert ctx.authenticate("Bearer dash-tok", "127.0.0.1") == "jarvis-dash"
+        assert ctx.resolve_identity("jarvis-dash").is_operator is True
+        # Mallory's token -> "mallory" -> no operator identity.
+        assert ctx.authenticate("Bearer mal-tok", "127.0.0.1") == "mallory"
+        assert ctx.resolve_identity("mallory") is None
+        # Wrong / missing token: still 401, not a promoted operator.
+        assert ctx.authenticate("Bearer nope", "127.0.0.1") is None
+        assert ctx.authenticate(None, "127.0.0.1") is None
