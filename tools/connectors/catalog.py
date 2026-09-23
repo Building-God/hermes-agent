@@ -86,26 +86,44 @@ class HostInstaller:
         return dashboard_install_plugin("", force=force, enable=enable, catalog_name=name, ref=ref)
 
     def skill_meta(self, identifier: str) -> Optional[Dict[str, Any]]:
-        from hermes_cli.skills_hub import inspect_skill
+        """The first hub source that knows the identifier; metadata only, no bundle download."""
+        from hermes_cli.skills_hub import _sources
+        from tools.skills_hub import skills_hub_http_session
 
-        return inspect_skill(identifier)
+        with skills_hub_http_session():
+            for source in _sources():
+                try:
+                    meta = source.inspect(identifier)
+                except Exception:
+                    continue
+                if meta is not None:
+                    return {"name": meta.name, "description": meta.description, "source": meta.source,
+                            "identifier": meta.identifier or identifier}
+        return None
 
-    def install_skill(self, identifier: str, *, force: bool) -> str:
-        """Install headless and return the installed skill's name. ``do_install`` reports only by
-        printing, so success is read from the hub lock file and failure from its last line."""
+    def install_skill(self, identifier: str, *, force: bool) -> Dict[str, Any]:
+        """Install headless; ``{name, already_installed}``. ``do_install`` reports only by printing, so
+        success is read from the hub lock file and failure from its last line. A skill that is already
+        installed (force off) is left as it is and reported so."""
         from rich.console import Console
 
         from hermes_cli.skills_hub import do_install
         from tools.skills_hub import HubLockFile
 
+        def entry() -> Optional[Dict[str, Any]]:
+            return next((e for e in HubLockFile().list_installed() if e.get("identifier") == identifier), None)
+
+        before = entry()
+        if before is not None and not force:
+            return {"name": str(before["name"]), "already_installed": True}
         out = io.StringIO()
         do_install(identifier, force=force, skip_confirm=True,
                    console=Console(file=out, width=200, no_color=True, highlight=False))
-        entry = next((e for e in HubLockFile().list_installed() if e.get("identifier") == identifier), None)
-        if entry is None:
+        after = entry()
+        if after is None or (before is not None and after.get("updated_at") == before.get("updated_at")):
             lines = [line.strip() for line in out.getvalue().splitlines() if line.strip()]
             raise RuntimeError(lines[-1] if lines else "the skill was not installed")
-        return str(entry["name"])
+        return {"name": str(after["name"]), "already_installed": False}
 
 
 @dataclass
@@ -216,7 +234,7 @@ class _Runner:
             _save_credentials({k: v for k, v in env.items() if k not in _OPTION_KEYS and v})
             if target.kind == "skill":
                 identifier = str(self.facts[target.name].get("identifier") or target.name)
-                return {"profile": profile, "skill": self.installer.install_skill(identifier, force=force)}
+                return {"profile": profile, **self.installer.install_skill(identifier, force=force)}
             enable = _flag(env.get("enable"), True)
             result = self.installer.install_plugin(target.name, force=force, enable=enable, ref=env.get("ref") or None)
         if not result.get("ok"):
@@ -280,7 +298,9 @@ def _installed_row(target: Target, outcome: Dict[str, Any]) -> tuple:
     """The connected row's fields (the drawn row plus what went live) and its one-line detail."""
     extra = {**target.extra, "target_profile": outcome["profile"]}
     if target.kind == "skill":
-        return {**extra, "skill": outcome["skill"], "tools": []}, ""
+        detail = "already installed; left as it is (Advanced, force reinstall replaces it)" \
+            if outcome.get("already_installed") else ""
+        return {**extra, "skill": outcome["name"], "tools": []}, detail
     live = (outcome.get("activation") or {}).get("live_now") or {}
     servers = live.get("mcp_servers") or []
     tools = [name for server in servers if server.get("connected") for name in server.get("tools") or ()]
