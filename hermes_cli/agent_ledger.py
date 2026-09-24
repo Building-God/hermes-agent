@@ -326,12 +326,14 @@ def build_ledger(
 
 # Static routing when we have no signal (matches t_5eb9182a's role table).
 _STATIC_ROLES: dict[str, tuple[str, str]] = {
-    "build": ("anthropic", "claude-opus-4-7"),
+    # 2026-09-24: workers run on API, never Harry's Claude subscription
+    # (Jarvis roadmap rule 20). GLM-5.1 is the live default on both machines.
+    "build": ("zai", "glm-5.1"),
     "review": ("zai", "glm-5.1"),
     "research": ("zai", "glm-5.1"),
     "draft": ("zai", "glm-5.1"),
-    "ops": ("anthropic", "claude-opus-4-7"),
-    "unknown": ("anthropic", "claude-opus-4-7"),
+    "ops": ("zai", "glm-5.1"),
+    "unknown": ("zai", "glm-5.1"),
 }
 
 
