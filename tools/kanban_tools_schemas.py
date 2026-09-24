@@ -176,7 +176,12 @@ KANBAN_BLOCK_SCHEMA = _schema(
         "``reason`` is shown to the human on the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
-        "block on things you can resolve yourself."
+        "block on things you can resolve yourself. "
+        "A hurdle is the next step, never the end: every needs_input/transient "
+        "block must carry a prepared one-tap next step (exact link/button + one "
+        "line of what happens); 'Blocked: needs X' with no prepared action is a "
+        "defect. Put a NEXT-STEP: <link|button|option> marker in the reason so "
+        "the human has a tap-target, not just a fail-report."
     ),
     {
         "task_id": _prop("string", _DESC_TASK_ID_DEFAULT),
