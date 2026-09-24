@@ -1,0 +1,68 @@
+{
+  "build": {
+    "provider": "zai",
+    "model": "glm-5.1",
+    "updated_at": "2026-09-24T14:01:55+00:00",
+    "evidence": {
+      "wins": 0,
+      "losses": 0,
+      "challenger": null,
+      "incumbent": "seed=live default 2026-09-24 (workers on API, never Claude subscription; roadmap rule 20)"
+    }
+  },
+  "review": {
+    "provider": "zai",
+    "model": "glm-5.1",
+    "updated_at": "2026-09-24T14:01:55+00:00",
+    "evidence": {
+      "wins": 0,
+      "losses": 0,
+      "challenger": null,
+      "incumbent": null
+    }
+  },
+  "research": {
+    "provider": "zai",
+    "model": "glm-5.1",
+    "updated_at": "2026-09-24T14:01:55+00:00",
+    "evidence": {
+      "wins": 0,
+      "losses": 0,
+      "challenger": null,
+      "incumbent": null
+    }
+  },
+  "draft": {
+    "provider": "zai",
+    "model": "glm-5.1",
+    "updated_at": "2026-09-24T14:01:55+00:00",
+    "evidence": {
+      "wins": 0,
+      "losses": 0,
+      "challenger": null,
+      "incumbent": null
+    }
+  },
+  "ops": {
+    "provider": "zai",
+    "model": "glm-5.1",
+    "updated_at": "2026-09-24T14:01:55+00:00",
+    "evidence": {
+      "wins": 0,
+      "losses": 0,
+      "challenger": null,
+      "incumbent": "seed=live default 2026-09-24 (workers on API, never Claude subscription; roadmap rule 20)"
+    }
+  },
+  "unknown": {
+    "provider": "zai",
+    "model": "glm-5.1",
+    "updated_at": "2026-09-24T14:01:55+00:00",
+    "evidence": {
+      "wins": 0,
+      "losses": 0,
+      "challenger": null,
+      "incumbent": "seed=live default 2026-09-24 (workers on API, never Claude subscription; roadmap rule 20)"
+    }
+  }
+}
