@@ -1661,12 +1661,15 @@ def check_respawn_guard(
     path never increments ``consecutive_failures``), ``"blocker_auth"``
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
-    a re-queue event arrived after it - a deliberate re-run) and ``"active_pr"``
-    (PR URL in a recent comment; re-spawning risks a duplicate PR - unless a
-    handoff event followed the comment: the named profile must work on that
-    PR). The review lane skips the last two: they are the *inputs* to a review
-    handoff. Stale / dead claim locks are NOT a guard reason - the reclaim
-    passes own those.
+    a re-queue event arrived after it - a deliberate re-run; bypass events are
+    ``status``, ``promoted``, ``unblocked``, ``reclaimed``, ``reconciled``, and
+    ``canon_gate_refused`` - the last two cover the acceptance-gate refusal path
+    where the gate bounces the task back to ready via an orphaned-running
+    reconcile and the canon_gate_refused marker) and ``"active_pr"`` (PR URL in
+    a recent comment; re-spawning risks a duplicate PR - unless a handoff event
+    followed the comment: the named profile must work on that PR). The review
+    lane skips the last two: they are the *inputs* to a review handoff. Stale /
+    dead claim locks are NOT a guard reason - the reclaim passes own those.
     """
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
@@ -1725,6 +1728,11 @@ def check_respawn_guard(
     #    AFTER that success (done→ready drag, re-promotion, unblock, reclaim) is
     #    a deliberate "run it again" - otherwise a manual done→ready would sit
     #    silently held until the window elapses.
+    #    Also bypass for ``reconciled`` (orphan reconciler re-queued the task
+    #    after the acceptance gate refused the completion and left it as an
+    #    orphaned-running state) and ``canon_gate_refused`` (acceptance gate
+    #    reopened the card because it was missing a CANON citation or metadata -
+    #    it needs another run to supply the missing signal, not a 1-hour wait).
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
     recent_completed = conn.execute(
         "SELECT ended_at FROM task_runs "
@@ -1737,7 +1745,8 @@ def check_respawn_guard(
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed', "
+            "             'reconciled', 'canon_gate_refused') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()
