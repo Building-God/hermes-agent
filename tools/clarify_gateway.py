@@ -11,7 +11,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +40,37 @@ _notify_cbs: Dict[str, Callable[[_ClarifyEntry], None]] = {}
 TEXT_RESOLVED = "resolved"
 TEXT_REJECTED_PROSE = "rejected_prose"
 TEXT_REJECTED_SELECTION = "rejected_selection"
+# System/notification traffic (kanban task-status wake, gateway relay) is never
+# a human answer: it must leave the clarify armed, not resolve it (t_fb1c5819).
+TEXT_REJECTED_NOTIFICATION = "rejected_notification"
 TEXT_NO_PENDING = "no_pending"
+
+# Stable prefixes the gateway/notifier emit for automatic task-status traffic.
+# An inbound starting with one of these must never be bound to a pending clarify
+# as if Harry had typed it (kanban t_fb1c5819: a "[kanban] Task t_... blocked"
+# wake masqueraded as his answer and unblocked a needs_input card).
+_NOTIFICATION_TEXT_PREFIXES = ("[kanban]", "[gateway]")
+# Stable label every automatic task-status line carries (see the i18n
+# ``gateway.kanban.wake.guidance`` string), matched as a substring so a relay
+# that re-wraps or truncates the prefix is still excluded.
+_NOTIFICATION_TEXT_MARKERS = ("automatic task-status notification",)
+
+
+def is_notification_text(text: Any) -> bool:
+    """True when ``text`` is automatic system/notification traffic, not a human answer.
+
+    Guards the clarify-binding path (kanban t_fb1c5819): a kanban wake, gateway
+    relay, or automatic task-status line must never masquerade as Harry's reply to
+    a pending clarify. Matches the stable prefixes the notifier/gateway emit
+    (``[kanban] Task ...``, ``[gateway] ...``) and the task-status guidance marker, so
+    a notification arriving while a clarify is pending leaves it unanswered.
+    """
+    s = str(text or "").strip()
+    if not s:
+        return False
+    if s.startswith(_NOTIFICATION_TEXT_PREFIXES):
+        return True
+    return any(marker in s for marker in _NOTIFICATION_TEXT_MARKERS)
 
 
 def register(clarify_id: str, session_key: str, question: str, choices: Optional[List[str]],
@@ -206,6 +236,8 @@ def _coerce_multi_select_text(entry: _ClarifyEntry, text: str) -> Optional[str]:
 
 def attempt_text_response_for_session(session_key: str, response: str) -> str:
     """Try to resolve the oldest pending clarify from typed text; returns a TEXT_* outcome."""
+    if is_notification_text(response):
+        return TEXT_REJECTED_NOTIFICATION
     entry = get_pending_for_session(session_key, include_choice_prompts=True)
     if entry is None:
         return TEXT_NO_PENDING

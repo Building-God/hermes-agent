@@ -434,3 +434,82 @@ class TestNativeRejectClassification:
         )
         assert value is None
         assert reason == "prose"
+
+
+class TestNotificationTextExcluded:
+    """kanban t_fb1c5819: automatic task-status traffic must never answer a clarify.
+
+    A kanban wake ("[kanban] Task t_... blocked", the notifier's i18n
+    ``gateway.kanban.wake.message`` shape) is system traffic. ``is_notification_text``
+    flags it, and ``attempt_text_response_for_session`` must reject it with
+    ``TEXT_REJECTED_NOTIFICATION`` - leaving the pending clarify armed, never
+    consuming the notification as Harry's answer.
+    """
+
+    def setup_method(self):
+        _clear_clarify_state()
+
+    def test_is_notification_text_matches_kanban_wake(self):
+        from tools import clarify_gateway as cm
+
+        assert cm.is_notification_text("[kanban] Task t_9d02f55d blocked; needs attention.")
+        assert cm.is_notification_text(
+            "[kanban] Task t_x completed.\nTitle: X\nThis is an automatic task-status notification."
+        )
+
+    def test_is_notification_text_matches_gateway_prefix_and_marker(self):
+        from tools import clarify_gateway as cm
+
+        assert cm.is_notification_text("[gateway] relay: task status changed")
+        assert cm.is_notification_text(
+            "Some re-wrapped line - This is an automatic task-status notification, not a request."
+        )
+
+    def test_is_notification_text_ignores_human_answers(self):
+        from tools import clarify_gateway as cm
+
+        assert not cm.is_notification_text("Trigger the scout-driver tick now")
+        assert not cm.is_notification_text("2")
+        assert not cm.is_notification_text("")
+        assert not cm.is_notification_text(None)
+
+    def test_kanban_wake_does_not_resolve_open_ended_clarify(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("nb-1", "sk-nb", "How to unblock the scout cards?", None)
+        outcome = cm.attempt_text_response_for_session(
+            "sk-nb",
+            "[kanban] Task t_9d02f55d blocked; needs attention.\n"
+            "Title: How we all talk to each other - the living doctrine\n"
+            "This is an automatic task-status notification, not a request to decompose the task again.",
+        )
+        assert outcome == cm.TEXT_REJECTED_NOTIFICATION
+        pending = cm.get_pending_for_session("sk-nb", include_choice_prompts=True)
+        assert pending is not None
+        assert pending.clarify_id == "nb-1"
+        assert not pending.event.is_set()
+
+    def test_kanban_wake_does_not_resolve_choice_clarify(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("nb-2", "sk-nb2", "Pick one", ["Trigger tick", "Add to allowlist"])
+        outcome = cm.attempt_text_response_for_session(
+            "sk-nb2", "[gateway] Task t_x blocked; needs attention.",
+        )
+        assert outcome == cm.TEXT_REJECTED_NOTIFICATION
+        pending = cm.get_pending_for_session("sk-nb2", include_choice_prompts=True)
+        assert pending is not None
+        assert not pending.event.is_set()
+
+    def test_real_answer_still_resolves_open_ended_clarify(self):
+        from tools import clarify_gateway as cm
+
+        cm.register("nb-3", "sk-nb3", "How to unblock the scout cards?", None)
+        outcome = cm.attempt_text_response_for_session("sk-nb3", "Trigger the scout-driver tick now")
+        assert outcome == cm.TEXT_RESOLVED
+        # The waiter pops the entry in wait_for_response; without a waiter the entry
+        # stays in the index but is resolved (event set, response recorded).
+        pending = cm.get_pending_for_session("sk-nb3", include_choice_prompts=True)
+        assert pending is not None
+        assert pending.event.is_set()
+        assert pending.response == "Trigger the scout-driver tick now"

@@ -374,6 +374,13 @@ class GatewayInboundMixin:
             return None
         if _pending_clarify is None:
             return None
+        # kanban t_fb1c5819: a synthetic ``internal=True`` event (kanban wake,
+        # background-process notification, async-delegation completion) is system
+        # traffic, never Harry answering. Leave the clarify armed and let the event
+        # fall through to normal routing instead of binding it as his reply - the
+        # exact hole that let "[kanban] Task t_... blocked" masquerade as his consent.
+        if getattr(event, "internal", False):
+            return None
         _clarify_has_audio = bool(self._pending_event_audio_paths(event))
         _raw_clarify_reply = await self._prepare_clarify_reply_text(event)
 
@@ -418,6 +425,17 @@ class GatewayInboundMixin:
             # Selection-shaped but invalid (out-of-range number, bad comma-list): keep the clarify
             # armed for retry — don't cancel, don't treat as an unrelated follow-up.
             return _retain("invalid selection attempt")
+        if _text_outcome == _clarify_mod.TEXT_REJECTED_NOTIFICATION:
+            # kanban t_fb1c5819: the inbound text is a task-status notification
+            # ("[kanban] Task ...", "[gateway] ...", an automatic task-status line),
+            # not Harry answering. Leave the clarify armed and fall through to normal
+            # routing - never consume the notification as his reply.
+            logger.info(
+                "Gateway left pending clarify unanswered: inbound text is a task-status "
+                "notification, not a user reply (session=%s, id=%s)",
+                _quick_key, _pending_clarify.clarify_id,
+            )
+            return None
         if _text_outcome == _clarify_mod.TEXT_REJECTED_PROSE:
             # Native-choice prompts reject unmatched prose so it continues through normal busy
             # routing. Release this clarify first: redirect() degrades to steer() while tools
