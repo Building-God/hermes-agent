@@ -1667,6 +1667,15 @@ def check_respawn_guard(
     PR). The review lane skips the last two: they are the *inputs* to a review
     handoff. Stale / dead claim locks are NOT a guard reason - the reclaim
     passes own those.
+
+    Re-queue bypass events for ``"recent_success"``: ``status``, ``promoted``,
+    ``unblocked``, ``reclaimed`` (explicit re-queue/drag), plus ``reconciled``
+    (orphan reconciler re-queued after a dead claim) and ``canon_gate_refused``
+    (acceptance gate reopened the card - it needs another run to add the missing
+    CANON citation or metadata). Without ``reconciled`` and ``canon_gate_refused``
+    in this list, a card that the acceptance gate refuses immediately after
+    completion stays permanently respawn-guarded until the 1-hour window elapses
+    (t_58daad56 postmortem, 2026-09-25).
     """
     row = conn.execute(
         "SELECT last_failure_error FROM tasks WHERE id = ?",
@@ -1737,7 +1746,8 @@ def check_respawn_guard(
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed', "
+            "             'reconciled', 'canon_gate_refused') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()
