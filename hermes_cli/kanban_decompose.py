@@ -1,4 +1,4 @@
-"""Kanban decomposer — fan a triage task out into a graph of child tasks.
+"""Kanban decomposer - fan a triage task out into a graph of child tasks.
 
 Invoked by ``hermes kanban decompose [task_id | --all]`` and the gateway
 dispatcher's auto-decompose path. Reads the profile roster (with
@@ -11,7 +11,7 @@ profile) can judge completion and add more work.
 Mirrors ``kanban_specify`` (lazy aux import, lenient parse, never raises on
 expected failures). ``fanout=false`` collapses to the ``specify`` behaviour
 (tighten + promote, no children), making ``decompose`` a strict superset.
-Unknown assignees are rewritten to ``default_assignee`` — a child NEVER ends
+Unknown assignees are rewritten to ``default_assignee`` - a child NEVER ends
 up with ``assignee=None``.
 """
 
@@ -73,7 +73,7 @@ Rules:
     DESCRIPTION (not just the name). When nothing matches well, use null
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
-    context — be specific about goal, approach, and acceptance criteria.
+    context - be specific about goal, approach, and acceptance criteria.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -129,13 +129,13 @@ def _profile_author() -> str:
 def _resolve_profile_from_cfg(cfg: dict, key: str, *, fallback: Optional[str] = None) -> str:
     """``kanban.<key>`` if it names an existing profile, else ``fallback``
     (the root task's own assignee) if that does, else the active default
-    profile — so a task is never stranded for lack of an owner.
+    profile - so a task is never stranded for lack of an owner.
     ``orchestrator_profile`` owns the root after fan-out; ``default_assignee``
     catches children the decomposer can't route.
 
     The root's assignee sits before the active profile because the decomposer
-    runs inside whatever profile hosts the dispatcher — an operator's
-    credential-less incognito profile, say — and that profile must never
+    runs inside whatever profile hosts the dispatcher - an operator's
+    credential-less incognito profile, say - and that profile must never
     silently become the owner of work the card was assigned away from (#114294).
     """
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
@@ -174,7 +174,7 @@ def _build_roster() -> tuple[list[dict], set[str]]:
 
 def _format_roster(roster: list[dict]) -> str:
     if not roster:
-        return "  (no profiles installed — decomposer cannot route work)"
+        return "  (no profiles installed - decomposer cannot route work)"
     return "\n".join(
         f"  - {entry['name']}{'' if entry['has_description'] else ' ⚠ undescribed'}: {entry['description']}"
         for entry in roster
@@ -182,7 +182,7 @@ def _format_roster(roster: list[dict]) -> str:
 
 
 def _normalize_assignee_choice(assignee: object, *, default_assignee: str, valid_names: set[str]) -> str:
-    """A valid assignee, else ``default_assignee`` — promoted work is never
+    """A valid assignee, else ``default_assignee`` - promoted work is never
     left unassigned."""
     if not isinstance(assignee, str) or not assignee.strip():
         return default_assignee
@@ -254,7 +254,7 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
         )
         if isinstance(assignee, str) and assignee.strip() and assignee.strip() not in routing.valid_names:
             logger.info(
-                "decompose: task %s child %d picked unknown assignee %r — "
+                "decompose: task %s child %d picked unknown assignee %r - "
                 "routing to default_assignee %r",
                 task_id, idx, assignee, routing.default_assignee,
             )
@@ -337,10 +337,19 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return task ids currently in the triage column that are safe to auto-decompose.
+
+    Tasks that reached triage via a block-loop (``block_recurrences >=
+    BLOCK_RECURRENCE_LIMIT``) are excluded: they need human or orchestrator
+    attention, not another round of automatic decomposition that would simply
+    spawn a new worker to hit the same wall again.
+    """
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [row.id for row in rows]
+    return [
+        row.id for row in rows
+        if (row.block_recurrences or 0) < kb.BLOCK_RECURRENCE_LIMIT
+    ]
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
