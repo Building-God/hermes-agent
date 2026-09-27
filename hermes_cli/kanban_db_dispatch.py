@@ -87,6 +87,24 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# If a comment contains a PR URL AND one of these markers, it documents a
+# CLOSED/MERGED/superseded PR rather than an open one - skip the active_pr guard.
+# Recovery comments and reviewer supersession notes often include closed-PR
+# evidence alongside the PR URL; those should not re-trigger the 24h window.
+_RESPAWN_GUARD_PR_CLOSED_RE = re.compile(
+    r'"pr_closed"\s*:|PR\s+#?\d+\s+(CLOSED|MERGED)|now\s+(CLOSED|MERGED)'
+    r'|CLOSED\s+\(|MERGED\s+\(|superseded\s+by|was\s+merged|has\s+been\s+merged',
+    re.IGNORECASE,
+)
+
+# TTL for the GitHub PR state cache (5 minutes - long enough to avoid hot-loop
+# API calls, short enough to pick up a PR merge within a couple dispatch ticks).
+_GITHUB_PR_STATE_CACHE_TTL = 300
+
+# Module-level in-memory cache: url.lower() -> (state_upper, fetched_at_epoch)
+# state_upper is "OPEN", "MERGED", "CLOSED", or "" for fetch failures.
+_github_pr_state_cache: dict[str, tuple[str, float]] = {}
+
 
 @dataclass
 class DispatchResult:
@@ -129,6 +147,12 @@ class DispatchResult:
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
+    skipped_workspace_busy: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, workspace_path)`` deferred because another running worker
+    already holds the same ``dir`` workspace_path. Two ``dir``-workspace
+    workers on the same repo can trample each other's uncommitted files, so
+    dispatch waits for the first to finish. ``scratch`` and ``worktree`` tasks
+    get isolated paths from the resolver and are never blocked by this guard."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -167,7 +191,11 @@ def held_by_capacity(results: Iterable[Optional["DispatchResult"]]) -> bool:
     health window under ``max_in_progress: 1`` logs a false "dispatcher stuck".
     """
     return any(
-        res is not None and (res.capacity_held or bool(res.skipped_per_profile_capped))
+        res is not None and (
+            res.capacity_held
+            or bool(res.skipped_per_profile_capped)
+            or bool(res.skipped_workspace_busy)
+        )
         for res in results
     )
 
@@ -1647,6 +1675,46 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _fetch_github_pr_state(url: str) -> str:
+    """Return the GitHub PR state for *url* as an upper-case string.
+
+    Returns ``"OPEN"``, ``"MERGED"``, or ``"CLOSED"`` on success.
+    Returns ``""`` on any error (network, missing ``gh`` binary, auth).
+
+    Results are cached in :data:`_github_pr_state_cache` for
+    :data:`_GITHUB_PR_STATE_CACHE_TTL` seconds so the dispatcher's hot loop
+    does not make a fresh API call on every tick.  The cache is keyed by the
+    lowercased URL so variant capitalisations share entries.
+
+    Only the ``gh`` CLI is used; no direct network calls are made from this
+    module, so the call respects whatever token ``gh`` is configured with.
+    """
+    key = url.rstrip("/").lower()
+    entry = _github_pr_state_cache.get(key)
+    if entry is not None:
+        state, fetched_at = entry
+        if time.time() - fetched_at < _GITHUB_PR_STATE_CACHE_TTL:
+            return state
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", url, "--json", "state", "--jq", ".state"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            state = result.stdout.strip().upper()
+            if state in ("OPEN", "MERGED", "CLOSED"):
+                _github_pr_state_cache[key] = (state, time.time())
+                return state
+    except Exception:
+        pass
+    # On any failure, store a short-lived empty sentinel so a transient gh
+    # error doesn't spam the process with repeated calls.
+    _github_pr_state_cache[key] = ("", time.time())
+    return ""
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1711,9 +1779,16 @@ def check_respawn_guard(
     # crash is different: its persisted error includes the worker's last
     # captured output, which is context rather than a diagnosis and may contain
     # benign commands such as ``claude auth status`` (#117097).
+    # Also exempt ``review_requested`` and ``completed`` outcomes: a later
+    # successful run supersedes a prior rate-limited run's stamped error.
+    # Without this, a task that was rate-limited and then successfully reached
+    # review would be permanently blocked by the stale rate-limit text in
+    # last_failure_error (the field is only cleared by _record_task_failure,
+    # not by request_review).
+    _BLOCKER_AUTH_EXEMPT_OUTCOMES = {"crashed", "review_requested", "completed"}
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    if err and latest_outcome not in _BLOCKER_AUTH_EXEMPT_OUTCOMES and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
@@ -1725,6 +1800,11 @@ def check_respawn_guard(
     #    AFTER that success (done→ready drag, re-promotion, unblock, reclaim) is
     #    a deliberate "run it again" - otherwise a manual done→ready would sit
     #    silently held until the window elapses.
+    #    Also bypass for ``reconciled`` (orphan reconciler re-queued the task
+    #    after the acceptance gate refused the completion and left it as an
+    #    orphaned-running state) and ``canon_gate_refused`` (acceptance gate
+    #    reopened the card because it was missing a CANON citation or metadata -
+    #    it needs another run to supply the missing signal, not a 1-hour wait).
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
     recent_completed = conn.execute(
         "SELECT ended_at FROM task_runs "
@@ -1737,7 +1817,8 @@ def check_respawn_guard(
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed', "
+            "             'reconciled', 'canon_gate_refused') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()
@@ -1751,13 +1832,74 @@ def check_respawn_guard(
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
+    all_comments = conn.execute(
         "SELECT body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
         (task_id, pr_cutoff),
-    ).fetchall():
+    ).fetchall()
+    # Pre-collect PR URLs and PR numbers that appear in CLOSED/MERGED comments
+    # so that an older URL-only comment for the same PR does not re-arm the
+    # guard even when the two pieces of evidence land in separate comments.
+    # Two sources:
+    #   (a) same-comment URL + closed marker - most reliable
+    #   (b) any closed-marker comment mentioning the PR *number* - covers the
+    #       common pattern where a recovery note says "PR #105 CLOSED" without
+    #       repeating the full URL.
+    _PR_NUM_IN_CLOSED_RE = re.compile(
+        r"PR\s+#?(\d+)\s+(CLOSED|MERGED)|PR\s+#?(\d+)\s*=\s*(CLOSED|MERGED)",
+        re.IGNORECASE,
+    )
+    closed_pr_urls: set[str] = set()
+    closed_pr_numbers: set[str] = set()
+    for c in all_comments:
+        body = _kb._lossy_text(c["body"])
+        if not body:
+            continue
+        if _RESPAWN_GUARD_PR_CLOSED_RE.search(body):
+            # Same-comment URL+marker
+            for m in _RESPAWN_GUARD_PR_URL_RE.finditer(body):
+                closed_pr_urls.add(m.group(0).rstrip("/").lower())
+            # PR number in closed-marker text
+            for m in _PR_NUM_IN_CLOSED_RE.finditer(body):
+                num = m.group(1) or m.group(3)
+                if num:
+                    closed_pr_numbers.add(num)
+    for c in all_comments:
         body = _kb._lossy_text(c["body"])
         if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
+            continue
+        # Skip comments that document a closed/superseded PR: a recovery
+        # comment or reviewer note that includes a PR URL alongside a closed
+        # marker is evidence the PR is done, not a signal to guard.
+        if _RESPAWN_GUARD_PR_CLOSED_RE.search(body):
+            continue
+        # Collect URLs in this comment.
+        urls_in_comment = {
+            m.group(0).rstrip("/").lower()
+            for m in _RESPAWN_GUARD_PR_URL_RE.finditer(body)
+        }
+        # A URL is text-cleared if:
+        #   (a) it appeared in closed_pr_urls (same comment URL+marker), or
+        #   (b) its PR number appeared in a closed-marker comment.
+        def _url_text_cleared(url: str) -> bool:
+            if url in closed_pr_urls:
+                return True
+            # Extract PR number from URL: .../pull/NNN
+            num_m = re.search(r"/pull/(\d+)", url)
+            return bool(num_m and num_m.group(1) in closed_pr_numbers)
+
+        text_cleared = {u for u in urls_in_comment if _url_text_cleared(u)}
+        if urls_in_comment and urls_in_comment.issubset(text_cleared):
+            continue
+        # For URLs not cleared by text markers, check live GitHub state.
+        # A MERGED or CLOSED result is definitive - the PR is no longer open.
+        # An OPEN result, or a fetch failure (empty string), keeps the guard.
+        live_cleared: set[str] = set()
+        for url in urls_in_comment - text_cleared:
+            live_state = _fetch_github_pr_state(url)
+            if live_state in ("MERGED", "CLOSED"):
+                live_cleared.add(url)
+        if urls_in_comment and (urls_in_comment - text_cleared).issubset(live_cleared):
             continue
         events = conn.execute(
             # Strictly after: a same-second tie stays guarded (fail closed).
@@ -2056,6 +2198,44 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
     return total
 
 
+def _running_dir_workspaces(conn: sqlite3.Connection) -> set[str]:
+    """Absolute workspace_path of every ``dir``-workspace worker currently in
+    ``status='running'``. Used by the same-workspace collision guard so a second
+    worker never runs against a live repo whose uncommitted files another
+    worker holds. ``scratch`` and ``worktree`` are excluded - the resolver hands
+    each one an isolated path, so they cannot collide. Fails open to empty on
+    a broken DB (dispatch stays alive; the cap is the safety net)."""
+    try:
+        rows = conn.execute(
+            "SELECT workspace_path FROM tasks "
+            "WHERE status = 'running' AND workspace_kind = 'dir' "
+            "AND workspace_path IS NOT NULL AND workspace_path != ''"
+        ).fetchall()
+    except Exception:
+        return set()
+    out: set[str] = set()
+    for r in rows:
+        wp = (r["workspace_path"] or "").strip()
+        if wp:
+            out.add(_normalize_workspace_path(wp))
+    return out
+
+
+def _normalize_workspace_path(path: str) -> str:
+    """Case-fold + normalize the workspace path so ``C:\\Users\\...`` and
+    ``c:/users/...`` are recognized as the same repo on Windows.
+
+    Fails open to the original string if normalization raises - the guard is
+    only advisory (workers still get their own claim), and a broken path
+    should not brick dispatch."""
+    try:
+        import os as _os
+        return _os.path.normcase(_os.path.normpath(path))
+    except Exception:
+        return path
+
+
+
 def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
     """Classify system memory pressure: ok/elevated/critical/unknown.
 
@@ -2161,6 +2341,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    busy_workspaces: Optional[set[str]] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2182,6 +2363,23 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    # Same-workspace collision guard: two ``dir``-workspace workers on the same
+    # repo can trample each other's uncommitted files (git index, in-flight
+    # edits, .venv), so at most one runs at a time per workspace_path. Only
+    # ``dir`` workspaces are gated - ``scratch`` and ``worktree`` each get an
+    # isolated path from the resolver. Task-scoped: works whether the busy
+    # holder is on the same lane or a sibling.
+    if busy_workspaces is not None:
+        try:
+            wp_declared = (row["workspace_path"] or "").strip()
+            wk_declared = (row["workspace_kind"] or "").strip()
+        except Exception:
+            wp_declared, wk_declared = "", ""
+        if wk_declared == "dir" and wp_declared:
+            norm = _normalize_workspace_path(wp_declared)
+            if norm in busy_workspaces:
+                result.skipped_workspace_busy.append((task_id, wp_declared))
+                return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
@@ -2225,6 +2423,9 @@ def _dispatch_lane_task(
             result.auto_blocked.append(claimed.id)
         return False
     _kbw.set_workspace_path(conn, claimed.id, str(workspace))
+    # Guard sees this workspace as busy for the rest of this tick's rows.
+    if busy_workspaces is not None and claimed.workspace_kind == "dir":
+        busy_workspaces.add(_normalize_workspace_path(str(workspace)))
     if claimed.workspace_kind == "worktree":
         _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
     _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
@@ -2383,7 +2584,7 @@ def _tick_spawn_budget(
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, workspace_kind, workspace_path FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -2508,6 +2709,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        busy_workspaces=_running_dir_workspaces(conn),
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
