@@ -87,6 +87,24 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# If a comment contains a PR URL AND one of these markers, it documents a
+# CLOSED/MERGED/superseded PR rather than an open one - skip the active_pr guard.
+# Recovery comments and reviewer supersession notes often include closed-PR
+# evidence alongside the PR URL; those should not re-trigger the 24h window.
+_RESPAWN_GUARD_PR_CLOSED_RE = re.compile(
+    r'"pr_closed"\s*:|PR\s+#?\d+\s+(CLOSED|MERGED)|now\s+(CLOSED|MERGED)'
+    r'|CLOSED\s+\(|MERGED\s+\(|superseded\s+by|was\s+merged|has\s+been\s+merged',
+    re.IGNORECASE,
+)
+
+# TTL for the GitHub PR state cache (5 minutes - long enough to avoid hot-loop
+# API calls, short enough to pick up a PR merge within a couple dispatch ticks).
+_GITHUB_PR_STATE_CACHE_TTL = 300
+
+# Module-level in-memory cache: url.lower() -> (state_upper, fetched_at_epoch)
+# state_upper is "OPEN", "MERGED", "CLOSED", or "" for fetch failures.
+_github_pr_state_cache: dict[str, tuple[str, float]] = {}
+
 
 @dataclass
 class DispatchResult:
@@ -1647,6 +1665,46 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _fetch_github_pr_state(url: str) -> str:
+    """Return the GitHub PR state for *url* as an upper-case string.
+
+    Returns ``"OPEN"``, ``"MERGED"``, or ``"CLOSED"`` on success.
+    Returns ``""`` on any error (network, missing ``gh`` binary, auth).
+
+    Results are cached in :data:`_github_pr_state_cache` for
+    :data:`_GITHUB_PR_STATE_CACHE_TTL` seconds so the dispatcher's hot loop
+    does not make a fresh API call on every tick.  The cache is keyed by the
+    lowercased URL so variant capitalisations share entries.
+
+    Only the ``gh`` CLI is used; no direct network calls are made from this
+    module, so the call respects whatever token ``gh`` is configured with.
+    """
+    key = url.rstrip("/").lower()
+    entry = _github_pr_state_cache.get(key)
+    if entry is not None:
+        state, fetched_at = entry
+        if time.time() - fetched_at < _GITHUB_PR_STATE_CACHE_TTL:
+            return state
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", url, "--json", "state", "--jq", ".state"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            state = result.stdout.strip().upper()
+            if state in ("OPEN", "MERGED", "CLOSED"):
+                _github_pr_state_cache[key] = (state, time.time())
+                return state
+    except Exception:
+        pass
+    # On any failure, store a short-lived empty sentinel so a transient gh
+    # error doesn't spam the process with repeated calls.
+    _github_pr_state_cache[key] = ("", time.time())
+    return ""
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1750,14 +1808,82 @@ def check_respawn_guard(
     #    now work on THAT PR - a closer or the implementer finishing it, not a
     #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
     #    so the worker that opened the PR is still not re-spawned against it.
+    #
+    #    Text-based closed markers are checked first (fast, no network).  For
+    #    any URL not already cleared by text evidence, the live GitHub PR state
+    #    is queried (cached for _GITHUB_PR_STATE_CACHE_TTL seconds).  A merged
+    #    or closed PR is never a guard reason; an API call failure falls back to
+    #    guarding (fail closed) - a transient gh error is better than a spurious
+    #    duplicate PR.
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
+    all_comments = conn.execute(
         "SELECT body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ? ORDER BY created_at DESC",
         (task_id, pr_cutoff),
-    ).fetchall():
+    ).fetchall()
+    # Pre-collect PR URLs and PR numbers that appear in CLOSED/MERGED comments
+    # so that an older URL-only comment for the same PR does not re-arm the
+    # guard even when the two pieces of evidence land in separate comments.
+    # Two sources:
+    #   (a) same-comment URL + closed marker - most reliable
+    #   (b) any closed-marker comment mentioning the PR *number* - covers the
+    #       common pattern where a recovery note says "PR #105 CLOSED" without
+    #       repeating the full URL.
+    _PR_NUM_IN_CLOSED_RE = re.compile(
+        r"PR\s+#?(\d+)\s+(CLOSED|MERGED)|PR\s+#?(\d+)\s*=\s*(CLOSED|MERGED)",
+        re.IGNORECASE,
+    )
+    closed_pr_urls: set[str] = set()
+    closed_pr_numbers: set[str] = set()
+    for c in all_comments:
+        body = _kb._lossy_text(c["body"])
+        if not body:
+            continue
+        if _RESPAWN_GUARD_PR_CLOSED_RE.search(body):
+            # Same-comment URL+marker
+            for m in _RESPAWN_GUARD_PR_URL_RE.finditer(body):
+                closed_pr_urls.add(m.group(0).rstrip("/").lower())
+            # PR number in closed-marker text
+            for m in _PR_NUM_IN_CLOSED_RE.finditer(body):
+                num = m.group(1) or m.group(3)
+                if num:
+                    closed_pr_numbers.add(num)
+    for c in all_comments:
         body = _kb._lossy_text(c["body"])
         if not (body and _RESPAWN_GUARD_PR_URL_RE.search(body)):
+            continue
+        # Skip comments that document a closed/superseded PR: a recovery
+        # comment or reviewer note that includes a PR URL alongside a closed
+        # marker is evidence the PR is done, not a signal to guard.
+        if _RESPAWN_GUARD_PR_CLOSED_RE.search(body):
+            continue
+        # Collect URLs in this comment.
+        urls_in_comment = {
+            m.group(0).rstrip("/").lower()
+            for m in _RESPAWN_GUARD_PR_URL_RE.finditer(body)
+        }
+        # A URL is text-cleared if:
+        #   (a) it appeared in closed_pr_urls (same comment URL+marker), or
+        #   (b) its PR number appeared in a closed-marker comment.
+        def _url_text_cleared(url: str) -> bool:
+            if url in closed_pr_urls:
+                return True
+            # Extract PR number from URL: .../pull/NNN
+            num_m = re.search(r"/pull/(\d+)", url)
+            return bool(num_m and num_m.group(1) in closed_pr_numbers)
+
+        text_cleared = {u for u in urls_in_comment if _url_text_cleared(u)}
+        if urls_in_comment and urls_in_comment.issubset(text_cleared):
+            continue
+        # For URLs not cleared by text markers, check live GitHub state.
+        # A MERGED or CLOSED result is definitive - the PR is no longer open.
+        # An OPEN result, or a fetch failure (empty string), keeps the guard.
+        live_cleared: set[str] = set()
+        for url in urls_in_comment - text_cleared:
+            live_state = _fetch_github_pr_state(url)
+            if live_state in ("MERGED", "CLOSED"):
+                live_cleared.add(url)
+        if urls_in_comment and (urls_in_comment - text_cleared).issubset(live_cleared):
             continue
         events = conn.execute(
             # Strictly after: a same-second tie stays guarded (fail closed).
