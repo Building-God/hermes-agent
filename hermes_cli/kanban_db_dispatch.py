@@ -30,6 +30,26 @@ from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
 
+# Unified failure policy (imported from Jarvis soul/failure_policy.py).
+# Every failure is classified before retry; circuit breakers stop hammering
+# rate-limited providers.
+from hermes_cli.failure_policy import (
+    classify_failure,
+    FailureClass,
+    FailurePolicy,
+    CircuitBreakerRegistry,
+    get_registry,
+)
+
+# Module-level circuit breaker registry (one per dispatcher process).
+# Persisted from failure_policy's global singleton.
+_failure_circuit_breakers: CircuitBreakerRegistry = get_registry()
+
+# When a (profile, provider) circuit is OPEN, workers route through
+# the LiteLLM fallback proxy instead of the primary provider.
+_LITELLM_FALLBACK_BASE_URL = "http://localhost:4000"
+_LITELLM_FALLBACK_MODEL = "chat"  # LiteLLM alias (sonnet -> deepseek -> glm)
+
 
 # After this many consecutive non-success attempts on a task/profile the
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
@@ -1367,6 +1387,22 @@ def _record_task_failure(
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     error = error[:500]
+
+    # Classify the failure and feed the circuit breaker for CAPACITY (rate-limit)
+    # failures. This lets the dispatcher route future spawns through LiteLLM
+    # when the primary provider is rate-limited.
+    if not infrastructure and outcome not in (None, "completed"):
+        policy = classify_failure(error, outcome=outcome)
+        if policy.failure_class == FailureClass.CAPACITY:
+            provider = _infer_provider_from_error(error)
+            if provider:
+                # Get the task's assignee for the (profile, provider) key.
+                assignee_row = conn.execute(
+                    "SELECT assignee FROM tasks WHERE id = ?", (task_id,),
+                ).fetchone()
+                profile = (assignee_row["assignee"] or "default") if assignee_row else "default"
+                _failure_circuit_breakers.record_failure(profile, provider)
+
     with _kb.write_txn(conn):
         row = conn.execute(
             "SELECT consecutive_failures, status, max_retries, current_run_id "
@@ -1504,8 +1540,24 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     Called from ``complete_task`` on success. NOT called on spawn success: a
     spawn proves the worker could start, not that the run will succeed, so
     timeouts and crashes must accumulate across spawn boundaries.
+
+    Also resets the (profile, provider) circuit breaker since the task succeeded
+    — the provider is healthy.
     """
     with _kb.write_txn(conn):
+        # Infer the (profile, provider) from the last failure before clearing it
+        # so we can reset the circuit breaker.
+        old_err = conn.execute(
+            "SELECT last_failure_error, assignee FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if old_err and old_err["last_failure_error"]:
+            err_text = _kb._lossy_text(old_err["last_failure_error"]) or ""
+            provider = _infer_provider_from_error(err_text)
+            if provider:
+                profile = old_err["assignee"] or "default"
+                _failure_circuit_breakers.record_success(profile, provider)
+
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 0, "
             "last_failure_error = NULL WHERE id = ?",
@@ -1513,8 +1565,96 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _infer_provider_from_error(error_text: str) -> Optional[str]:
+    """Infer the provider name from a rate-limit error message.
+
+    Providers often include their name in error text (e.g. 'openrouter',
+    'anthropic', 'openai'). Return the normalized provider name or None.
+    """
+    import re as _re
+
+    # Known provider patterns in error messages.
+    _PROVIDER_PATTERNS = _re.compile(
+        r"\b(openrouter|anthropic|openai|gemini|deepseek|nous|together|groq|"
+        r"perplexity|mistral|cohere)\b",
+        _re.IGNORECASE,
+    )
+    match = _PROVIDER_PATTERNS.search(error_text)
+    return match.group(1).lower() if match else None
+
+
+def _apply_litellm_fallback(conn: sqlite3.Connection, claimed: Any) -> None:
+    """Route a claimed task through LiteLLM when its (profile, provider) circuit is OPEN.
+
+    When the circuit breaker is open for this task's (profile, provider), override
+    the model and provider to use the LiteLLM proxy at localhost:4000 instead of
+    the rate-limited primary. Only applies when the task does not already have
+    a model/provider override set.
+    """
+    if claimed.model_override or claimed.provider_override:
+        # Task already has an explicit override — respect it.
+        return
+
+    assignee = claimed.assignee or "default"
+    err_text = ""
+    row = conn.execute(
+        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        (claimed.id,),
+    ).fetchone()
+    if row:
+        err_text = _kb._lossy_text(row["last_failure_error"]) or ""
+
+    # Determine provider from the persisted error or the task's profile config.
+    provider = _infer_provider_from_error(err_text)
+    if not provider:
+        # Fall back to profile's configured provider.
+        try:
+            from hermes_cli.auth import _get_config_provider
+            provider = _get_config_provider() or ""
+        except Exception:
+            provider = ""
+
+    if not provider:
+        return
+
+    profile = assignee
+    if _failure_circuit_breakers.is_open(profile, provider):
+        # Circuit is OPEN — route through LiteLLM.
+        claimed.model_override = _LITELLM_FALLBACK_MODEL
+        claimed.provider_override = "custom"
+
+
+def _post_cooldown_comment(
+    conn: sqlite3.Connection,
+    task_id: str,
+    until_time: float,
+    attempt: int,
+    max_attempts: int,
+    fallback: str,
+    reason: str,
+) -> None:
+    """Post a visible card comment with cooldown info and retry attempt."""
+    from datetime import datetime, timezone
+
+    until_str = datetime.fromtimestamp(until_time, tz=timezone.utc).strftime(
+        "%H:%M UTC"
+    )
+    body = (
+        f"cooling down until {until_str}, attempt {attempt}/{max_attempts}, "
+        f"will retry with {fallback}\n\n"
+        f"reason: {reason}"
+    )
+    try:
+        with _kb.write_txn(conn):
+            _kb._insert_comment(conn, task_id, "dispatcher", body, int(time.time()))
+    except Exception:
+        # Best-effort: comment failure must not block dispatch
+        pass
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
+    assignee: Optional[str] = None,
 ) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -1525,7 +1665,7 @@ def check_respawn_guard(
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
     path never increments ``consecutive_failures``), ``"blocker_auth"``
-    (quota/auth pattern; the breaker still trips eventually), then for the
+    (quota/auth pattern classified by the failure policy), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
@@ -1573,14 +1713,73 @@ def check_respawn_guard(
         # (spaced by the cooldown) until quota returns or a real run supersedes it.
         return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.  A plain
-    # crash is different: its persisted error includes the worker's last
-    # captured output, which is context rather than a diagnosis and may contain
-    # benign commands such as ``claude auth status`` (#117097).
+    # 2. Failure-policy classification: replace the simple regex with the
+    #    unified policy module. Classify the persisted error, check the
+    #    (profile, provider) circuit breaker, and compute dynamic backoff.
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
-        return "blocker_auth"
+    if err and latest_outcome not in ("crashed", "review_requested", "completed"):
+        policy = classify_failure(err, outcome=latest_outcome)
+
+        if policy.failure_class == FailureClass.PERMANENT:
+            # Permanent failures (auth, credentials, bad input) — auto-block,
+            # never retry. The old _RESPAWN_BLOCKER_RE used to let these
+            # accumulate failures until the task breaker tripped; now we
+            # classify and block on the first permanent failure.
+            return "blocker_auth"
+
+        if policy.failure_class == FailureClass.CAPACITY:
+            # Rate limit / quota — check the per-(profile, provider) circuit.
+            provider = _infer_provider_from_error(err)
+            profile = assignee or "default"
+
+            if provider and _failure_circuit_breakers.is_open(profile, provider):
+                # Circuit is OPEN — compute backoff from the policy.
+                failures = conn.execute(
+                    "SELECT consecutive_failures FROM tasks WHERE id = ?",
+                    (task_id,),
+                ).fetchone()
+                attempt = min(int(failures[0]) + 1, policy.max_retries) if failures else 1
+
+                if attempt > policy.max_retries:
+                    # Retry budget exhausted for this provider.
+                    # Let the task through with LiteLLM fallback (handled
+                    # in _dispatch_lane_task).
+                    return None
+
+                backoff = policy.next_backoff_seconds(attempt)
+                ended_at = latest_run["ended_at"]
+                if ended_at is not None and (now - int(ended_at)) < backoff:
+                    # Within cooldown — post a comment and hold.
+                    until_time = float(ended_at) + backoff
+                    _post_cooldown_comment(
+                        conn, task_id,
+                        until_time=until_time,
+                        attempt=attempt,
+                        max_attempts=policy.max_retries,
+                        fallback="LiteLLM (localhost:4000)",
+                        reason=f"circuit OPEN for ({profile}, {provider}) — {err[:200]}",
+                    )
+                    return "circuit_open_cooldown"
+
+                # Backoff elapsed, retry budget available — let through
+                # with LiteLLM fallback.
+                return None
+
+            elif _RESPAWN_BLOCKER_RE.search(err):
+                # Legacy match for unrecognized rate-limit patterns.
+                # The policy module classifies these as CAPACITY already,
+                # but keep the blocker label for visibility.
+                return "blocker_auth"
+
+        if policy.failure_class == FailureClass.NEEDS_HARRY:
+            # Escalate to Harry — auto-block with a visible reason.
+            return "blocker_auth"
+
+        # TRANSIENT / INFRASTRUCTURE: let through with backoff.
+        # The old check_respawn_guard would return "blocker_auth" for any
+        # _RESPAWN_BLOCKER_RE match on a non-crashed outcome. Now we only
+        # block on PERMANENT (immediate) and NEEDS_HARRY.
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
     # are the canonical *inputs* to a review handoff, not duplicate-work signals.
@@ -2061,7 +2260,7 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
-    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
+    guard_reason = check_respawn_guard(conn, task_id, lane=lane, assignee=assignee)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
@@ -2111,6 +2310,9 @@ def _dispatch_lane_task(
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+    # LiteLLM fallback: when the (profile, provider) circuit is OPEN,
+    # route this worker through the LiteLLM proxy instead of the primary provider.
+    _apply_litellm_fallback(conn, claimed)
     try:
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
@@ -2293,7 +2495,7 @@ def _any_spawnable_review(
             continue
         if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
             continue
-        if check_respawn_guard(conn, row["id"], lane="review") is None:
+        if check_respawn_guard(conn, row["id"], lane="review", assignee=assignee) is None:
             return True
     return False
 
