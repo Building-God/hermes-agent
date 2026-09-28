@@ -12,6 +12,7 @@ from pydantic import Field
 
 from .base import JsonValue, Params, Result, WireEnum
 from .common import OpenModel, ProfileParams, SessionLiveInfo
+from .connectors_operation import CatalogAppState, CatalogTier
 from .registry import method
 
 
@@ -204,9 +205,11 @@ method("skills.manage", params=SkillsManageParams, result=SkillsManageResult,
 
 
 class SkillsReloadParams(Params):
-    """``session_id`` binds the rescan to that session's profile and workspace (project skills)."""
+    """``session_id`` binds the rescan to that session's profile and workspace (project skills);
+    ``profile`` scopes a session-less rescan."""
 
     session_id: str | None = None
+    profile: str | None = None
 
 
 class SkillCommandRef(Result):
@@ -585,6 +588,7 @@ class PluginsAction(WireEnum):
     update = "update"
     remove = "remove"
     settings = "settings"
+    onboarding = "onboarding"
 
 
 class PluginsManageParams(ProfileParams):
@@ -635,6 +639,7 @@ class PluginSettingField(Result):
 class PluginServerState(WireEnum):
     connected = "connected"
     app_not_running = "app_not_running"
+    hermes_not_connected = "hermes_not_connected"
     endpoint_unavailable = "endpoint_unavailable"
     no_interactive_session = "no_interactive_session"
     version_too_old = "version_too_old"
@@ -708,6 +713,20 @@ class PluginActivation(Result):
     deferred: dict[str, list[str]] = Field(default_factory=dict)
 
 
+class OnboardingCatalogPlugin(Result):
+    """A catalog plugin curated for the onboarding card (``onboarding: true``) that this OS runs.
+    ``app_state`` is the pinned ``plugin.json`` declaration judged on this host; ``sentence`` names what
+    is missing (empty when present or unknown)."""
+
+    name: str
+    title: str
+    description: str
+    tier: CatalogTier
+    platforms: list[str]
+    app_state: CatalogAppState
+    sentence: str
+
+
 class PluginsManageResult(Result):
     """``list`` → ``plugins`` + counts; ``toggle`` → ``ok``/``unchanged``/``restart_required``/``name``
     (the canonical key written)/``plugin``; ``install`` → ``hermes_cli.plugins_cmd.dashboard_install_plugin``'s
@@ -734,6 +753,8 @@ class PluginsManageResult(Result):
     missing_env: list[str] | None = None
     # ``install`` → the manifest's ``python_dependencies`` the installer applied (``[]`` when none).
     python_dependencies: list[str] | None = None
+    # ``install`` from the catalog → the entry's informational ``known_issues`` (``[]`` when none).
+    known_issues: list[str] | None = None
     after_install_path: str | None = None
     enabled: bool | None = None
     sha: str | None = None
@@ -742,6 +763,8 @@ class PluginsManageResult(Result):
     delta_lines: list[str] | None = None
     error: str | None = None
     written: list[str] | None = None
+    # ``onboarding`` → the curated catalog plugins for the onboarding card.
+    onboarding: list[OnboardingCatalogPlugin] | None = None
 
 
 method("plugins.manage", params=PluginsManageParams, result=PluginsManageResult,
