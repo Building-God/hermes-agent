@@ -168,6 +168,11 @@ class DispatchResult:
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
+    deferred_file_locked: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, "locked by <holder task id>")`` deferred because the card's
+    declared ``holds:`` paths intersect a RUNNING card's declared holds. The
+    card stays in its lane and spawns on a later tick once the holder leaves
+    ``running`` — collision avoidance, not a failure."""
     memory_pressure: Optional[str] = None
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
@@ -195,6 +200,8 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
             counts["rate_limited"] = counts.get("rate_limited", 0) + len(res.rate_limited)
         if res.skipped_locked:
             counts["skipped_locked"] = counts.get("skipped_locked", 0) + 1
+        if res.deferred_file_locked:
+            counts["file_locked"] = counts.get("file_locked", 0) + len(res.deferred_file_locked)
         if res.memory_pressure:
             pressure = res.memory_pressure
     parts = [f"{k}={v}" for k, v in sorted(counts.items())]
@@ -2140,6 +2147,73 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+# ---------------------------------------------------------------------------
+# Per-card file ownership (declared ``holds:`` paths)
+# ---------------------------------------------------------------------------
+
+# A card declares the paths it will edit as one or more lines of the form
+# ``holds: <path>`` in its body. Matching lines are found anywhere in the body
+# so the declaration can sit in a "File ownership" section; the value is the
+# remainder of the same line. Everything else about the card is unchanged, and
+# a card with no ``holds:`` lines is untouched by the guard (legacy cards).
+_HOLDS_LINE_RE = re.compile(r"(?m)^\s*holds:\s*(.+?)\s*$")
+
+
+def parse_holds_paths(body: Optional[str]) -> list[str]:
+    """Held paths declared in a card body, normalized for comparison.
+
+    Each ``holds: <path>`` line's value goes through ``os.path.normpath`` then
+    ``os.path.normcase`` — the same normalization family the dispatcher uses
+    for path comparisons — so ``A/b.py``, ``A\\b.py`` and ``a/B.py`` are one
+    hold. Relative paths (repo-relative declarations) compare as-is once
+    normalized; the contract compares declared strings, not filesystem
+    existence. Returns ``[]`` for bodies with no declarations.
+    """
+    paths: list[str] = []
+    for match in _HOLDS_LINE_RE.finditer(body or ""):
+        raw = (match.group(1) or "").strip().strip('"\ufeff').strip("'").strip()
+        if not raw:
+            continue
+        paths.append(os.path.normcase(os.path.normpath(raw)))
+    return paths
+
+
+def _running_holds_map(
+    conn: sqlite3.Connection, *, exclude_task_id: Optional[str] = None,
+) -> dict[str, str]:
+    """``normalized held path -> holding RUNNING task id``.
+
+    One row read per tick; a hold is attributed to its (single) owning running
+    card so the defer record can name it (``locked by <task id>``). Later
+    holders writing the same path would overwrite — the running set is
+    normally disjoint because this very guard keeps colliding cards out.
+    """
+    holds_map: dict[str, str] = {}
+    rows = conn.execute(
+        "SELECT id, body FROM tasks WHERE status = 'running'"
+    ).fetchall()
+    for row in rows:
+        tid = row["id"]
+        if tid == exclude_task_id:
+            continue
+        for held in parse_holds_paths(_kb._lossy_text(row["body"])):
+            holds_map[held] = tid
+    return holds_map
+
+
+def _first_conflicting_hold(
+    candidate_holds: list[str], holds_map: Mapping[str, str],
+) -> tuple[Optional[str], Optional[str]]:
+    """``(conflicting path, holder task id)`` for the first intersection, else
+    ``(None, None)``. Iteration order follows the candidate's declaration
+    order so the record names the card's own first conflict."""
+    for held in candidate_holds:
+        holder = holds_map.get(held)
+        if holder is not None:
+            return held, holder
+    return None, None
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -2212,6 +2286,36 @@ def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -
         return spawn_fn(task, workspace)
 
 
+def _record_file_lock_defer_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    holder_id: str,
+    conflict_path: Optional[str],
+    candidate_holds: list[str],
+) -> None:
+    """One ``deferred_file_locked`` event per collision, so ``kanban show`` /
+    the dash can surface ``locked by <card>`` on the deferred card.
+
+    Deduped like ``skipped_nonspawnable``: a held card re-defers every tick
+    and one row per tick would flood the card's event log. The event repeats
+    only when the collision itself changes (different holder or path).
+    """
+    payload = {
+        "holder": holder_id,
+        "locked_by": f"locked by {holder_id}",
+        "path": conflict_path,
+        "holds": candidate_holds,
+    }
+    with _kb.write_txn(conn):
+        last = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1", (task_id,)).fetchone()
+        if (last is not None and last["kind"] == "deferred_file_locked"
+                and last["payload"] == _kb._json_or_null(payload)):
+            return
+        _kb._append_event(conn, task_id, "deferred_file_locked", payload)
+
+
 def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2226,6 +2330,8 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    running_holds: Mapping[str, str],
+    tick_holds: dict[str, str],
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2260,6 +2366,23 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
+    # Per-card file ownership (``holds:`` declarations): two cards editing the
+    # same file must not run at once — the later one defers (never a failure),
+    # so colliding workers stop clobbering each other's edits. The guard is
+    # inert for cards without ``holds:`` lines.
+    candidate_holds = parse_holds_paths(_kb._lossy_text(row["body"]))
+    if candidate_holds:
+        conflict_path, holder_id = _first_conflicting_hold(
+            candidate_holds, {**running_holds, **tick_holds},
+        )
+        if holder_id is not None:
+            note = f"locked by {holder_id}"
+            result.deferred_file_locked.append((task_id, note))
+            if not dry_run:
+                _record_file_lock_defer_event(
+                    conn, task_id, holder_id, conflict_path, candidate_holds,
+                )
+            return False
     guard_reason = check_respawn_guard(conn, task_id, lane=lane, assignee=assignee)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
@@ -2284,6 +2407,10 @@ def _dispatch_lane_task(
     if dry_run:
         result.spawned.append((task_id, assignee, ""))
         _count_spawn(assignee)
+        # Model the grant a real spawn would make, so a dry-run tick reports
+        # same-tick collisions exactly like a live one.
+        for held in candidate_holds:
+            tick_holds.setdefault(held, task_id)
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
@@ -2324,6 +2451,10 @@ def _dispatch_lane_task(
         # only on successful completion (complete_task).
         result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
         _count_spawn(claimed.assignee)
+        # This card now owns its declared paths for the rest of the tick, so a
+        # later same-file row in the SAME tick defers against it too.
+        for held in candidate_holds:
+            tick_holds.setdefault(held, claimed.id)
         return True
     except Exception as exc:
         from tools.process_registry import RestartSafeScopeUnavailable
@@ -2460,9 +2591,13 @@ def _tick_spawn_budget(
 
 
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
-    """Unclaimed rows of one lane in dispatch order."""
+    """Unclaimed rows of one lane in dispatch order.
+
+    ``body`` rides along for the per-card file-ownership guard (declared
+    ``holds:`` paths); it is not used for anything else here.
+    """
     return conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, body FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -2573,6 +2708,17 @@ def _dispatch_once_locked(
             "GROUP BY assignee"
         ):
             per_profile_running[prow["assignee"]] = int(prow["n"])
+    # Per-card file ownership: holds of every RUNNING card (one read), plus
+    # holds granted to cards spawned earlier in THIS tick (mutated by
+    # ``_dispatch_lane_task``) - a second same-file card in the same tick must
+    # defer too. The map is resolved only when some lane row actually declares
+    # ``holds:`` paths: a legacy-only board pays nothing and the guard stays
+    # inert for it.
+    if any(parse_holds_paths(_kb._lossy_text(r["body"])) for r in (*ready_rows, *review_rows)):
+        running_holds: Mapping[str, str] = _running_holds_map(conn)
+    else:
+        running_holds = {}
+    tick_holds: dict[str, str] = {}
     # Review-lane reservation: the ready loop runs first and would otherwise
     # consume the ENTIRE shared budget, starving reviews under a sustained ready
     # backlog. When spawnable review work exists and there is any budget, hold
@@ -2587,6 +2733,7 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        running_holds=running_holds, tick_holds=tick_holds,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
