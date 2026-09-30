@@ -52,7 +52,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         logger.warning("kanban dispatcher: invalid dispatch_interval_seconds=%r, using default 60",
                        kanban_cfg.get("dispatch_interval_seconds"))
         interval = 60.0
-    interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
+    interval = max(interval, 1.0)  # sanity floor - tighter than this is a footgun
 
     max_spawn = kanban_cfg.get("max_spawn")
     if max_spawn is not None:
@@ -95,7 +95,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
     # Fallback profile for tasks created without an assignee (e.g. via the
     # dashboard). Empty (the schema default) keeps skipping them.
     # When set, the dispatcher applies it to unassigned ready tasks instead of skipping them indefinitely
-    # (#27145). Empty string (the schema default) means "no fallback, keep skipping" — backward-compatible
+    # (#27145). Empty string (the schema default) means "no fallback, keep skipping" - backward-compatible
     # with existing installs.
     default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or None
     if default_assignee:
@@ -214,7 +214,7 @@ class _KanbanDispatcher:
         """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?
 
         Control-plane lanes (e.g. ``orion-cc``) are pulled by terminals via
-        ``claim_task`` and never spawnable — a queue full of those is
+        ``claim_task`` and never spawnable - a queue full of those is
         "correctly idle", not "stuck". The review column is probed only when
         review dispatch is on (same gate as the dispatcher): a task waiting
         for a human reviewer is idle, not stuck.
@@ -226,6 +226,28 @@ class _KanbanDispatcher:
             try:
                 conn = _kbc().connect(board=slug)
                 if kbd.has_spawnable_ready(conn) or (_review_probe and kbd.has_spawnable_review(conn)):
+                    return True
+            except Exception:
+                continue
+            finally:
+                if conn is not None:
+                    with contextlib.suppress(Exception):
+                        conn.close()
+        return False
+
+    def ready_backlog_nonempty(self) -> bool:
+        """Is there ANY ready+unclaimed task on a board, spawnable or not?
+
+        The zero-dispatchable alert uses this together with :meth:`ready_nonempty`:
+        when a ready backlog exists but nothing in it is spawnable, the queue is
+        silently drifting (e.g. bogus assignees) and must be surfaced.
+        """
+        kbd = _kbd()
+        for slug in self._board_slugs():
+            conn = None
+            try:
+                conn = _kbc().connect(board=slug)
+                if kbd.has_ready_backlog(conn):
                     return True
             except Exception:
                 continue
