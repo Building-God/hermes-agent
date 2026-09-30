@@ -235,6 +235,28 @@ class _KanbanDispatcher:
                         conn.close()
         return False
 
+    def ready_backlog_nonempty(self) -> bool:
+        """Is there ANY ready+unclaimed task on a board, spawnable or not?
+
+        The zero-dispatchable alert uses this together with :meth:`ready_nonempty`:
+        when a ready backlog exists but nothing in it is spawnable, the queue is
+        silently drifting (e.g. bogus assignees) and must be surfaced.
+        """
+        kbd = _kbd()
+        for slug in self._board_slugs():
+            conn = None
+            try:
+                conn = _kbc().connect(board=slug)
+                if kbd.has_ready_backlog(conn):
+                    return True
+            except Exception:
+                continue
+            finally:
+                if conn is not None:
+                    with contextlib.suppress(Exception):
+                        conn.close()
+        return False
+
     def auto_decompose_tick(self, auto_decompose_per_tick: int) -> int:
         """Auto-decompose up to N triage tasks across all boards into ready workgraphs.
 

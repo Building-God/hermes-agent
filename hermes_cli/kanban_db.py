@@ -1199,6 +1199,44 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _reject_unknown_assignee(assignee: str) -> None:
+    """Fail-closed: refuse a card assigned to a name that is not a real,
+    installed Hermes profile AND lies outside the dispatcher's claim allowlist.
+
+    A bogus assignee (e.g. ``staging-draft``) would otherwise sit in ``ready``
+    forever: the dispatcher buckets it ``skipped_nonspawnable`` and health
+    telemetry treats it as a deliberately-idle control-plane lane, so the
+    mistake is silent. Rejecting here makes the mistake loud at the single
+    creation choke point.
+
+    Uses the dispatcher's own sources of truth - :func:`hermes_cli.profiles.profile_exists`
+    (is this a real profile?) and ``kanban.dispatch_profiles`` via the
+    dispatcher's allowlist reader - no second source of truth. A real profile
+    is always accepted (even one this home would not auto-claim, like a
+    foreign-home ``maestro``); the rejection fires only when the name is not a
+    profile at all AND the home has declared a claim allowlist (so the name can
+    never be dispatched). With no allowlist configured the check fails open.
+    """
+    try:
+        from hermes_cli.kanban_db_dispatch import _dispatch_profile_allowlist
+        from hermes_cli.profiles import normalize_profile_name, profile_exists
+    except Exception:
+        return  # can't introspect; preserve legacy behavior
+    try:
+        if profile_exists(assignee):
+            return  # a real profile - accept, even if not in this home's allowlist
+        allowlist = _dispatch_profile_allowlist(normalize_profile_name)
+    except Exception:
+        return
+    if allowlist is None:
+        return  # no claim allowlist configured - can't judge, fail open
+    raise ValueError(
+        f"assignee {assignee!r} is not an installed Hermes profile and is not "
+        f"in kanban.dispatch_profiles; it would never be dispatched. Leave "
+        f"assignee empty to use kanban.default_assignee, or correct the name."
+    )
+
+
 def _resolve_project_link(
     conn: sqlite3.Connection, project_id: Optional[str], project_source_task_id: Optional[str],
     workspace_kind: str, workspace_path: Optional[str],
@@ -1388,6 +1426,8 @@ def create_task(
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
+    if assignee:
+        _reject_unknown_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -1894,6 +1934,42 @@ def task_graph_context(conn: sqlite3.Connection, task_id: str) -> dict:
 
 # --- Comments & events ---
 
+# A worker's own comment that literally says it is closing the card as
+# superseded must actually close it: workers routinely write "Closing this
+# card as superseded" and forget to call ``complete_task``, leaving the card
+# ``ready`` so the dispatcher retries it forever. Match on "clos(e|ing) ...
+# as superseded" and only from the card's assignee.
+_SUPERSEDED_CLOSE_RE = re.compile(
+    r"\bclos(?:e|ing)\b[^\n]{0,80}\bas superseded\b", re.IGNORECASE,
+)
+
+
+def _maybe_auto_close_superseded(conn: sqlite3.Connection, task_id: str, author: str) -> None:
+    """Best-effort: close a card whose assignee just commented it superseded.
+
+    Never raises - a failed auto-close must not break the comment write. The
+    card is only closed when it is still open and the comment author is the
+    card's assignee (the worker closing its own superseded work).
+    """
+    try:
+        row = conn.execute(
+            "SELECT assignee, status FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None or row["status"] not in {"ready", "blocked", "review", "running"}:
+            return
+        if not author or not row["assignee"] or author.strip().lower() != row["assignee"].lower():
+            return
+        latest = conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if latest is None or not _SUPERSEDED_CLOSE_RE.search(latest["body"] or ""):
+            return
+        complete_task(conn, task_id, result="superseded", force=True)
+    except Exception:
+        _log.debug("kanban: auto-close-superseded failed for %s", task_id, exc_info=True)
+
+
 def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) -> int:
     if not body or not body.strip():
         raise ValueError("comment body is required")
@@ -1909,7 +1985,11 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) 
             "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
         )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
-        return int(cur.lastrowid or 0)
+        comment_id = int(cur.lastrowid or 0)
+    # Post-commit: ``complete_task`` has post-commit side effects and must not
+    # run under the open outer transaction.
+    _maybe_auto_close_superseded(conn, task_id, author)
+    return comment_id
 
 
 def _require_task(conn: sqlite3.Connection, task_id: str) -> None:
@@ -4417,7 +4497,7 @@ def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
     s = s.strip()
     if len(s) <= limit:
         return s
-    return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
+    return s[:limit] + f"... [truncated, {len(s) - limit} chars omitted]"
 
 
 def _ctx_stamp(ts: int, now: int) -> str:
