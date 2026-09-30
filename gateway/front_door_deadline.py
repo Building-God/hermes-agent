@@ -71,22 +71,37 @@ def journal_path(hermes_home: Any) -> Path:
     return Path(hermes_home) / JOURNAL_FILENAME
 
 
-def idempotency_key(platform: str, conversation_id: str, request_ts: float) -> str:
+def idempotency_key(
+    platform: str, conversation_id: str, request_ts: float, message: str = "",
+) -> str:
     """Stable key for one inbound request: same conversation + same second.
 
     Used so a gateway restart that re-delivers the same inbound message (or a
     replayed session resume) can detect that the request was already journaled and
     acknowledged, instead of answering it twice or silently dropping it.
+
+    ``request_ts`` is the original inbound timestamp when one was persisted. When
+    it was NOT persisted (``0``/``None``), the key must still be stable across a
+    restart of the same message, so it falls back to a content hash of ``message``
+    rather than the wall clock (which would re-key on every resume and never
+    dedupe). Tradeoff: two *identical* messages that both lacked a timestamp would
+    collide - but that is far rarer and safer than never deduping a resumed turn.
     """
-    return f"{platform}:{conversation_id}:{int(request_ts)}"
+    if request_ts:
+        discriminator = str(int(request_ts))
+    else:
+        discriminator = "m" + hashlib.sha1((message or "").encode("utf-8")).hexdigest()[:16]
+    return f"{platform}:{conversation_id}:{discriminator}"
 
 
-def tracking_id(platform: str, conversation_id: str, request_ts: float) -> str:
+def tracking_id(
+    platform: str, conversation_id: str, request_ts: float, message: str = "",
+) -> str:
     """Short stable tracking id for a request (human-readable, unique per request)."""
-    digest = hashlib.sha1(
-        f"{platform}:{conversation_id}:{int(request_ts)}".encode("utf-8")
-    ).hexdigest()[:8]
-    return f"fd-{int(request_ts)}-{digest}"
+    key = idempotency_key(platform, conversation_id, request_ts, message)
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:8]
+    ts_part = str(int(request_ts)) if request_ts else "m"
+    return f"fd-{ts_part}-{digest}"
 
 
 def make_request_entry(
@@ -103,9 +118,9 @@ def make_request_entry(
 ) -> Dict[str, Any]:
     """Build the durable journal entry for one request."""
     _ts = request_ts if request_ts else time.time()
-    _key = idempotency_key(platform, conversation_id, _ts)
+    _key = idempotency_key(platform, conversation_id, request_ts, message)
     return {
-        "tracking_id": tracking_id(platform, conversation_id, _ts),
+        "tracking_id": tracking_id(platform, conversation_id, request_ts, message),
         "idempotency_key": _key,
         "platform": platform,
         "conversation_id": str(conversation_id),
