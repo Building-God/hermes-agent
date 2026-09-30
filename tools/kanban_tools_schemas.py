@@ -583,6 +583,38 @@ KANBAN_UNBLOCK_SCHEMA = _schema(
     ["task_id"],
 )
 
+KANBAN_ARCHIVE_SCHEMA = _schema(
+    "kanban_archive",
+    (
+        "Archive a Kanban card with a one-line reason (board hygiene: "
+        "\"duplicate of X\", \"stale\", \"covered by Y\"). This is a close, "
+        "not a delete - the card and its full audit trail are preserved with "
+        "the reason recorded on the archived event. Orchestrator-only: "
+        "dispatcher-spawned task workers never see this tool."
+    ),
+    {
+        "task_id": _prop("string", "Card id to archive."),
+        "reason": _prop("string", "One-line reason the card is being archived."),
+    },
+    ["task_id"],
+)
+
+KANBAN_REASSIGN_SCHEMA = _schema(
+    "kanban_reassign",
+    (
+        "Reassign a mis-filed Kanban card to a real profile (empty/None "
+        "unassigns). A running card is refused unless reclaim_first is true. "
+        "Orchestrator-only: dispatcher-spawned task workers never see this "
+        "tool."
+    ),
+    {
+        "task_id": _prop("string", "Card id to reassign."),
+        "profile": _prop("string", "Profile name to assign the card to."),
+        "reclaim_first": _prop("boolean", "Release a stale running claim first (default false)."),
+    },
+    ["task_id"],
+)
+
 KANBAN_LINK_SCHEMA = _schema(
     "kanban_link",
     (
