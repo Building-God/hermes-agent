@@ -35,6 +35,11 @@ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
 _GC_INTERVAL_SECONDS = 3600.0
 _HEALTH_WINDOW = 6
+# How often to re-post the one-line "dispatcher stuck" alarm to Harry's Home
+# channel while the ready queue stays non-empty with zero spawns. The gateway
+# log warns every 300s; the Home-channel alarm is deliberately slower (never
+# silent, but not a spam loop). Mirrors proactive-loop's ALARM_COOLDOWN_SECONDS.
+_STUCK_ALARM_COOLDOWN_SECONDS = 1800  # 30 min
 
 
 class GatewayKanbanWatchersMixin:
@@ -272,6 +277,7 @@ class GatewayKanbanWatchersMixin:
         # broken PATH, missing venv, or credential loss.
         bad_ticks = 0
         last_warn_at = 0
+        last_alarm_at = 0
         zero_dispatchable_ticks = 0
         last_zero_warn_at = 0
         results: Optional[list] = None
@@ -316,16 +322,22 @@ class GatewayKanbanWatchersMixin:
                         ready_backlog = await _to_thread_process_service(dispatcher.ready_backlog_nonempty)
                         zero_dispatchable_ticks = zero_dispatchable_ticks + 1 if ready_backlog else 0
                 now = int(time.time())
-                if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
+                if bad_ticks >= _HEALTH_WINDOW:
                     held = _kbd.describe_suppression(res for _slug, res in (results or []))
-                    logger.warning(
-                        "kanban dispatcher stuck: ready queue non-empty for "
-                        "%d consecutive ticks but 0 workers spawned.%s Check "
-                        "profile health (venv, PATH, credentials) and "
-                        "`hermes kanban list --status ready`.",
-                        bad_ticks, f" Last tick held back: {held}." if held else "",
-                    )
-                    last_warn_at = now
+                    if now - last_warn_at >= 300:
+                        logger.warning(
+                            "kanban dispatcher stuck: ready queue non-empty for "
+                            "%d consecutive ticks but 0 workers spawned.%s Check "
+                            "profile health (venv, PATH, credentials) and "
+                            "`hermes kanban list --status ready`.",
+                            bad_ticks, f" Last tick held back: {held}." if held else "",
+                        )
+                        last_warn_at = now
+                    # Never silent: surface the same condition to Harry's Home
+                    # channel on a slower cadence than the gateway log.
+                    if now - last_alarm_at >= _STUCK_ALARM_COOLDOWN_SECONDS:
+                        await self._alarm_dispatcher_stuck(bad_ticks, held)
+                        last_alarm_at = now
                 if zero_dispatchable_ticks >= _HEALTH_WINDOW and now - last_zero_warn_at >= 300:
                     logger.warning(
                         "kanban dispatcher: zero dispatchable work - a ready "
@@ -346,6 +358,52 @@ class GatewayKanbanWatchersMixin:
             await self._sleep_between_ticks(interval)
 
         self._release_kanban_dispatcher_lock()
+
+    async def _alarm_dispatcher_stuck(self, bad_ticks: int, held: Optional[str]) -> None:
+        """Post a one-line ``dispatcher stuck`` alarm to Harry's Home channel.
+
+        Mirrors the proactive loop's nothing-runnable alarm: silence is the
+        failure mode, so when the ready queue is non-empty but nothing has
+        spawned for ``bad_ticks`` consecutive ticks the operator is told - not
+        just logged. Cooldown is the caller's job (``_STUCK_ALARM_COOLDOWN_SECONDS``);
+        this method only delivers. Best-effort: a missing adapter or a failed
+        send is debug-logged, never raised, so a broken notification path can
+        never take down the dispatcher tick itself.
+        """
+        line = (
+            "[kanban dispatcher] ALARM: ready queue non-empty for "
+            f"{bad_ticks} consecutive ticks but 0 workers spawned"
+            f"{f' (held back: {held})' if held else ''}. "
+            "Check `hermes kanban list --status ready`."
+        )
+        config = getattr(self, "config", None)
+        if config is None:
+            return
+        for platform, adapter in list((getattr(self, "adapters", None) or {}).items()):
+            try:
+                home = config.get_home_channel(platform)
+            except Exception:
+                home = None
+            if not home or not home.chat_id:
+                continue
+            try:
+                result = await adapter.send(str(home.chat_id), line)
+            except Exception as exc:
+                logger.debug(
+                    "dispatcher stuck alarm send failed on %s: %s",
+                    getattr(platform, "value", platform), exc,
+                )
+                continue
+            if result is not None and getattr(result, "success", True) is False:
+                logger.debug(
+                    "dispatcher stuck alarm rejected on %s",
+                    getattr(platform, "value", platform),
+                )
+                continue
+            logger.info(
+                "dispatcher stuck alarm sent to %s home channel",
+                getattr(platform, "value", platform),
+            )
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

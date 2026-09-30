@@ -144,3 +144,50 @@ def test_tick_spawn_budget_marks_capacity_hold(monkeypatch):
     monkeypatch.setattr(kbd, "count_running_tasks", lambda conn: 0)
     kbd._tick_spawn_budget(sqlite3.connect(":memory:"), free, max_spawn=None, max_in_progress=1, board="b")
     assert free.capacity_held is False and not kbd.held_by_capacity([free, None])
+
+
+def test_dispatcher_stuck_alarm_posts_one_line_to_home_channel(monkeypatch):
+    """A stuck dispatcher posts a one-line alarm to Harry's Home channel, not just a log line."""
+    import asyncio
+
+    import gateway.kanban_watchers as kw
+
+    class _Home:
+        chat_id = "1381875949330628681"
+
+    class _Config:
+        def get_home_channel(self, platform):
+            return _Home()
+
+    class _Adapter:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, chat_id, text, **kw):
+            self.sent.append((chat_id, text))
+            return type("R", (), {"success": True})()
+
+    adapter = _Adapter()
+    runner = object.__new__(kw.GatewayKanbanWatchersMixin)
+    runner.config = _Config()
+    runner.adapters = {"discord": adapter}
+
+    asyncio.run(runner._alarm_dispatcher_stuck(22, "active_pr=1"))
+
+    assert adapter.sent, "stuck alarm was never sent"
+    chat_id, text = adapter.sent[0]
+    assert chat_id == "1381875949330628681"
+    assert "ALARM" in text
+    assert "22 consecutive ticks" in text
+    assert "active_pr=1" in text
+
+
+def test_dispatcher_stuck_alarm_is_silent_without_home_channel(monkeypatch):
+    """No home channel configured (or no adapters) means the alarm is a no-op, not a crash."""
+    import asyncio
+
+    import gateway.kanban_watchers as kw
+
+    runner = object.__new__(kw.GatewayKanbanWatchersMixin)
+    # No .config / .adapters at all - the method must return without raising.
+    asyncio.run(runner._alarm_dispatcher_stuck(22, "active_pr=1"))
