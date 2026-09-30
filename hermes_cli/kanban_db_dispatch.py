@@ -158,6 +158,14 @@ class DispatchResult:
     """Unassigned task ids that had ``kanban.default_assignee`` applied this
     tick before spawning, so telemetry/CLI/dashboard can show the dispatcher
     acting on the fallback rule rather than explicit assignments."""
+    recovered_stranded: list[str] = field(default_factory=list)
+    """Ready/review task ids whose assignee named no real profile (a bogus
+    assignee like ``staging-draft``) and were reassigned to a working profile
+    this tick. Surfaces stranded-card recovery to telemetry/CLI/dashboard."""
+    auto_blocked_stranded: list[str] = field(default_factory=list)
+    """Ready/review task ids whose assignee named no real profile and could
+    not be reassigned (no usable fallback profile) - blocked with a reason
+    instead of idling silently as a phantom control-plane lane."""
     skipped_nonspawnable: list[str] = field(default_factory=list)
     """Ready task ids whose assignee names a control-plane lane (e.g. a Claude
     Code terminal like ``orion-cc``), not a Hermes profile. Expected steady-state
@@ -2236,6 +2244,19 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     return _has_spawnable(conn, "ready")
 
 
+def has_ready_backlog(conn: sqlite3.Connection) -> bool:
+    """True iff ANY ready+unclaimed task exists, spawnable or not.
+
+    Distinguishes "backlog exists, zero dispatchable" (this returns True while
+    :func:`has_spawnable_ready` returns False) from "correctly idle" (no ready
+    work at all). Feeds the zero-dispatchable health alert so a queue full of
+    bogus-assignee cards is never silently ignored.
+    """
+    return conn.execute(
+        "SELECT 1 FROM tasks WHERE status = 'ready' AND claim_lock IS NULL LIMIT 1",
+    ).fetchone() is not None
+
+
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     """:func:`has_spawnable_ready` for the review column."""
     return _has_spawnable(conn, "review")
@@ -2591,33 +2612,73 @@ def _dispatch_lane_task(
 
 def _apply_default_assignee(
     conn: sqlite3.Connection, task_id: str, assignee: str, *, dry_run: bool,
+    from_assignee: Optional[str] = None,
 ) -> bool:
-    """Persist ``kanban.default_assignee`` on an unassigned ready row.
+    """Persist ``assignee`` on an unassigned ready row (``from_assignee=None``)
+    or reassign a stranded non-empty bogus assignee (``from_assignee`` set).
 
     Mutating the row keeps board state honest: the task is legitimately owned
-    by the default, not "unassigned but secretly routed". ``dry_run`` reports
-    without writing. Returns False when the write failed.
+    by the target, not "unassigned but secretly routed" or "stuck on a name no
+    profile matches". ``dry_run`` reports without writing. Returns False when
+    the write failed.
     """
     if dry_run:
         return True
     try:
         with _kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET assignee = ? WHERE id = ? "
-                "AND (assignee IS NULL OR assignee = '')",
-                (assignee, task_id),
-            )
-            _kb._append_event(
-                conn, task_id, "assigned",
-                {"assignee": assignee, "source": "kanban.default_assignee"},
-            )
+            if from_assignee is None:
+                conn.execute(
+                    "UPDATE tasks SET assignee = ? WHERE id = ? "
+                    "AND (assignee IS NULL OR assignee = '')",
+                    (assignee, task_id),
+                )
+                event: dict[str, Any] = {"assignee": assignee, "source": "kanban.default_assignee"}
+            else:
+                conn.execute(
+                    "UPDATE tasks SET assignee = ? WHERE id = ? AND assignee = ?",
+                    (assignee, task_id, from_assignee),
+                )
+                event = {
+                    "assignee": assignee, "from": from_assignee,
+                    "source": "kanban.recover_stranded",
+                }
+            _kb._append_event(conn, task_id, "assigned", event)
     except Exception:
         _kb._log.debug(
-            "kanban dispatch: failed to apply default_assignee=%r to task %s",
+            "kanban dispatch: failed to apply assignee=%r to task %s",
             assignee, task_id, exc_info=True,
         )
         return False
     return True
+
+
+def _assignee_is_real_profile(name: str) -> bool:
+    """True iff ``name`` is a real installed Hermes profile, UNGATED by the
+    per-home ``kanban.dispatch_profiles`` claim allowlist.
+
+    A foreign-home profile (e.g. ``sage``) is real even when this home's
+    dispatcher would not claim it - only a name that matches no profile at all
+    (``staging-draft``) is a bogus assignee eligible for stranded recovery.
+    Can't-introspect falls back to True so an unreadable profiles module never
+    triggers a destructive reassign.
+    """
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        return True
+    try:
+        return bool(profile_exists(name))
+    except Exception:
+        return True
+
+
+def _review_recovery_target(default_assignee: Optional[str]) -> Optional[str]:
+    """Profile to recover a stranded review-lane card onto: ``reviewer`` when
+    it is a real profile (review work belongs to the reviewer), else the
+    default assignee."""
+    if _assignee_is_real_profile("reviewer"):
+        return "reviewer"
+    return default_assignee
 
 
 def _run_reclaim_phase(
@@ -2853,6 +2914,23 @@ def _dispatch_once_locked(
                 continue
             row_assignee = default_assignee
             result.auto_assigned_default.append(row["id"])
+        elif not _assignee_is_real_profile(row_assignee):
+            # Stranded: the assignee names no real profile (e.g. a bogus
+            # ``staging-draft``). Reassign to the default (best-effort) or
+            # block so it surfaces instead of idling silently.
+            if default_assignee and _apply_default_assignee(
+                conn, row["id"], default_assignee, dry_run=dry_run,
+                from_assignee=row_assignee,
+            ):
+                result.recovered_stranded.append(row["id"])
+                row_assignee = default_assignee
+            else:
+                if not dry_run:
+                    _kb.block_task(conn, row["id"], reason=(
+                        f"assignee {row_assignee!r} is not an installed profile"
+                    ))
+                result.auto_blocked_stranded.append(row["id"])
+                continue
         if _dispatch_lane_task(conn, row, row_assignee, result, lane="ready", **lane_kwargs):
             spawned += 1
 
@@ -2863,10 +2941,25 @@ def _dispatch_once_locked(
     for row in review_rows:
         if spawn_budget is not None and spawned >= spawn_budget:
             break
-        if not row["assignee"]:
+        row_assignee = row["assignee"]
+        if not row_assignee:
             result.skipped_unassigned.append(row["id"])
             continue
-        if _dispatch_lane_task(conn, row, row["assignee"], result, lane="review", **lane_kwargs):
+        if not _assignee_is_real_profile(row_assignee):
+            target = _review_recovery_target(default_assignee)
+            if target and _apply_default_assignee(
+                conn, row["id"], target, dry_run=dry_run, from_assignee=row_assignee,
+            ):
+                result.recovered_stranded.append(row["id"])
+                row_assignee = target
+            else:
+                if not dry_run:
+                    _kb.block_task(conn, row["id"], reason=(
+                        f"assignee {row_assignee!r} is not an installed profile"
+                    ))
+                result.auto_blocked_stranded.append(row["id"])
+                continue
+        if _dispatch_lane_task(conn, row, row_assignee, result, lane="review", **lane_kwargs):
             spawned += 1
     return result
 

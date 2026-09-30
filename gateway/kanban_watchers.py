@@ -272,6 +272,8 @@ class GatewayKanbanWatchersMixin:
         # broken PATH, missing venv, or credential loss.
         bad_ticks = 0
         last_warn_at = 0
+        zero_dispatchable_ticks = 0
+        last_zero_warn_at = 0
         results: Optional[list] = None
         dispatcher = _KanbanDispatcher(_kb, settings)
 
@@ -292,6 +294,7 @@ class GatewayKanbanWatchersMixin:
                 # dispatch while paused; running workers finish naturally.
                 if not _kanban_dispatch_allowed():
                     bad_ticks = 0
+                    zero_dispatchable_ticks = 0
                 else:
                     # Re-read the auto-decompose toggle live so disabling it
                     # takes effect on the next tick, not on restart.
@@ -304,6 +307,14 @@ class GatewayKanbanWatchersMixin:
                     ready_pending = await _to_thread_process_service(dispatcher.ready_nonempty)
                     busy = _kbd.held_by_capacity(res for _slug, res in (results or []))
                     bad_ticks = bad_ticks + 1 if ready_pending and not any_spawned and not busy else 0
+                    # Zero-dispatchable: a ready backlog exists but nothing in
+                    # it is spawnable (e.g. bogus assignees). The queue is
+                    # drifting silently - surface it instead of suppressing.
+                    if ready_pending:
+                        zero_dispatchable_ticks = 0
+                    else:
+                        ready_backlog = await _to_thread_process_service(dispatcher.ready_backlog_nonempty)
+                        zero_dispatchable_ticks = zero_dispatchable_ticks + 1 if ready_backlog else 0
                 now = int(time.time())
                 if bad_ticks >= _HEALTH_WINDOW and now - last_warn_at >= 300:
                     held = _kbd.describe_suppression(res for _slug, res in (results or []))
@@ -315,6 +326,16 @@ class GatewayKanbanWatchersMixin:
                         bad_ticks, f" Last tick held back: {held}." if held else "",
                     )
                     last_warn_at = now
+                if zero_dispatchable_ticks >= _HEALTH_WINDOW and now - last_zero_warn_at >= 300:
+                    logger.warning(
+                        "kanban dispatcher: zero dispatchable work - a ready "
+                        "backlog exists for %d consecutive ticks but no card "
+                        "maps to an installed profile. A card is probably "
+                        "assigned to a non-existent assignee; run "
+                        "`hermes kanban list --status ready` and reassign.",
+                        zero_dispatchable_ticks,
+                    )
+                    last_zero_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
                 self._release_kanban_dispatcher_lock()
