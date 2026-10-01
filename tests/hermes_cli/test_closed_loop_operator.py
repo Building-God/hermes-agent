@@ -1593,3 +1593,98 @@ def test_audit_intake_and_native_handoff_share_actual_worker_failure_types(board
     assert kb.get_task(board,repair).status=='review'
     assert kb.get_task(board,repair).result is None
     assert kb.get_task(board,tid).status=='blocked' and kb.get_task(board,tid).block_kind=='dependency'
+
+
+def test_native_outcome_rejects_structural_receipts_and_returns_to_implementer(board,monkeypatch):
+    from hermes_cli import kanban_outcomes as outcomes
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    settings.update(cohort_task_ids=[tid],outcome_checks={tid:{'kind':'queue','url':'http://127.0.0.1:7888/api/questions'}})
+    monkeypatch.setattr(outcomes,'check_queue',lambda cfg:{'passed':False,'failures':['Actual duplicate intent remains']})
+    assert not kb.complete_task(board,repair,result='Cycle count zero; all repaired',expected_run_id=review.current_run_id,
+        metadata={'acceptance_receipts':{'native_original_outcome':{'passed':True},'sql':'zero cycles'}})
+    assert kb.get_task(board,repair).status=='ready'
+    assert kb.get_task(board,repair).assignee=='pilot'
+    assert operator._last(board,repair,'completed') is None
+    event=operator._last(board,repair,'operator_outcome_failed')
+    assert event['run_id']==review.current_run_id
+    assert operator._payload(event)['original_task_id']==tid
+    assert 'Actual duplicate intent remains' in operator._payload(operator._last(board,repair,'changes_requested'))['reason']
+
+
+def test_native_outcome_records_current_probe_not_worker_receipt(board,monkeypatch):
+    from hermes_cli import kanban_outcomes as outcomes
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    settings.update(cohort_task_ids=[tid],outcome_checks={tid:{'kind':'queue','url':'http://127.0.0.1:7888/api/questions'}})
+    monkeypatch.setattr(outcomes,'check_queue',lambda cfg:{'passed':True,'observed':'controlled current actual API'})
+    assert kb.complete_task(board,repair,result='Controlled independently reproduced effect',expected_run_id=review.current_run_id,metadata={'acceptance_receipts':['worker structural claims']})
+    native=operator._payload(operator._last(board,repair,'completed'))['acceptance_receipts']['native_original_outcome']
+    assert native['passed'] and native['review_run_id']==review.current_run_id
+    assert native['observed']=='controlled current actual API'
+
+
+def test_audited_original_recovery_accepts_actual_old_hold_new_framework_stop(board,monkeypatch):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    settings['cohort_task_ids']=[tid]
+    assert kb.complete_task(board,repair,result='Controlled independent existing repair',expected_run_id=review.current_run_id,metadata={'acceptance_receipts':{'probe':'controlled fixture'}})
+    hold=operator._last_hold(board,tid)
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'operator_acceptance_invalidated',{'owner':'agent','source_completed_event_id':123})
+        kb._append_event(board,tid,'operator_request_stopped',{'owner':'agent','due_at':1})
+        board.execute("UPDATE tasks SET status='blocked',block_kind='capability',result=NULL,claim_lock=NULL,current_run_id=NULL WHERE id=?",(tid,))
+    stop=operator._last(board,tid,'operator_request_stopped')
+    settings['agent_owned_faults']={tid:{'completed_event_id':123,'blocked_event_id':hold['id'],'deadline_stop_event_id':stop['id'],'retry_acceptance':True,'source':'actual retained old hold and new stop','reason':'controlled real schema'}}
+    due=operator._payload(operator._last(board,tid,'operator_deadline'))['due_at']
+    monkeypatch.setattr(kb.time,'time',lambda:due+1)
+    operator.reconcile(board,settings=settings,now=due+1)
+    assert operator._last(board,tid,'operator_audited_acceptance_recovery') is not None
+    assert kb.get_task(board,tid).status=='review'
+    assert operator._last_hold(board,tid)['id']==hold['id']
+
+
+@pytest.mark.parametrize('questions,passed',[
+    ([{'id':'a','text':'Instagram login cookies'},{'id':'b','text':'Instagram session access'}],False),
+    ([{'id':'a','text':'Instagram login cookies'}],True),
+    ([{'id':'a','text':'Cycle repair complete. How proceed?'}],False),
+    ([{'id':'a','text':'Test: dash reasoning (repair verification question)'}],False),
+    ([{'id':'a','text':'Please open the dash queue and verify it'}],False),
+    ([{'id':'a','text':'Choose your clip priority','options':['Now','Later']}],True),
+])
+def test_queue_outcome_checks_intent_and_agent_demands_not_card_ids(monkeypatch,questions,passed):
+    from hermes_cli import kanban_outcomes as outcomes
+    monkeypatch.setattr(outcomes,'_local_json',lambda url:{'questions':questions})
+    assert outcomes.check_queue({'url':'http://127.0.0.1:7888/api/questions'})['passed']==passed
+
+
+@pytest.mark.parametrize('runtime,passed',[
+    ({'pid':1,'source_sha256':'current','credential_sha256':'current-token'},True),
+    ({'pid':1,'source_sha256':'old','credential_sha256':'current-token'},False),
+    ({'pid':1,'source_sha256':'current','credential_sha256':'inherited-old-token'},False),
+    ({},False),
+])
+def test_dashboard_acceptance_requires_actual_consumer_identity(monkeypatch,runtime,passed):
+    from hermes_cli import kanban_outcomes as outcomes
+    from types import SimpleNamespace
+    monkeypatch.setattr(outcomes.subprocess,'run',lambda *args,**kwargs:SimpleNamespace(returncode=0,stdout=json.dumps({'passed':True,'actor':'operator-verification'})))
+    monkeypatch.setattr(outcomes,'_local_json',lambda url:{'hermes_client_runtime':runtime})
+    result=outcomes.check_conversation({'python':'python','client_sha256':'current','ui_credential_sha256':'current-token','health_url':'http://127.0.0.1:7888/api/health'},dashboard=True)
+    assert result['passed']==passed
+
+
+def test_declared_outcome_rechecks_legacy_claim_once_without_native_probe_event(board,monkeypatch):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    settings['cohort_task_ids']=[tid]
+    assert kb.complete_task(board,repair,result='Controlled old structural repair',expected_run_id=review.current_run_id,metadata={'acceptance_receipts':{'probe':'controlled old SQL'}})
+    operator.reconcile(board,settings=settings)
+    build=kb.claim_task(board,tid)
+    assert kb.request_review(board,tid,reviewer='reviewer',summary='controlled candidate',expected_run_id=build.current_run_id)
+    review=kb.claim_review_task(board,tid)
+    assert kb.complete_task(board,tid,result='Controlled legacy structural result',expected_run_id=review.current_run_id,metadata={'acceptance_receipts':{'native_original_outcome':{'passed':True}}})
+    old=operator._last(board,tid,'completed')
+    settings['outcome_checks']={tid:{'kind':'queue','url':'http://127.0.0.1:7888/api/questions'}}
+    operator.reconcile(board,settings=settings)
+    invalid=operator._last(board,tid,'operator_acceptance_invalidated')
+    assert invalid and operator._payload(invalid)['source_completed_event_id']==old['id']
+    assert kb.get_task(board,tid).status=='review'
+    count=board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='review_requested'",(tid,)).fetchone()[0]
+    operator.reconcile(board,settings=settings)
+    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='review_requested'",(tid,)).fetchone()[0]==count
