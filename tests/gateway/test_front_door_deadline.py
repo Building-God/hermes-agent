@@ -139,11 +139,12 @@ def test_ack_is_truthful_and_does_not_ask_resend():
         user="Harry", message="why is work stuck?", request_ts=1000.0,
         deadline_seconds=120, ack_ts=1120.0,
     )
+    entry["card_id"] = "t_owned"
     ack = build_bounded_ack(entry)
-    assert entry["tracking_id"] in ack
+    assert entry["card_id"] in ack
     assert "resend" not in ack.lower()
     assert "try again" not in ack.lower()
-    assert "tracked request" in ack  # truthful: names the tracking id, claims no human receipt
+    assert "owns it" in ack  # truthful: names the tracking id, claims no human receipt
 
 
 def test_resume_reference_differs_and_no_resend():
@@ -152,8 +153,9 @@ def test_resume_reference_differs_and_no_resend():
         user="Harry", message="why is work stuck?", request_ts=1000.0,
         deadline_seconds=120, ack_ts=1120.0,
     )
+    entry["card_id"] = "t_owned"
     ref = build_resume_reference(entry)
-    assert entry["tracking_id"] in ref
+    assert entry["card_id"] in ref
     assert "resend" not in ref.lower()
     assert ref != build_bounded_ack(entry)
 
@@ -162,6 +164,8 @@ def test_resume_reference_differs_and_no_resend():
 def _deadline_runner_harness(tmp_path, monkeypatch):
     """Patch gateway.run side effects and return (runner, worker, interrupts)."""
     import gateway.run as gateway_run
+    monkeypatch.setattr("hermes_cli.kanban_operator.dispatch_owner", lambda *a,**k: "pilot")
+    monkeypatch.setattr("gateway.front_door_deadline.settle_foreground_fence", lambda *a,**k: None)
 
     monkeypatch.setattr(gateway_run, "_hermes_home", str(tmp_path))
     interrupts = []
@@ -207,7 +211,7 @@ def test_deadline_result_bounded_ack_journal_interrupt(tmp_path, monkeypatch):
     assert result["front_door_deadline"] is True
     assert result["already_acked"] is False
     assert result["tracking_id"].startswith("fd-")
-    assert "tracked request" in result["final_response"]  # truthful bounded ack
+    assert "owns it" in result["final_response"]  # truthful bounded ack
     assert "resend" not in result["final_response"].lower()
     assert interrupts, "request_hard_interrupt was not called on the still-running agent"
 
@@ -232,7 +236,7 @@ def test_deadline_result_resume_dedupes_persisted_timestamp(tmp_path, monkeypatc
     assert first["already_acked"] is False
     assert second["already_acked"] is True  # resumed turn recognised
     assert second["front_door_deadline"] is True
-    assert "Still on it" in second["final_response"]  # resume reference, not a re-ack
+    assert "Existing task" in second["final_response"]  # resume reference, not a re-ack
     assert second["tracking_id"] == first["tracking_id"]
     assert len(read_journal(str(tmp_path))) == 1  # no duplicate answer
 
@@ -283,7 +287,7 @@ def test_await_turn_worker_fires_deadline_on_slow_provider(tmp_path, monkeypatch
 
     assert result["front_door_deadline"] is True
     assert result["already_acked"] is False
-    assert "tracked request" in result["final_response"]
+    assert "owns it" in result["final_response"]
     assert interrupts, "request_hard_interrupt was not called on the still-running agent"
     assert elapsed < 15.0  # bounded (the poll interval is the coarse upper bound), not minutes
     assert len(read_journal(str(tmp_path))) == 1

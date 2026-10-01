@@ -33,7 +33,7 @@ def _kbn():
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested", "operator_exception", "operator_repair_overdue")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
@@ -58,8 +58,8 @@ def diagnostic_event(ev) -> bool:
 # #22941 fixed for `blocked`. Keeping the subscription alive until the task is archived lets the cursor
 # (advanced atomically by claim_unseen_events_for_sub) handle dedup, and any retry-loop event reaches the
 # user. Per-subscription send-failure counter. Adapter.send raising means the chat is dead (deleted, bot
-# kicked, etc.) — after N consecutive send failures the sub is dropped so we don't spin against a dead chat
-# every 5 seconds forever. A genuinely dead chat still drops, just ~60s later — a fine trade for an
+# kicked, etc.) - after N consecutive send failures the sub is dropped so we don't spin against a dead chat
+# every 5 seconds forever. A genuinely dead chat still drops, just ~60s later - a fine trade for an
 # unattended gate where a false drop means silent work pileup.
 MAX_SEND_FAILURES = 12
 
@@ -73,7 +73,7 @@ def _safe_review_reason(value: Any, limit: int = 160) -> str:
     reason = redact_sensitive_text("" if value is None else str(value), force=True, redact_url_credentials=True)
     reason = " ".join(_LOCAL_PATH_RE.sub("[local path]", reason).split())
     if len(reason) > limit:
-        reason = reason[: limit - 1].rstrip() + "…"
+        reason = reason[: limit - 1].rstrip() + "..."
     return reason
 
 
@@ -110,7 +110,7 @@ _ANCHORLESS_WARNED: set[tuple] = set()
 def _warn_anchorless_thread_sub_once(sub: dict, platform: str) -> None:
     """A thread-shaped subscription without ``parent_chat_id`` cannot match a channel-level
     ``profile_routes`` entry, so the fail-closed route gate skips it on every tick. Say so ONCE per
-    row at WARNING — a subscription that can never deliver was invisible below DEBUG (#110919)."""
+    row at WARNING - a subscription that can never deliver was invisible below DEBUG (#110919)."""
     metadata = sub.get("delivery_metadata") or {}
     thread_like = bool(sub.get("thread_id")) or (sub.get("chat_type") or metadata.get("chat_type")) in {
         "thread", "forum", "forum_post", "forum-post", "topic"}
@@ -160,7 +160,7 @@ def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profi
     profile = owner_profile or getattr(runner, "_kanban_notifier_profile", None)
     primary_profile = getattr(runner, "_primary_profile_name", None) or runner._active_profile_name()
     profile = profile or primary_profile
-    # A profile holding its OWN adapter for this platform is an independent credential boundary —
+    # A profile holding its OWN adapter for this platform is an independent credential boundary -
     # ``_authorization_adapter`` already answered for it, so the primary never stands in. Adapters
     # on OTHER platforms do not gate this one: the primary bot is the only credential serving the
     # pinned chat, for inbound turns and for these notifications alike (#115460).
@@ -198,7 +198,7 @@ def _adapter_for_subscription(runner: Any, platform: Any, sub: dict, owner_profi
                          user_id=user_id or route.user_id):
             return None
     # A stateless (api_server) subscription carries a RAW session id, not a routable chat, so no
-    # profile_routes entry can anchor it — and a platform-wide api_server route would deny the
+    # profile_routes entry can anchor it - and a platform-wide api_server route would deny the
     # default profile's own api_server destinations. The shared listener mirrors /p/<profile>/ for
     # every served profile, so the owner's own session store is the proof: authorize exactly the
     # session that lives in the served profile's state.db, never the platform. The default profile
@@ -287,6 +287,9 @@ class _Collector:
 
     def _claim_for_sub(self, conn: Any, slug: str, sub: dict) -> Optional[dict]:
         """Claim one subscription's unseen events; None when skipped or nothing new."""
+        import time
+        if int(sub.get("retry_after", 0)) > int(time.time()):
+            return None
         owner_profile = sub.get("notifier_profile") or None
         platform = (sub.get("platform") or "").lower()
         if platform not in self.active_platforms:
@@ -413,13 +416,13 @@ def _fmt_completed(ev, n) -> tuple:
     from agent.redact import redact_sensitive_text
     safe_summary = redact_sensitive_text(str(summary), force=True, redact_url_credentials=True).strip()
     receipt = _verified_exact_receipt((ev.payload or {}).get("exact_artifact"))
-    header = f"✔ {n.head} done — {str(n.title)[:300]}"
+    header = f"✔ {n.head} done - {str(n.title)[:300]}"
     # Leave room below Discord's 2,000-character text limit even for a long title.
     available = max(0, 1800 - len(header) - 1)
     include_receipt = bool(receipt and receipt not in safe_summary)
     summary_budget = max(0, available - (len(receipt) + 1 if include_receipt else 0))
     if len(safe_summary) > summary_budget:
-        safe_summary = safe_summary[: max(0, summary_budget - 1)].rstrip() + "…"
+        safe_summary = safe_summary[: max(0, summary_budget - 1)].rstrip() + "..."
     detail = f"{safe_summary}\n{receipt}" if include_receipt and safe_summary else (
         receipt if include_receipt else safe_summary
     )
@@ -440,7 +443,7 @@ def _fmt_review_requested(ev, n) -> tuple:
         summary = str(summary)
         handoff = f"\n{summary[:200]}"
         wake_handoff = _first_line(summary, 200)
-    return f"👀 {n.head} ready for review — {n.title}{handoff}", wake_handoff, None
+    return f"👀 {n.head} ready for review - {n.title}{handoff}", wake_handoff, None
 
 
 def _fmt_changes_requested(ev, n) -> tuple:
@@ -449,7 +452,7 @@ def _fmt_changes_requested(ev, n) -> tuple:
     reviewer = _safe_review_reason(payload.get("reviewer"), 48)
     implementer = _safe_review_reason(payload.get("implementer"), 48)
     reason_text = reason or "reviewer feedback requires changes"
-    provenance = f" — reviewer @{reviewer}" if reviewer else ""
+    provenance = f" - reviewer @{reviewer}" if reviewer else ""
     if implementer:
         provenance += f" → implementer @{implementer}"
     msg = f"🛑 {n.board_tag}Kanban {n.task_id} review requested changes/BLOCK: {reason_text}{provenance}"
@@ -469,7 +472,7 @@ def _fmt_block_loop_detected(ev, n) -> tuple:
     kind = _payload(ev, "kind")
     decision = kind == "needs_input"
     msg = (
-        f"🛑 {n.head} routed to TRIAGE — "
+        f"🛑 {n.head} routed to TRIAGE - "
         f"{'needs a human decision' if decision else 'for orchestration attention'}"
         f"{_clip(ev, 'recurrences', ' (blocked {}x for the same cause)', 200)}{_clip(ev, 'reason', ': {}', 160)}"
     )
@@ -479,6 +482,9 @@ def _fmt_block_loop_detected(ev, n) -> tuple:
 def _fmt_gave_up(ev, n) -> tuple:
     # The dispatcher auto-blocked the task after ``failures`` consecutive non-success attempts
     # (spawn failure, crash, or timeout alike): it is now Blocked and waiting for a human.
+    from hermes_cli.kanban_operator import policy
+    if policy().get("enabled", False):
+        return f"{n.head} exhausted its execution attempts. This is an agent-owned failure; automatic repair must pass independent review before it resumes.", None, None
     failures = _payload(ev, "failures")
     count = f"it failed {int(failures)} times in a row" if failures else "it kept failing"
     last = _clip(ev, "error", " (last: {})", 160)
@@ -500,11 +506,13 @@ def _fmt_timed_out(ev, n) -> tuple:
 # intentionally silent (no formatter), and excluded from _WAKE_KINDS so they
 # never wake the creator.
 _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
+    "operator_exception": lambda ev, n: (f"{n.head}: agent-owned exception - {_payload(ev, 'reason')}. Completion is unproved; no Harry choice is requested.", None, None),
+    "operator_repair_overdue": lambda ev, n: (f"{n.head}: its agent-owned repair missed its deadline. Completion is unproved.", None, None),
     "completed": _fmt_completed,
     "blocked": lambda ev, n: (f"⏸ {n.head} blocked{_clip(ev, 'reason', ': {}', 160)}", None, None),
     "gave_up": _fmt_gave_up,
     "crashed": lambda ev, n: (
-        f"✖ {n.head} — its worker stopped unexpectedly; it will be retried automatically.", None, None,
+        f"✖ {n.head} - its worker stopped unexpectedly; it will be retried automatically.", None, None,
     ),
     "timed_out": _fmt_timed_out,
     "status": lambda ev, n: (f"🔄 {n.head} → {_payload(ev, 'status') or ''}", None, None),
@@ -576,12 +584,12 @@ class _KanbanNotification:
         fails = self.sub_fail_counts.get(self.sub_key, 0) + 1
         self.sub_fail_counts[self.sub_key] = fails
         logger.warning(fmt, *prefix, fails, MAX_SEND_FAILURES, exc, exc_info=exc_info)
-        if fails >= MAX_SEND_FAILURES:
-            logger.warning(drop_fmt, self.task_id, self.platform_str, fails)
-            await self.unsub()
-            self.clear_failures()
-        else:
-            await self.rewind()
+        # Delivery is durable work: never delete the sole return route because
+        # the destination had an outage. Persist bounded backoff across restart.
+        await _to_thread_process_service(partial(
+            self.runner._kanban_sub_op, self.board_slug, "record_delivery_failure", self.sub,
+        ))
+        await self.rewind()
 
     async def _wake_failed(self, fmt: str, exc: Exception) -> None:
         drop_fmt = "kanban notifier: dropping subscription %s on %s after %d consecutive wake failures"
@@ -680,7 +688,7 @@ class _KanbanNotification:
         # Legacy rows may carry chat_type in delivery_metadata; last resort is
         # "group". A mismatch only degrades to a fresh session.
         # Legacy rows written before the column existed may still carry chat_type in delivery_metadata
-        # (#60600 rows) — fall back to that, then to "group" (the historical default that suits the
+        # (#60600 rows) - fall back to that, then to "group" (the historical default that suits the
         # dashboard/group flows). handle_message() get_or_create_session's the target, so a mismatch only
         # ever degrades to a fresh session, never an exception.
         _delivery_meta = sub.get("delivery_metadata") or {}
@@ -714,13 +722,20 @@ class _KanbanNotification:
         async def send_ping():
             nonlocal _send_res
             _send_res = await adapter.send(sub["chat_id"], msg, metadata=metadata)
-        if not await present_notification(send_ping, platform=self.platform_str, diagnostic=diagnostic_event(ev)):
-            return False
+        if ev.id > self.sub.get("last_ping_event_id", 0):
+            if not await present_notification(send_ping, platform=self.platform_str, diagnostic=diagnostic_event(ev)):
+                return False
         # SendResult(success=False) without an exception is a FAILED delivery
         # (else the event is lost); None / non-SendResult keeps the
         # "no exception == delivered" contract.
         if getattr(_send_res, "success", True) is False:
             raise RuntimeError(f"adapter send() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
+        if ev.id > self.sub.get("last_ping_event_id", 0):
+            await _to_thread_process_service(partial(
+                self.runner._kanban_sub_op, self.board_slug, "record_notify_ping", self.sub,
+                event_id=ev.id, message_id=getattr(_send_res, "message_id", None),
+            ))
+            self.sub["last_ping_event_id"] = ev.id
         logger.debug("kanban notifier: delivered %s event for %s to %s/%s on board %s",
                      ev.kind, self.task_id, self.platform_str, sub["chat_id"], self.board_slug)
         # Upload artifact paths from the handoff payload / legacy result as
@@ -729,13 +744,15 @@ class _KanbanNotification:
         # handoff time. Retry exposure matches ``completed`` (the sub cursor is
         # rewound only when a send failed).
         if ev.kind in ("completed", "review_requested"):
-            try:
-                await self.runner._deliver_kanban_artifacts(
+            artifacts = await self.runner._deliver_kanban_artifacts(
                     adapter=adapter, chat_id=sub["chat_id"], metadata=metadata,
                     event_payload=getattr(ev, "payload", None), task=self.task,
                 )
-            except Exception as art_exc:
-                logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)
+            await _to_thread_process_service(partial(
+                self.runner._kanban_sub_op, self.board_slug, "record_notify_artifacts", self.sub,
+                event_id=ev.id, artifacts=artifacts,
+            ))
+            self.sub["last_artifact_event_id"] = ev.id
         return True
 
     async def _send_pings(self) -> bool:
@@ -757,7 +774,10 @@ class _KanbanNotification:
             if not self.send_passive:
                 # Wake-only: the wake path is the sole delivery and resolves the counter.
                 continue
-            if ev.id <= self.sub.get("last_ping_event_id", 0):
+            if ev.id <= self.sub.get("last_ping_event_id", 0) and (
+                ev.kind not in ("completed", "review_requested") or
+                ev.id <= self.sub.get("last_artifact_event_id", 0)
+            ):
                 continue
             try:
                 if await self._send_event(ev, msg) is False:

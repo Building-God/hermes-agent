@@ -844,6 +844,12 @@ def _handle_block(args: dict, **kw) -> str:
     with _board(args.get("board")) as (kb, conn):
         _check(kind is None or kind in kb.VALID_BLOCK_KINDS,
                f"kind must be one of {sorted(kb.VALID_BLOCK_KINDS)} (or omit it)")
+        task = kb.get_task(conn, tid)
+        if task and task.current_run_id:
+            run = conn.execute("SELECT profile FROM task_runs WHERE id=?", (task.current_run_id,)).fetchone()
+            if run and run["profile"] == "reviewer":
+                _check(kind in {"dependency", "transient"},
+                       "Reviewer faults are agent-owned. Use a typed dependency/transient hold, or request_changes to the implementer; a reviewer cannot create a Harry question.")
         # The goal loop treats ANY blocked status as terminal, so kanban_block
         # would be an escape hatch around the completion judge: goal_mode tasks
         # may only block on genuine external blockers.

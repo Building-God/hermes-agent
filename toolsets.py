@@ -92,7 +92,7 @@ TOOLSETS = {
         ["video_generate", "xai_video_edit", "xai_video_extend"],
     ),
     "computer_use": _ts(
-        "Background desktop control via cua-driver (macOS/Windows/Linux) — "
+        "Background desktop control via cua-driver (macOS/Windows/Linux) - "
         "screenshots, mouse, keyboard, scroll, drag. Does NOT steal the user's cursor "
         "or keyboard focus. Works with any tool-capable model.",
         ["computer_use"],
@@ -122,11 +122,11 @@ TOOLSETS = {
         "search (content + files)",
         ["read_file", "write_file", "patch", "search_files"],
     ),
-    # Read-only file access — no write_file, no patch. Used by scanner/planner
+    # Read-only file access - no write_file, no patch. Used by scanner/planner
     # profiles (Scout, Architect) that must never mutate the filesystem.
     "file_readonly": _ts(
         "Read-only file access: read files and search filenames/content. "
-        "No write_file, no patch — for scanner/planner profiles that must "
+        "No write_file, no patch - for scanner/planner profiles that must "
         "never mutate the filesystem.",
         ["read_file", "search_files"],
     ),
@@ -136,14 +136,14 @@ TOOLSETS = {
     "context_engine": _ts("Runtime tools exposed by the active context engine"),
     "session_search": _ts("Search and recall past conversations with summarization", ["session_search"]),
     "connections": _ts("Remote connector discovery, execution, and account authorization", ["manage_connections"]),
-    "project": _ts("Desktop Projects — create/switch named workspaces (GUI sessions only)", ["desktop_project"]),
+    "project": _ts("Desktop Projects - create/switch named workspaces (GUI sessions only)", ["desktop_project"]),
     "bot_room": _ts("Verified text-only Group Chat turn capabilities"),
 
     # GUI-renderer affordances, enabled per desktop-sourced SESSION by the GUI
-    # gateway (tui_gateway/server.py::_load_enabled_toolsets) — never by a
+    # gateway (tui_gateway/server.py::_load_enabled_toolsets) - never by a
     # process env var, which is blind to a desktop client on a remote backend.
     "desktop_ui": _ts(
-        "Desktop GUI affordances — in-app terminal/browser panes, pane focus, "
+        "Desktop GUI affordances - in-app terminal/browser panes, pane focus, "
         "reactions (GUI sessions only)",
         ["read_terminal", "close_terminal", "desktop_preview", "drive_preview",
          "annotate_preview", "read_window_below", "focus_pane", "react_to_message",
@@ -155,16 +155,16 @@ TOOLSETS = {
     "homeassistant": _ts("Home Assistant smart home control and monitoring", _HA_TOOLS),
     # Reviewer-narrow kanban surface. Independent-child reviewers must not be able to
     # convert internal review ambiguity into a Harry question by calling
-    # kanban_block(kind=needs_input) (t_f8c942b9 — R5 projects any blocked-with-reason
+    # kanban_block(kind=needs_input) (t_f8c942b9 - R5 projects any blocked-with-reason
     # onto the dashboard question surface). Keep verdict tools (complete /
-    # request_changes) and evidence tools (comment / attach); omit block, unblock,
-    # create, link — genuine human-only escalation flows through a separately
+    # request_changes) and evidence tools (comment / attach); dependency/transient
+    # block and link are guarded in the handler; omit unblock and create - genuine human-only escalation flows through a separately
     # authored card, not a reviewer-emitted needs_input block. Active when the agent
     # is spawned by the kanban dispatcher (HERMES_KANBAN_TASK env set).
     "kanban_reviewer": _ts(
         "Reviewer-narrow Kanban surface: show/list/status/comment/attach/complete/"
-        "request_review/request_changes/heartbeat/checkpoint. Omits kanban_block "
-        "(and kanban_unblock/kanban_create/kanban_link) so a reviewer cannot convert "
+        "request_review/request_changes/heartbeat/checkpoint/internal block/link. "
+        "Omits unblock/create and guards block kinds so a reviewer cannot convert "
         "internal review ambiguity into a Harry needs_input question; genuine "
         "human-only escalation flows through a separately authored card.",
         [
@@ -173,14 +173,15 @@ TOOLSETS = {
             "kanban_heartbeat", "kanban_comment",
             "kanban_attach", "kanban_attach_url", "kanban_attachments",
             "kanban_checkpoint",
+            "kanban_block", "kanban_link",
         ],
     ),
     "kanban": _ts(
-        "Kanban multi-agent coordination — only active when the agent is spawned by "
+        "Kanban multi-agent coordination - only active when the agent is spawned by "
         "the kanban dispatcher (HERMES_KANBAN_TASK env set). The dispatcher runs "
         "inside the gateway by default; see `kanban.dispatch_in_gateway` in "
         "config.yaml. Lets workers mark tasks done with structured handoffs, enter "
-        "first-class review (request_review — not a block), return review changes, "
+        "first-class review (request_review - not a block), return review changes, "
         "block for human input, save/load durable owned-run checkpoints, heartbeat during long ops, comment on "
         "threads, attach files, and (for orchestrators) list, unblock, and fan out tasks.",
         [t for t in _HERMES_CORE_TOOLS if t.startswith("kanban_")] + ["kanban_checkpoint"],
@@ -215,12 +216,12 @@ TOOLSETS = {
     # there is deliberately no agent-callable send_message tool. hermes-acp is the
     # coding posture minus the interactive clarify UI.
     "hermes-acp": _ts(
-        "Editor integration (VS Code, Zed, JetBrains) — coding-focused tools without "
+        "Editor integration (VS Code, Zed, JetBrains) - coding-focused tools without "
         "messaging, audio, or clarify UI",
         [t for t in _CODING_TOOLS if t != "clarify"],
     ),
     "hermes-api-server": _ts(
-        "OpenAI-compatible API server — full agent tools accessible via HTTP (no "
+        "OpenAI-compatible API server - full agent tools accessible via HTTP (no "
         "interactive UI tools like clarify or send_message)",
         _core_without("text_to_speech", "clarify", "computer_use", kanban=False),
     ),
@@ -406,7 +407,7 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
             all_tools.update(resolve_toolset(toolset_name, visited.copy(), include_registry=include_registry))
         return sorted(all_tools)
 
-    # Diamond include or cycle: [] silently — the tools are collected via another path.
+    # Diamond include or cycle: [] silently - the tools are collected via another path.
     if name in visited:
         return []
     visited.add(name)
