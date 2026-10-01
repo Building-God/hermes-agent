@@ -51,8 +51,17 @@ def verified_repair_for_original(conn,original_id):
     return {'repair_task_id':repair_id,'review_run_id':completed['run_id']}
 
 
+def audited_repair_fault_event(conn,repair_id,event_id=None):
+    """One typed failure vocabulary for audit intake and atomic handoff."""
+    sql="SELECT * FROM task_events WHERE task_id=? AND kind IN ('blocked','block_loop_detected','dependency_wait','changes_requested','operator_repair_stopped','protocol_violation','gave_up')"
+    args=[repair_id]
+    if event_id is not None:
+        sql+=' AND id=?';args.append(event_id)
+    return conn.execute(sql+' ORDER BY id DESC LIMIT 1',args).fetchone()
+
+
 def audited_repair_latest_fault_id(conn,repair_id):
-    row=conn.execute("SELECT id FROM task_events WHERE task_id=? AND kind IN ('blocked','block_loop_detected','dependency_wait','changes_requested','operator_repair_stopped') ORDER BY id DESC LIMIT 1",(repair_id,)).fetchone()
+    row=audited_repair_fault_event(conn,repair_id)
     return row['id'] if row else 0
 
 

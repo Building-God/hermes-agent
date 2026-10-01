@@ -1576,3 +1576,20 @@ def test_audited_original_correction_is_exact_finite_and_preserves_deadline(boar
     operator.reconcile(board,settings=settings,now=new_due+2)
     assert kb.get_task(board,tid).status=='blocked'
     assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_audited_acceptance_recovery'",(tid,)).fetchone()[0]==1
+
+
+@pytest.mark.parametrize('kind',['protocol_violation','gave_up','dependency_wait','block_loop_detected'])
+def test_audit_intake_and_native_handoff_share_actual_worker_failure_types(board,monkeypatch,kind):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    settings['cohort_task_ids']=[tid]
+    dispatch._record_task_failure(board,repair,'Controlled old worker missing terminal outcome',outcome='crashed',failure_limit=1,release_claim=True,end_run=True)
+    with kb.write_txn(board):
+        kb._append_event(board,repair,kind,{'owner':'agent','reason':'Controlled old worker terminal failure','protocol_violation':True})
+    event=operator._last(board,repair,kind)
+    assert operator.audited_repair_latest_fault_id(board,repair)==event['id']
+    settings['audited_repair_faults']={repair:{'event_id':event['id'],'source':'controlled failure drill','reason':'Correct missing-outcome worker and immutable scope transition'}}
+    ok,why=kb.request_review(board,repair,reviewer='reviewer',summary='Native source correction candidate; independent reproduction remains required',metadata={'acceptance_receipts':{'native_authority_correction':{'audit_event_id':event['id'],'scope':'Controlled transition authority only; outcome unproved'}}},resume_audited_repair=True,with_reason=True)
+    assert ok,why
+    assert kb.get_task(board,repair).status=='review'
+    assert kb.get_task(board,repair).result is None
+    assert kb.get_task(board,tid).status=='blocked' and kb.get_task(board,tid).block_kind=='dependency'
