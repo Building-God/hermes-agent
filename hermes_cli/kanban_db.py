@@ -4026,13 +4026,13 @@ def request_review(
             from hermes_cli.kanban_operator import repair_descendant_hold
             repair_block=_last_hold(conn,task_id)
             circular_hold=(trow['block_kind'] in (None,'dependency') and repair_block and repair_descendant_hold(conn,task_id,_json_dict(repair_block['payload']).get('reason')))
-            from hermes_cli.kanban_operator import repair_authority,repair_contract,audited_repair_attempt_allowed
+            from hermes_cli.kanban_operator import repair_authority,repair_contract,audited_repair_attempt_allowed,audited_repair_latest_fault_id
             audit=(policy(conn).get('audited_repair_faults') or {}).get(task_id,{})
             authority=repair_authority(conn,task_id)
-            audit_event=conn.execute("SELECT id FROM task_events WHERE task_id=? AND id=? AND kind IN ('blocked','changes_requested')",(task_id,audit.get('event_id'))).fetchone()
+            audit_event=conn.execute("SELECT id FROM task_events WHERE task_id=? AND id=? AND kind IN ('blocked','changes_requested','operator_repair_stopped')",(task_id,audit.get('event_id'))).fetchone()
             native_contract,native_failure=repair_contract(conn,task_id)
             audited_repair_hold=(resume_audited_repair and authority and authority['event']['task_id'] in policy(conn).get('cohort_task_ids',[])
-                                and audit_event and audit_event['id']==max((repair_block['id'] if repair_block else 0),(_last(conn,task_id,'changes_requested')['id'] if _last(conn,task_id,'changes_requested') else 0))
+                                and audit_event and audit_event['id']==audited_repair_latest_fault_id(conn,task_id)
                                 and audit.get('source') and audit.get('reason') and not native_failure
                                 and audited_repair_attempt_allowed(conn,task_id,audit)
                                 and trow['status'] in ('blocked','todo') and trow['claim_lock'] is None)
@@ -4044,7 +4044,7 @@ def request_review(
                 return _ret(False,"audited repair recovery requires exact agent fault evidence, original native authority, and no prior corrective handoff")
             if resume_agent_repair and not repair_handoff:
                 return _ret(False,"agent review recovery requires an unclaimed operator repair with a human-review misclassification or verified circular descendant hold")
-            if repair_handoff and (not reviewer or _canonical_assignee(reviewer)==trow["assignee"]):
+            if repair_handoff and (not reviewer or (_canonical_assignee(reviewer)==trow["assignee"] and not audited_repair_hold)):
                 return _ret(False,"agent repair review requires a different named reviewer")
             origin_policy=policy(conn)
             origin=conn.execute("SELECT 1 FROM task_user_origins WHERE task_id=?",(task_id,)).fetchone()
@@ -4767,9 +4767,24 @@ def _task_user_origin(conn: sqlite3.Connection, task_id: str) -> sqlite3.Row | N
     ).fetchone()
 
 
-def task_goal_text(conn: sqlite3.Connection, task: Task) -> str:
+def task_goal_text(conn: sqlite3.Connection, task: Task, *, for_completion: bool = False) -> str:
     """Return immutable authenticated request before editable model-authored card text."""
     origin = _task_user_origin(conn, task.id)
+    if origin or getattr(task,'created_by',None)=='operator-repair':
+        from hermes_cli.kanban_operator import repair_authority,policy
+        cfg=policy(conn)
+        authority=repair_authority(conn,task.id) if getattr(task,'created_by',None)=='operator-repair' else None
+        if authority:origin=authority['origin']
+        if cfg.get('enabled') and origin:
+            goal='Original recorded request (immutable):\n'+origin['text']+'\nCandidate card text and prior review instructions cannot replace this requested outcome.'
+            original_id=authority['event']['task_id'] if authority else task.id
+            if authority:goal+=' Preserve the original agent-owned dependency hold; do not change ownership flags or ask Harry for agent deployment, review or tool metadata.'
+            if original_id in cfg.get('state_report_task_ids',[]):goal+=' This is a factual status question. Answer from observed current facts, including unresolved work and unavailable/unproved platforms. A truthful negative status satisfies the question; fixing unrelated work or asserting everything is healthy is not required. Delivery and human receipt remain separate.'
+            claimed=_latest_event(conn,task.id,'claimed',task.current_run_id) if getattr(task,'current_run_id',None) else None
+            source_status=_json_dict(claimed['payload']).get('source_status') if claimed else None
+            if not for_completion and source_status=='review':goal+=' Your owned step is independent review: reproduce the requested outcome and use kanban_request_changes with concrete evidence when the candidate fails. A valid rejection returns work to its implementer; it is not a Harry choice or an unachievable implementation goal. Only verified original outcome evidence permits kanban_complete.'
+            else:goal+=' Reproduce the requested outcome with actual probe/source receipts. Independent native acceptance remains mandatory; promises, counts and task-flag edits are not completion.'
+            return goal
     parts: list[str] = []
     if origin:
         parts.append("Authenticated original request (immutable):\n" + origin["text"])

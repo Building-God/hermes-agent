@@ -51,6 +51,11 @@ def verified_repair_for_original(conn,original_id):
     return {'repair_task_id':repair_id,'review_run_id':completed['run_id']}
 
 
+def audited_repair_latest_fault_id(conn,repair_id):
+    row=conn.execute("SELECT id FROM task_events WHERE task_id=? AND kind IN ('blocked','block_loop_detected','dependency_wait','changes_requested','operator_repair_stopped') ORDER BY id DESC LIMIT 1",(repair_id,)).fetchone()
+    return row['id'] if row else 0
+
+
 def audited_repair_attempt_allowed(conn,repair_id,audit,cfg=None):
     cfg=cfg or policy(conn)
     phases=conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='operator_authority_review_handoff' ORDER BY id",(repair_id,)).fetchall()
@@ -150,11 +155,11 @@ def acceptance_owner(conn,cfg,current_owner):
 
 def _exception(conn, tid, reason, **details):
     from hermes_cli import kanban_db as kb
-    existing = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='operator_exception'", (tid,))
-    if any(_payload(row).get("reason") == reason for row in existing):
-        return
+    payload=dict(owner='agent',reason=reason,**details)
     with kb.write_txn(conn):
-        kb._append_event(conn,tid,"operator_exception",dict(owner="agent",reason=reason,**details))
+        existing=conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='operator_exception' AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.reason') END=? ORDER BY id DESC LIMIT 1",(tid,reason)).fetchone()
+        if existing and _payload(existing)==payload:return
+        kb._append_event(conn,tid,"operator_exception",payload)
 
 
 def _last(conn, task_id, kind):
@@ -422,7 +427,9 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
         contract,failure=repair_contract(conn,repair_id)
         if failure or not contract:continue
         try:
-            reviewer=acceptance_owner(conn,cfg,task.assignee)
+            prior_review=_last(conn,repair_id,'review_requested')
+            implementer=_payload(prior_review).get('implementer') or task.assignee
+            reviewer=acceptance_owner(conn,cfg,implementer)
             metadata={'acceptance_receipts':{'native_authority_correction':{'audit_event_id':audit.get('event_id'),'contract':contract,'scope':'Ownership only; requested functional result remains unproved'}}}
             ok,reason=kb.request_review(conn,repair_id,reviewer=reviewer,summary=str(audit.get('reason',''))+' Independently reproduce the authenticated original requested outcome. Deployment and routing are agent-owned. This machine receipt verifies ownership only, not functional success; retain actual probe receipts and do not ask Harry to repair agent authority.',metadata=metadata,resume_audited_repair=True,with_reason=True)
             if not ok:raise ValueError(reason or 'audited repair correction refused')
@@ -570,6 +577,9 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
     # Rework deadlines are actionable transitions, not timestamps in a journal.
     for row in conn.execute("SELECT t.* FROM tasks t WHERE t.status IN ('ready','running')").fetchall():
         event = _last(conn,row["id"],"operator_rework_due")
+        phase = _last(conn,row['id'],'operator_agent_review_handoff')
+        if event and phase and event['id']<phase['id']:
+            continue
         if not event or now < _payload(event).get("due_at",now+1):
             continue
         later_review = _last(conn,row["id"],"review_requested")
@@ -673,6 +683,23 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
             if original_deadline and now>=_payload(original_deadline).get('due_at',0):
                 try:
                     original=kb.get_task(conn,tid)
+                    # A factual status answer already has independently accepted
+                    # native evidence. Replace only its extra internal sign-off
+                    # edge with the mandatory owned original final review.
+                    if tid in cfg.get('state_report_task_ids',[]) and isinstance(evidence,dict) and evidence.get('native_live_state'):
+                        for parent_id in kb.parent_ids(conn,tid):
+                            parent=kb.get_task(conn,parent_id)
+                            if not parent or parent.status in ('done','archived') or parent.claim_lock or parent.created_by!=implementer or parent.block_kind not in (None,'dependency','transient','capability') or not parent.title.startswith('Independent verification sign-off:') or conn.execute('SELECT 1 FROM task_user_origins WHERE task_id=?',(parent_id,)).fetchone():continue
+                            if not conn.execute('SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?',(repair.id,parent_id)).fetchone():continue
+                            with kb.write_txn(conn):
+                                current=kb.get_task(conn,parent_id)
+                                held_original=kb.get_task(conn,tid)
+                                if not current or current.status in ('done','archived') or current.claim_lock or current.created_by!=implementer or current.block_kind not in (None,'dependency','transient','capability') or not current.title.startswith('Independent verification sign-off:') or conn.execute('SELECT 1 FROM task_user_origins WHERE task_id=?',(parent_id,)).fetchone() or not conn.execute('SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?',(repair.id,parent_id)).fetchone() or not held_original or held_original.status!='blocked' or held_original.block_kind!='dependency' or held_original.claim_lock:continue
+                                if conn.execute('DELETE FROM task_links WHERE parent_id=? AND child_id=?',(parent_id,tid)).rowcount:
+                                    # Do not recompute readiness or expose original
+                                    # execution between edge correction and review.
+                                    kb._append_event(conn,tid,'unlinked',{'parent':parent_id,'child':tid,'owner':'agent','source':'native_factual_final_review'})
+                                    kb._append_event(conn,tid,'operator_factual_verification_superseded',{'owner':'agent','verification_task_id':parent_id,'repair_task_id':repair.id,'completed_event_id':completed['id'],'scope':'Declared authenticated factual status request only. Replace extra internal sign-off edge with owned original final review; verifier is not marked passed or completed.'})
                     reviewer=dispatch_owner(conn,cfg.get('review_assignee','reviewer'))
                     if reviewer==original.assignee:
                         reviewer=acceptance_owner(conn,cfg,original.assignee)

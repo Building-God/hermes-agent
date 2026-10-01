@@ -496,12 +496,20 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str, *, conn=None, meta
         return
     goal=f"{task.title}\n\n{task.body or ''}".strip()
     authority=None
-    if conn is not None and task.created_by=='operator-repair':
-        from hermes_cli.kanban_operator import repair_authority
-        authority=repair_authority(conn,tid)
-        if authority and authority['origin']:
-            goal=('Original authenticated request:\n'+authority['origin']['text']+
-                  '\nNative repair authority: reproduce this requested functional outcome. Preserve the original agent-owned dependency hold; do not change block_kind, require Harry deployment, or replace the outcome with task-flag edits. Independent native acceptance remains required. Prior candidate and review instructions do not supersede this authority.')
+    native_factual=False
+    if conn is not None:
+        from hermes_cli.kanban_operator import repair_authority,policy
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_acceptance_truth import native_state_report
+        cfg=policy(conn)
+        if task.created_by=='operator-repair':authority=repair_authority(conn,tid)
+        goal=kb.task_goal_text(conn,task,for_completion=tool_name=='kanban_complete')
+        if tool_name=='kanban_request_review':goal+=' This handoff presents the implementation and its actual candidate probe receipts; independent acceptance is performed by the owned reviewer afterwards, not before review is requested.'
+        report=native_state_report(conn,tid,cfg)
+        if report:
+            native_factual=True
+            goal+=' This is a factual status question: answer from observed current facts, including unresolved work/unavailable platforms. A truthful negative status satisfies the question; fixing all unrelated work or asserting a healthy system is not its acceptance requirement.'
+            evidence=report[0]+'\nNative live-state facts obtained before judge; completion independently recomputes them atomically:\n'+json.dumps(report[1],ensure_ascii=False)
     if isinstance(metadata,dict) and metadata.get('acceptance_receipts'):
         evidence+='\nStructured acceptance receipts supplied to the completion tool:\n'+json.dumps(metadata['acceptance_receipts'],ensure_ascii=False)[:8000]
     try:
@@ -527,7 +535,7 @@ def _goal_gate(tool_name: str, task, tid: str, evidence: str, *, conn=None, meta
     if verdict == "done":
         return
     key = "blocked" if verdict == "blocked" else "continue"
-    if authority:
+    if authority or native_factual:
         raise _Reject('Agent-owned goal review '+key+': '+str(reason)+'. Preserve native ownership and repair/review the original outcome within its bounded phase. Do not hand deployment, tool metadata or reviewer authority to Harry.')
     raise _Reject(_GOAL_GATE_MESSAGES[tool_name][key].format(reason=reason, tid=tid))
 
