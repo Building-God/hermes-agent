@@ -349,6 +349,26 @@ def test_corrective_repair_can_rework_within_fixed_phase_but_never_after_new_sto
     assert kb.claim_task(board,repair) is None
 
 
+def test_lost_original_route_restores_exact_reply_without_replaying_false_history(board,monkeypatch):
+    tid,settings=accepted_origin(board,monkeypatch)
+    completed=operator._last(board,tid,'completed')
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'result_transport_sent',{'event_id':completed['id'],'platform':'discord','chat_id':'c','thread_id':'thread','message_id':'old-false-answer'})
+        kb._append_event(board,tid,'operator_acceptance_invalidated',{'source_completed_event_id':completed['id'],'reason':'False human confirmation'})
+        board.execute("UPDATE tasks SET status='archived' WHERE id=?",(tid,))
+    operator.reconcile(board,settings=settings)
+    sub=board.execute('SELECT * FROM kanban_notify_subs WHERE task_id=?',(tid,)).fetchone()
+    assert sub and (sub['platform'],sub['chat_id'],sub['thread_id'],sub['user_id'])==('discord','c','thread','harry')
+    assert json.loads(sub['delivery_metadata'])['reply_to_message_id']=='audit'
+    invalid=operator._last(board,tid,'operator_acceptance_invalidated')
+    assert sub['last_event_id']>=invalid['id']
+    assert sub['last_artifact_event_id']>=invalid['id']
+    restored=operator._last(board,tid,'operator_original_route_restored')
+    operator.reconcile(board,settings=settings)
+    assert operator._last(board,tid,'operator_original_route_restored')['id']==restored['id']
+    assert operator._last(board,tid,'result_receipt') is None
+
+
 def test_deadline_creates_owned_runnable_task_and_exact_route_once(board):
     first = ensure_continuation(entry())
     assert ensure_continuation(entry()) == first
