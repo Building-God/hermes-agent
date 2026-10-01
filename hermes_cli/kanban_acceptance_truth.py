@@ -1,5 +1,5 @@
 """Native acceptance facts and terminal fences, not a second execution plane."""
-import json,re
+import json,re,time
 from pathlib import Path
 
 
@@ -60,6 +60,18 @@ def execution_claim_allowed(conn,tid,source_status):
     if not policy(conn).get('enabled'):return True
     stop=conn.execute("SELECT id FROM task_events WHERE task_id=? AND kind IN ('operator_request_stopped','operator_repair_stopped','operator_acceptance_stopped','operator_terminal_recovered') ORDER BY id DESC LIMIT 1",(tid,)).fetchone()
     if not stop:return True
+    if source_status=='ready':
+        task=conn.execute('SELECT created_by FROM tasks WHERE id=?',(tid,)).fetchone()
+        phase=_last(conn,tid,'operator_agent_review_handoff')
+        changes=_last(conn,tid,'changes_requested')
+        if task and task['created_by']=='operator-repair' and phase and phase['id']>stop['id'] and changes and changes['id']>phase['id']:
+            from hermes_cli.kanban_operator import repair_contract
+            contract,failure=repair_contract(conn,tid)
+            cycles=conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='changes_requested' AND id>?",(tid,phase['id'])).fetchone()[0]
+            due=_data(phase).get('due_at',0)
+            rework=_last(conn,tid,'operator_rework_due')
+            if rework:due=min(due,_data(rework).get('due_at',due))
+            return bool(contract and not failure and time.time()<due and cycles<int(policy(conn).get('max_review_cycles',3)))
     if source_status=='review':
         resume=conn.execute("SELECT id FROM task_events WHERE task_id=? AND kind IN ('operator_acceptance_recovery','operator_agent_review_handoff') ORDER BY id DESC LIMIT 1",(tid,)).fetchone()
         return bool(resume and resume['id']>stop['id'])

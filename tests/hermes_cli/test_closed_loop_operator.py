@@ -302,6 +302,53 @@ def test_state_query_failure_repairs_and_delivers_original_without_inline_shell_
     assert operator._last(board,tid,'result_receipt') is None
 
 
+def test_corrective_review_keeps_implementation_owner_for_live_rework(board,monkeypatch):
+    tid,repair,settings=failed_origin_repair(board)
+    settings['acceptance_recheck_assignee']='other'
+    monkeypatch.setattr(dispatch,'_profile_exists_fn',lambda:lambda name:name in {'pilot','reviewer','other'})
+    monkeypatch.setattr('hermes_cli.profiles.profile_exists',lambda name:name in {'pilot','reviewer','other'})
+    worker=kb.claim_task(board,repair)
+    assert kb.request_review(board,repair,reviewer='reviewer',expected_run_id=worker.current_run_id)
+    review=kb.claim_review_task(board,repair)
+    child=kb.create_task(board,title='Sign-off descendant',assignee='other')
+    kb.link_tasks(board,parent_id=repair,child_id=child)
+    assert kb.block_task(board,repair,kind='dependency',reason='Awaiting '+child,expected_run_id=review.current_run_id)
+    # Historical snapshot: the prior reviewer has exited; no physical worker is spawned in this drill.
+    with kb.write_txn(board):
+        board.execute('UPDATE tasks SET claim_lock=NULL,claim_expires=NULL WHERE id=?',(repair,))
+    monkeypatch.setattr(operator,'policy',lambda conn:settings)
+    operator.reconcile(board,settings=settings)
+    operator.reconcile(board,settings=settings)
+    handoff=operator._payload(operator._last(board,repair,'review_requested'))
+    assert handoff['implementer']=='pilot' and handoff['reviewer']=='other', (handoff,operator._payload(operator._last(board,repair,'operator_exception')))
+    review=kb.claim_review_task(board,repair)
+    ok,owner=kb.request_changes(board,repair,reason='The original functional result still needs a deployed fix',expected_run_id=review.current_run_id)
+    assert ok and owner=='pilot'
+    assert kb.get_task(board,repair).assignee=='pilot'
+
+
+def test_corrective_repair_can_rework_within_fixed_phase_but_never_after_new_stop(board,monkeypatch):
+    import time
+    tid,repair,settings=failed_origin_repair(board)
+    monkeypatch.setattr(operator,'policy',lambda conn:settings)
+    worker=kb.claim_task(board,repair)
+    assert kb.request_review(board,repair,reviewer='reviewer',expected_run_id=worker.current_run_id)
+    with kb.write_txn(board):
+        kb._append_event(board,repair,'operator_repair_stopped',{'due_at':1,'owner':'agent'})
+        kb._append_event(board,repair,'operator_agent_review_handoff',{'due_at':time.time()+60,'owner':'agent','reviewer':'reviewer'})
+    review=kb.claim_review_task(board,repair)
+    ok,owner=kb.request_changes(board,repair,reason='The original live UI still has duplicate prompts',expected_run_id=review.current_run_id)
+    assert ok and owner=='pilot'
+    worker=kb.claim_task(board,repair)
+    assert worker is not None
+    assert kb.get_task(board,tid).status=='blocked'
+    assert kb.block_task(board,repair,kind='capability',reason='Final phase exhausted',expected_run_id=worker.current_run_id)
+    with kb.write_txn(board):
+        kb._append_event(board,repair,'operator_repair_stopped',{'due_at':1,'owner':'agent'})
+    assert kb.unblock_task(board,repair)
+    assert kb.claim_task(board,repair) is None
+
+
 def test_deadline_creates_owned_runnable_task_and_exact_route_once(board):
     first = ensure_continuation(entry())
     assert ensure_continuation(entry()) == first
