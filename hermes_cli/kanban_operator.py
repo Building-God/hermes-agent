@@ -196,6 +196,33 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
     runtime = max(60, int(cfg.get("attempt_seconds", 900)))
     deadline = max(runtime, int(cfg.get("request_seconds", 7200)))
     actions = []
+    # Archival can remove the original delivery subscription. Restore only
+    # invalidated authenticated cohort requests, at a fresh cursor; never replay
+    # the old false result or stale artifact/lifecycle backlog.
+    for tid in cfg.get('cohort_task_ids',[]):
+        invalid=_last(conn,tid,'operator_acceptance_invalidated');completed=_last(conn,tid,'completed')
+        if not invalid or (completed and completed['id']>invalid['id']):continue
+        origin=conn.execute('SELECT * FROM task_user_origins WHERE task_id=?',(tid,)).fetchone()
+        if not origin or not origin['user_id'] or not origin['message_id']:continue
+        existing=conn.execute('SELECT 1 FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=?',(tid,origin['platform'],origin['chat_id'])).fetchone()
+        if existing:continue
+        transport=_last(conn,tid,'result_transport_sent');route=_payload(transport)
+        known_route=route.get('platform')==origin['platform'] and route.get('chat_id')==origin['chat_id']
+        if not known_route and origin['platform']!='discord':
+            _exception(conn,tid,'original_route_restore_unproved',platform=origin['platform'])
+            continue
+        thread=route.get('thread_id') if known_route else None
+        try:
+            from hermes_cli.kanban_db_notify import add_notify_sub
+            with kb.write_txn(conn):
+                add_notify_sub(conn,task_id=tid,platform=origin['platform'],chat_id=origin['chat_id'],thread_id=thread,user_id=origin['user_id'],delivery_metadata={'reply_to_message_id':origin['message_id']})
+                cursor=conn.execute('SELECT COALESCE(MAX(id),0) FROM task_events WHERE task_id=?',(tid,)).fetchone()[0]
+                conn.execute("UPDATE kanban_notify_subs SET last_event_id=?,last_ping_event_id=?,last_artifact_event_id=? WHERE task_id=? AND platform=? AND chat_id=? AND COALESCE(thread_id,'')=?",(cursor,cursor,cursor,tid,origin['platform'],origin['chat_id'],thread or ''))
+                kb._append_event(conn,tid,'operator_original_route_restored',{'owner':'agent','platform':origin['platform'],'chat_id':origin['chat_id'],'thread_id':thread or '', 'reply_to_message_id':origin['message_id'],'skip_through_event_id':cursor,'human_receipt':'unobserved'})
+            actions.append({'task_id':tid,'original_delivery_route_restored':True})
+        except Exception as error:
+            _exception(conn,tid,'original_route_restore_failed',error=str(error)[:300])
+
     # A repair cannot depend on the failed original that is waiting for it.
     # Correct only the reverse edge identified by durable native repair origin.
     for event in conn.execute("SELECT * FROM task_events WHERE kind='operator_repair_created'").fetchall():
