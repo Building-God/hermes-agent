@@ -1718,6 +1718,115 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
+# --- Card-creation dedupe (stop automated fan-out creating duplicates) ---
+
+_TITLE_DEDUPE_PREFIXES = ("urgent:", "dash handoff:", "dash:", "handoff:")
+
+
+def normalize_title_for_dedupe(title: str) -> str:
+    """Normalise a card title for fuzzy dedupe: lowercase, strip punctuation,
+    drop leading ``URGENT:`` / ``Dash handoff:`` style prefixes, collapse space."""
+    text = (title or "").strip().lower()
+    while True:
+        stripped = False
+        for prefix in _TITLE_DEDUPE_PREFIXES:
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+                stripped = True
+        if not stripped:
+            break
+    text = re.sub(r"[^\w\s]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _title_similarity(a: str, b: str) -> float:
+    """Similarity of two already-normalised titles. Word-subset containment (the
+    shorter title's words all appear in the longer's, with >= 2 words) counts as
+    a full match, so ``Dash is broken`` vs ``Dash is broken / get it working``
+    dedupes; otherwise falls back to SequenceMatcher ratio."""
+    if not a or not b:
+        return 0.0
+    import difflib
+    ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    ta, tb = set(a.split()), set(b.split())
+    if ta and tb:
+        smaller, bigger = (ta, tb) if len(ta) <= len(tb) else (tb, ta)
+        if len(smaller) >= 2 and smaller <= bigger:
+            return 1.0
+    return ratio
+
+
+def _normalize_body_for_dedupe(body: Optional[str]) -> str:
+    """Normalise a card body for dedupe the same way titles are: lowercase,
+    strip punctuation, collapse space. An empty/near-empty body normalises to ''."""
+    return normalize_title_for_dedupe(body or "")
+
+
+def _body_dedupe_hash(body: Optional[str]) -> Optional[str]:
+    """Content hash of the normalised body. Two filings of the same job with
+    different titles but the same body share a hash, so a reworded re-filing
+    of the exact same spec still collapses."""
+    norm = _normalize_body_for_dedupe(body)
+    if not norm:
+        return None
+    import hashlib
+    return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+
+
+def find_duplicate_card(
+    conn: sqlite3.Connection, title: str, *, min_ratio: float = 0.85,
+    exclude_id: Optional[str] = None, body: Optional[str] = None,
+    assignee: Optional[str] = None,
+) -> Optional[dict]:
+    """Return the best open (non-``done``, non-``archived``) card that already
+    covers ``title``/``body``, else ``None``. Two signals, in priority order:
+
+    1. **Body hash** — an open card with the same normalised body (even under a
+       different title) is a full match (ratio 1.0): a reworded re-filing of the
+       same spec collapses instead of minting a rival card.
+    2. **Fuzzy title** — normalised-title similarity >= ``min_ratio``.
+
+    ``assignee`` (when provided) restricts the match to cards filed for the same
+    profile, so a cross-profile near-title coincidence does not suppress a real
+    card. Automated card creators call this first and comment on the existing
+    card instead of duplicating."""
+    body_hash = _body_dedupe_hash(body)
+    norm = normalize_title_for_dedupe(title)
+    if not norm and not body_hash:
+        return None
+    rows = conn.execute(
+        "SELECT id, title, status, body, assignee FROM tasks "
+        "WHERE status NOT IN ('done', 'archived')"
+    ).fetchall()
+    best: Optional[dict] = None
+    best_ratio = 0.0
+    for row in rows:
+        if exclude_id and row["id"] == exclude_id:
+            continue
+        if assignee and (row["assignee"] or "") != assignee:
+            continue
+        # Signal 1: identical normalised body = the same job, whatever the title.
+        if body_hash and _body_dedupe_hash(row["body"]) == body_hash:
+            return {
+                "id": row["id"], "title": row["title"], "status": row["status"],
+                "ratio": 1.0,
+            }
+        # Signal 2: fuzzy title.
+        if not norm:
+            continue
+        other = normalize_title_for_dedupe(row["title"])
+        if not other:
+            continue
+        ratio = _title_similarity(norm, other)
+        if ratio >= min_ratio and ratio > best_ratio:
+            best = {
+                "id": row["id"], "title": row["title"], "status": row["status"],
+                "ratio": round(ratio, 4),
+            }
+            best_ratio = ratio
+    return best
+
+
 def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
     """Assign/reassign; raises RuntimeError while the task is running under a claim."""
     profile = _canonical_assignee(profile)
@@ -4311,13 +4420,19 @@ def _fence_running_release(
     return True, termination
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> bool:
+def archive_task(
+    conn: sqlite3.Connection, task_id: str, *, signal_fn=None, reason: Optional[str] = None,
+) -> bool:
     """Archive a task after fencing any running host-local worker tree.
 
     An archive is deletable, so it must never discard the only worker identity
     evidence before termination confirms both the root and its snapshotted
     descendants are gone.  A failed fence leaves the running claim tracked and
     extends it for a retry, rather than making an effect-capable worker orphan.
+
+    ``reason`` (board-hygiene: "duplicate of X", "stale", "covered-by Y") is
+    recorded on the ``archived`` event payload so the audit trail shows why a
+    card was cleared, not just that it was archived.
     """
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
@@ -4362,7 +4477,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
             conn, task_id, outcome="reclaimed", status="reclaimed",
             summary="task archived with run still active",
         )
-        _append_event(conn, task_id, "archived", None, run_id=run_id)
+        _append_event(conn, task_id, "archived", {"reason": reason} if reason else None, run_id=run_id)
         if termination is not None:
             _append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
     # ``archived`` parents no longer block children; promote them now.
