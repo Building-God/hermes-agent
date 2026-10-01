@@ -1688,3 +1688,61 @@ def test_declared_outcome_rechecks_legacy_claim_once_without_native_probe_event(
     count=board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='review_requested'",(tid,)).fetchone()[0]
     operator.reconcile(board,settings=settings)
     assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='review_requested'",(tid,)).fetchone()[0]==count
+
+
+@pytest.mark.parametrize('mode',['exact','stale_phase','human'])
+def test_audited_acceptance_deadline_stop_uses_exact_native_phase_without_false_completion(board,monkeypatch,mode):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    settings['cohort_task_ids']=[tid]
+    assert kb.complete_task(board,repair,result='Controlled existing independently accepted repair',expected_run_id=review.current_run_id,metadata={'acceptance_receipts':{'probe':'fixture'}})
+    due=operator._payload(operator._last(board,tid,'operator_deadline'))['due_at']
+    monkeypatch.setattr(kb.time,'time',lambda:due+1)
+    hold=operator._last_hold(board,tid)
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'operator_acceptance_recovery',{'owner':'agent','due_at':due,'acceptance':'unproved'})
+        kb._append_event(board,tid,'operator_acceptance_stopped',{'owner':'agent','due_at':due})
+        board.execute("UPDATE tasks SET status='blocked',block_kind=?,result=NULL,claim_lock=NULL,current_run_id=NULL WHERE id=?",('needs_input' if mode=='human' else 'capability',tid))
+    phase=operator._last(board,tid,'operator_acceptance_recovery');stop=operator._last(board,tid,'operator_acceptance_stopped')
+    assert stop['kind']=='operator_acceptance_stopped'
+    settings['agent_owned_faults']={tid:{'blocked_event_id':hold['id'],'deadline_stop_event_id':stop['id'],'acceptance_phase_event_id':phase['id']-(1 if mode=='stale_phase' else 0),'retry_acceptance':True,'source':'actual acceptance deadline record','reason':'bounded independently audited native check correction'}}
+    operator.reconcile(board,settings=settings,now=due+1)
+    audit=operator._last(board,tid,'operator_audited_acceptance_recovery')
+    if mode!='exact':
+        assert audit is None
+    else:
+        assert audit and operator._payload(audit)['source_fault_event_id']==stop['id']
+        assert kb.get_task(board,tid).status=='review'
+        assert operator._payload(operator._last(board,tid,'operator_deadline'))['due_at']==due
+
+
+def test_sealed_original_outcome_defaults_guard_before_policy_update():
+    from hermes_cli import kanban_outcomes as outcomes
+    assert outcomes.declared_check({'cohort_task_ids':['t_2932862d']},'t_2932862d')['kind']=='dashboard'
+    assert outcomes.declared_check({'cohort_task_ids':['t_5cb8e6be']},'t_5cb8e6be')['kind']=='conversation'
+    assert outcomes.declared_check({'cohort_task_ids':['t_bbaf4f71']},'t_bbaf4f71')['kind']=='queue'
+
+
+def test_sealed_defaults_preserve_outside_cohort_work():
+    from hermes_cli import kanban_outcomes as outcomes
+    assert outcomes.declared_check({'cohort_task_ids':[]},'t_2932862d') is None
+    assert outcomes.declared_check({'cohort_task_ids':['unrelated']},'unrelated') is None
+
+
+def test_native_current_effects_supply_receipt_without_worker_format_barrier(board,monkeypatch):
+    from hermes_cli import kanban_outcomes as outcomes
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    settings.update(cohort_task_ids=[tid],outcome_checks={tid:{'kind':'queue','url':'http://127.0.0.1:7888/api/questions'}})
+    monkeypatch.setattr(outcomes,'check_queue',lambda cfg:{'passed':True,'observed':'controlled actual queue outcome'})
+    assert kb.complete_task(board,repair,result='Actual effects independently reproduced',expected_run_id=review.current_run_id)
+    receipt=operator._payload(operator._last(board,repair,'completed'))['acceptance_receipts']
+    assert receipt['native_original_outcome']['passed'] and receipt['worker_observations'] is None
+
+
+@pytest.mark.parametrize('questions,passed',[
+    ([],False),
+    ([{'id':'new-clear-title','source_task':'protected-choice','text':'Choose a physical microphone','options':['Connect mic','Park']}],True),
+])
+def test_queue_cannot_pass_by_erasing_unresolved_harry_only_choice(monkeypatch,questions,passed):
+    from hermes_cli import kanban_outcomes as outcomes
+    monkeypatch.setattr(outcomes,'_local_json',lambda url:{'questions':questions})
+    assert outcomes.check_queue({'url':'http://127.0.0.1:7888/api/questions','preserve_pending_choice_tasks':['protected-choice']})['passed']==passed
