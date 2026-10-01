@@ -1510,3 +1510,69 @@ def test_dead_owned_review_protocol_failure_returns_native_rework(board,monkeypa
     assert native_dispatch._account_crashes(board,sweep.crash_details)==[]
     assert operator._last(board,repair,'gave_up') is None
     assert kb.get_task(board,tid).block_kind=='dependency'
+
+@pytest.mark.parametrize('mode',['exact','stale','old_deadline_stop','human','outside','atomic_failure'])
+def test_audited_original_correction_is_exact_finite_and_preserves_deadline(board,monkeypatch,mode):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch,request_text='Fix the actual fixture queue outcome')
+    settings['cohort_task_ids']=[tid]
+    assert kb.complete_task(board,repair,result='Controlled independent repair probe',expected_run_id=review.current_run_id,metadata={'acceptance_receipts':{'probe':'controlled receipt'}})
+    due=operator._payload(operator._last(board,tid,'operator_deadline'))['due_at']
+    monkeypatch.setattr(kb.time,'time',lambda:due+1)
+    operator.reconcile(board,settings=settings,now=due+1)
+    original_review=kb.claim_review_task(board,tid)
+    assert kb.complete_task(board,tid,result='Controlled old result later independently disproved',expected_run_id=original_review.current_run_id,metadata={'acceptance_receipts':{'probe':'controlled old structural proof'}})
+    completed=operator._last(board,tid,'completed')
+    settings['agent_owned_faults']={tid:{'completed_event_id':completed['id'],'source':'controlled independent semantic audit','reason':'Actual fixture outcome failed'}}
+    operator.reconcile(board,settings=settings,now=due+2)
+    # Exhaust both existing native correction paths before auditing a NEW
+    # framework failure. A stale audit must not suppress ordinary recovery.
+    for _ in range(3):
+        phase=operator._payload(operator._last(board,tid,'operator_acceptance_recovery'))
+        cutoff=phase['due_at']+1
+        monkeypatch.setattr(kb.time,'time',lambda:cutoff)
+        operator.reconcile(board,settings=settings,now=cutoff)
+        assert kb.get_task(board,tid).status=='blocked'
+        operator.reconcile(board,settings=settings,now=cutoff+1)
+        if kb.get_task(board,tid).status=='blocked':break
+    assert kb.get_task(board,tid).status=='blocked'
+    # Controlled injection of the observed OLD framework transition: the
+    # expired original deadline killed an otherwise owned correction.
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'operator_request_stopped',{'owner':'agent','due_at':due,'fixture':'old framework deadline stop'})
+        kb._append_event(board,tid,'gave_up',{'owner':'agent','error':'Original request deadline exhausted','operator_rework':True,'sticky':True})
+    hold=operator._last_hold(board,tid)
+    stop=operator._last(board,tid,'operator_request_stopped')
+    settings['agent_owned_faults'][tid].update({'blocked_event_id':hold['id']-(1 if mode=='stale' else 0),'deadline_stop_event_id':stop['id']-(1 if mode=='old_deadline_stop' else 0),'retry_acceptance':True,'source':'controlled framework correction','reason':'Old framework killed corrective transition'})
+    if mode=='human':
+        with kb.write_txn(board):board.execute("UPDATE tasks SET block_kind='needs_input' WHERE id=?",(tid,))
+    if mode=='outside':settings['cohort_task_ids']=[]
+    reviews_before=board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='review_requested'",(tid,)).fetchone()[0]
+    owner_before=kb.get_task(board,tid).assignee
+    if mode=='atomic_failure':
+        native_append=kb._append_event
+        def fail_phase(conn,task_id,kind,*args,**kwargs):
+            if kind=='operator_audited_acceptance_recovery':raise RuntimeError('Controlled phase record failure')
+            return native_append(conn,task_id,kind,*args,**kwargs)
+        monkeypatch.setattr(kb,'_append_event',fail_phase)
+    operator.reconcile(board,settings=settings,now=cutoff+2)
+    assert operator._payload(operator._last(board,tid,'operator_deadline'))['due_at']==due
+    audit=operator._last(board,tid,'operator_audited_acceptance_recovery')
+    if mode!='exact':
+        assert audit is None
+        assert kb.get_task(board,tid).status=='blocked'
+        if mode=='human':assert kb.get_task(board,tid).block_kind=='needs_input'
+        if mode=='atomic_failure':
+            assert kb.get_task(board,tid).assignee==owner_before
+            assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='review_requested'",(tid,)).fetchone()[0]==reviews_before
+        return
+    assert audit is not None, json.dumps({'status':kb.get_task(board,tid).status,'kind':kb.get_task(board,tid).block_kind,'result':bool(kb.get_task(board,tid).result),'hold':dict(operator._last_hold(board,tid)),'exception':operator._payload(operator._last(board,tid,'operator_exception'))})
+    assert kb.get_task(board,tid).status=='review'
+    assert operator._payload(audit)['source_fault_event_id']==stop['id']
+    new_due=operator._payload(audit)['due_at']
+    assert new_due==cutoff+122
+    operator.reconcile(board,settings=settings,now=new_due+1)
+    assert kb.get_task(board,tid).status=='blocked'
+    settings['agent_owned_faults'][tid]['blocked_event_id']=operator._last_hold(board,tid)['id']
+    operator.reconcile(board,settings=settings,now=new_due+2)
+    assert kb.get_task(board,tid).status=='blocked'
+    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_audited_acceptance_recovery'",(tid,)).fetchone()[0]==1

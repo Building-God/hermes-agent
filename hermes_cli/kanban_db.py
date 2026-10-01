@@ -4019,7 +4019,8 @@ def request_review(
     # leave orphans that make the retry stage ``name_1.ext`` beside them.
     staged_copies: list[Path] = []
     try:
-        with write_txn(conn):
+        # Native audited-origin phases compose atomically; scope/hold guards still apply.
+        with write_txn(conn, allow_nested=resume_audited_origin):
             if not _parents_satisfied(conn, task_id):
                 return _ret(False, "parent dependencies are not satisfied")
             trow = conn.execute(
