@@ -4025,7 +4025,7 @@ def request_review(
                 return _ret(False, "task not found")
             from hermes_cli.kanban_operator import repair_descendant_hold
             repair_block=_last_hold(conn,task_id)
-            circular_hold=(trow['block_kind']=='dependency' and repair_block and repair_descendant_hold(conn,task_id,_json_dict(repair_block['payload']).get('reason')))
+            circular_hold=(trow['block_kind'] in (None,'dependency') and repair_block and repair_descendant_hold(conn,task_id,_json_dict(repair_block['payload']).get('reason')))
             from hermes_cli.kanban_operator import repair_authority,repair_contract
             audit=(policy(conn).get('audited_repair_faults') or {}).get(task_id,{})
             authority=repair_authority(conn,task_id)
@@ -4848,6 +4848,9 @@ def _ctx_header(lines: list[str], conn: sqlite3.Connection, task: Task) -> None:
         from hermes_cli.kanban_acceptance_truth import health_snapshot
         lines.extend(['## Native closed-loop facts',json.dumps(health_snapshot(conn,operator_policy,current_task=task.id)),
                       'These request exceptions and platform states outrank reassuring counts and candidate narration. A status answer must disclose unresolved agent faults. Do not archive work to bypass acceptance or delivery.'])
+        from hermes_cli.kanban_acceptance_truth import native_state_report
+        if native_state_report(conn,task.id,operator_policy):
+            lines.append('Native live-state acceptance is enabled for this authenticated status request and its owned repair. Read current Kanban facts for independent review, then complete your owned review run. The engine obtains current ledger/platform facts atomically and records the factual answer and native receipt. Inline SQL execution or Harry sign-off is not needed. This capability does not prove other requested repairs are complete.')
         if origin or task.created_by == "operator-repair":
             lines.append("This original request requires independent review. Request review from a different installed profile; the owned reviewer must reproduce the outcome before completing it. A self-written success summary is rejected. Include the actual reproduction/probe/source evidence in metadata.acceptance_receipts.")
         if task.created_by == "operator-repair":

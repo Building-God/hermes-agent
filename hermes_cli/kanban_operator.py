@@ -351,7 +351,7 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
             actions.append({'task_id':repair_id,'audited_authority_recovery':reviewer})
         except Exception as error:
             _exception(conn,repair_id,'audited_authority_recovery_failed',error=str(error)[:300])
-    for row in conn.execute("SELECT * FROM tasks WHERE created_by='operator-repair' AND status='blocked' AND block_kind='dependency' AND claim_lock IS NULL").fetchall():
+    for row in conn.execute("SELECT * FROM tasks WHERE created_by='operator-repair' AND status='blocked' AND (block_kind='dependency' OR block_kind IS NULL) AND claim_lock IS NULL").fetchall():
         tid=row['id'];blocked=_last_hold(conn,tid)
         if _last(conn,tid,'operator_agent_dependency_review_handoff') or not blocked or not repair_descendant_hold(conn,tid,_payload(blocked).get('reason')):
             continue
