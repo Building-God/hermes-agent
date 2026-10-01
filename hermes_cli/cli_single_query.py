@@ -69,7 +69,7 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str, run_turn=None
     from hermes_cli import kanban_db_connect as _kbc
     from hermes_cli.goals import run_kanban_goal_loop as _run_loop, DEFAULT_MAX_TURNS as _DEF_TURNS
 
-    # Goal text = title + body (the acceptance criteria the judge evaluates against).
+    # Shared immutable request and owned step, before editable card criteria.
     with _kbc.connect_closing() as conn:
         task = _kb.get_task(conn, task_id)
         goal_text = _kb.task_goal_text(conn, task) if task is not None else ""
@@ -93,7 +93,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str, run_turn=None
 
     def _block(reason: str) -> None:
         with _kbc.connect_closing() as c:
-            _kb.block_task(c, task_id, reason=reason, expected_run_id=worker_run_id)
+            from hermes_cli.kanban_operator import handle_worker_goal_failure
+            handle_worker_goal_failure(c, task_id, reason, expected_run_id=worker_run_id)
 
     _run_loop(
         task_id=task_id, goal_text=goal_text, run_turn=run_turn or _quiet_turn,
@@ -381,7 +382,7 @@ def _install_single_query_signal_handlers(cli):
         # Kanban worker exit path (#28181): SIGTERM hits a dispatcher-spawned worker that's likely in a
         # non-daemon thread waiting on a child subprocess in _wait_for_process. Raising KeyboardInterrupt
         # only unwinds the main thread; the worker thread keeps running, the process gets reparented to
-        # init, and the dispatcher's _pid_alive check returns True forever — task stuck in 'running'
+        # init, and the dispatcher's _pid_alive check returns True forever - task stuck in 'running'
         # indefinitely. Skip the controlled-unwind dance and call os._exit(0) so the kernel reclaims the PID
         # immediately and detect_crashed_workers can reclaim the stale claim on the next tick. Flush logging
         # + stdout/stderr first so the final debug trace isn't lost; SIGALRM deadman guards the flush
