@@ -84,6 +84,40 @@ def test_unreviewed_repair_cannot_resume_parent(board):
     assert kb.get_task(board, tid).status == "blocked"
 
 
+def test_total_repair_deadline_stops_new_attempts_without_harry_input(board):
+    tid=kb.create_task(board,title="failed original",assignee="pilot")
+    kb.claim_task(board,tid)
+    dispatch._record_task_failure(board,tid,"controlled failure",outcome="crashed",failure_limit=1,release_claim=True,end_run=True)
+    settings=dict(enabled=True,attempt_seconds=120)
+    operator.reconcile(board,settings=settings)
+    repair=operator._payload(operator._last(board,tid,"operator_repair_created"))["repair_task_id"]
+    due=operator._payload(operator._last(board,tid,"operator_repair_created"))["due_at"]
+    operator.reconcile(board,settings=settings,now=due)
+    assert kb.get_task(board,repair).status == "blocked"
+    assert kb.get_task(board,repair).block_kind is None
+    assert kb.get_task(board,tid).status == "blocked"
+    operator.reconcile(board,settings=settings,now=due+60)
+    assert dispatch.dispatch_once(board,dry_run=True).spawned == []
+    assert board.execute("SELECT COUNT(*) FROM tasks WHERE created_by='operator-repair'").fetchone()[0] == 1
+    assert operator._last(board,repair,"operator_repair_stopped")
+
+
+def test_expired_active_repair_keeps_claim_when_native_tree_stop_is_refused(board,monkeypatch):
+    tid=kb.create_task(board,title="failed original",assignee="pilot")
+    kb.claim_task(board,tid)
+    dispatch._record_task_failure(board,tid,"controlled failure",outcome="crashed",failure_limit=1,release_claim=True,end_run=True)
+    settings=dict(enabled=True,attempt_seconds=120)
+    operator.reconcile(board,settings=settings)
+    info=operator._payload(operator._last(board,tid,"operator_repair_created")); repair=info["repair_task_id"]
+    active=kb.claim_task(board,repair)
+    monkeypatch.setattr(kb,"_fence_running_release",lambda *a,**k:(False,{"identity_unverified":True}))
+    operator.reconcile(board,settings=settings,now=info["due_at"])
+    assert kb.get_task(board,repair).current_run_id == active.current_run_id
+    assert kb.get_task(board,repair).claim_lock == active.claim_lock
+    assert kb.get_task(board,tid).status == "blocked"
+    assert operator._last(board,tid,"operator_repair_overdue")
+
+
 def test_rejected_candidate_cannot_spin_through_same_review(board, monkeypatch):
     monkeypatch.setattr(operator, "policy", lambda *args: {"enabled": True})
     tid = kb.create_task(board, title="candidate", assignee="pilot")
