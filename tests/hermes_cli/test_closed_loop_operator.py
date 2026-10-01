@@ -169,6 +169,62 @@ def test_stale_repair_audit_does_not_override_a_later_fault(board,monkeypatch):
     assert kb.get_task(board,repair).status=='blocked'
 
 
+def failed_origin_repair(board):
+    tid=kb.create_task(board,title='Original failed outcome',assignee='pilot',user_origin={'platform':'discord','chat_id':'c','message_id':'edge-proof','user_id':'harry','text':'Fix the original requested outcome'})
+    kb.claim_task(board,tid)
+    dispatch._record_task_failure(board,tid,'controlled crash',outcome='crashed',failure_limit=1,release_claim=True,end_run=True)
+    settings={'enabled':True,'cohort_task_ids':[tid]}
+    operator.reconcile(board,settings=settings)
+    repair=operator._payload(operator._last(board,tid,'operator_repair_created'))['repair_task_id']
+    return tid,repair,settings
+
+
+def test_repair_dependency_cannot_wait_for_its_failed_original(board,monkeypatch):
+    tid,repair,settings=failed_origin_repair(board)
+    kb.link_tasks(board,parent_id=tid,child_id=repair)
+    unrelated=kb.create_task(board,title='Separate prerequisite',assignee='pilot')
+    kb.link_tasks(board,parent_id=unrelated,child_id=repair)
+    monkeypatch.setattr(operator,'policy',lambda conn:settings)
+    operator.reconcile(board,settings=settings)
+    links={tuple(r) for r in board.execute('SELECT parent_id,child_id FROM task_links')}
+    assert (tid,repair) not in links
+    assert (repair,tid) in links
+    assert (unrelated,repair) in links
+    assert kb.get_task(board,tid).status=='blocked'
+    assert kb.get_task(board,tid).block_kind=='dependency'
+    event=operator._last(board,tid,'operator_repair_dependency_corrected')
+    operator.reconcile(board,settings=settings)
+    assert operator._last(board,tid,'operator_repair_dependency_corrected')['id']==event['id']
+
+
+def test_dependency_correction_rolls_back_when_another_path_would_cycle(board,monkeypatch):
+    tid,repair,settings=failed_origin_repair(board)
+    middle=kb.create_task(board,title='Other dependency path',assignee='pilot')
+    kb.link_tasks(board,parent_id=tid,child_id=repair)
+    kb.link_tasks(board,parent_id=tid,child_id=middle)
+    kb.link_tasks(board,parent_id=middle,child_id=repair)
+    monkeypatch.setattr(operator,'policy',lambda conn:settings)
+    operator.reconcile(board,settings=settings)
+    links={tuple(r) for r in board.execute('SELECT parent_id,child_id FROM task_links')}
+    assert (tid,repair) in links and (repair,tid) not in links
+    assert operator._payload(operator._last(board,tid,'operator_exception'))['reason']=='repair_prerequisite_correction_failed'
+
+
+def test_terminal_recovery_has_new_actual_evidence_after_rejected_candidate(board,monkeypatch):
+    tid,settings=accepted_origin(board,monkeypatch)
+    completed=operator._last(board,tid,'completed')
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'changes_requested',{'reason':'False acceptance; correct the claimed human confirmation'})
+        kb._append_event(board,tid,'operator_acceptance_invalidated',{'source_completed_event_id':completed['id'],'reason':'Actual actor was AGENT'})
+        board.execute("UPDATE tasks SET status='archived' WHERE id=?",(tid,))
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,tid).status=='review'
+    receipt=operator._payload(operator._last(board,tid,'review_requested'))['acceptance_receipts']['native_terminal_correction']
+    assert receipt['source_completed_event_id']==completed['id']
+    assert 'unproved' in receipt['scope']
+    assert operator._last(board,tid,'completed')['id']==completed['id']
+
+
 def test_deadline_creates_owned_runnable_task_and_exact_route_once(board):
     first = ensure_continuation(entry())
     assert ensure_continuation(entry()) == first
