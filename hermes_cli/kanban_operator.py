@@ -589,7 +589,9 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
                                   "human_choice_pending": row["block_kind"] == "needs_input"})
             actions.append({"task_id": tid, "exception": "request_deadline_exceeded"})
         acceptance_phase=_last(conn,tid,'operator_acceptance_recovery')
-        bounded_acceptance=acceptance_phase and row['status'] in ('review','running') and now<_payload(acceptance_phase).get('due_at',0)
+        # A rejected corrective review returns to ready. It retains this SAME
+        # finite phase; the original deadline remains breached, never renewed.
+        bounded_acceptance=acceptance_phase and row['status'] in ('ready','review','running') and now<_payload(acceptance_phase).get('due_at',0)
         if now>=due and row['status'] in ('ready','running','review') and not bounded_acceptance:
             if row['status']=='running':
                 stopped=kb.block_task(conn,tid,reason='Agent-owned original request deadline exhausted; do not start another external action.',kind='capability')

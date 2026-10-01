@@ -854,9 +854,13 @@ def test_verified_late_repair_hands_original_to_acceptance_without_replaying_wor
     assert kb.get_task(board,tid).status=='review'
     assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_repair_verified'",(tid,)).fetchone()[0]==1
     assert phase['due_at']==due+121
+    monkeypatch.setattr(kb.time,'time',lambda:due+2)
     original_review=kb.claim_review_task(board,tid)
     assert kb.request_changes(board,tid,reason='Original outcome not yet proved',expected_run_id=original_review.current_run_id)[0]
     operator.reconcile(board,settings=settings,now=due+3)
+    assert kb.get_task(board,tid).status=='ready'
+    assert operator._payload(operator._last(board,tid,'operator_deadline'))['due_at']==due
+    operator.reconcile(board,settings=settings,now=phase['due_at']+1)
     assert kb.get_task(board,tid).status=='blocked'
     assert kb.get_task(board,tid).block_kind!='needs_input'
 
@@ -1452,3 +1456,57 @@ def test_operator_identity_requires_distinct_authenticated_interactive_credentia
         finally:
             await adapter.disconnect()
     asyncio.run(run())
+
+
+def test_owned_task_show_exposes_original_goal_before_candidate_history(board,monkeypatch):
+    from tools import kanban_tools
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch,request_text='Restore my actual conversation')
+    settings['cohort_task_ids']=[tid]
+    with kb.write_txn(board):
+        board.execute('UPDATE tasks SET title=?,body=? WHERE id=?',('Check only cycles','WRONG CANDIDATE INSTRUCTION: ask Harry to edit SQL',repair))
+    from contextlib import contextmanager
+    @contextmanager
+    def local_board(*args):yield kb,board
+    monkeypatch.setattr(kanban_tools,'_board',local_board)
+    result=json.loads(kanban_tools._handle_show({'task_id':repair}))
+    assert 'Restore my actual conversation' in result['task']['body']
+    assert 'WRONG CANDIDATE' not in result['task']['body']
+    assert result['candidate_history']['body']=='WRONG CANDIDATE INSTRUCTION: ask Harry to edit SQL'
+    assert 'historical evidence' in result['history_authority']
+    assert 'independent review' in result['task']['body']
+
+
+def test_owned_goal_accepts_independently_reproduced_existing_work(board,monkeypatch):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    goal=kb.task_goal_text(board,review)
+    assert 'Existing work from earlier runs' in goal
+    assert 'not who authored the change' in goal
+    assert 'metadata.acceptance_receipts' in goal
+
+
+@pytest.mark.parametrize('declared',[True,False])
+def test_dead_owned_review_protocol_failure_returns_native_rework(board,monkeypatch,declared):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    settings['cohort_task_ids']=[tid] if declared else []
+    from hermes_cli import kanban_db_dispatch as native_dispatch
+    with kb.write_txn(board):
+        board.execute('UPDATE tasks SET worker_pid=?,worker_started_at=?,claim_lock=? WHERE id=?',(987654,1,kb._host_prefix()+'controlled',repair))
+        board.execute('UPDATE task_runs SET started_at=1 WHERE id=?',(review.current_run_id,))
+    monkeypatch.setattr(native_dispatch,'_worker_alive',lambda *args:False)
+    monkeypatch.setattr(native_dispatch,'_classify_dead_worker',lambda *args,**kw:native_dispatch._DeadWorker('clean_exit',0,'Controlled missing terminal outcome','protocol_violation',{'protocol_violation':True},protocol_violation=True))
+    sweep=native_dispatch._reclaim_dead_workers(board)
+    current=kb.get_task(board,repair)
+    if not declared:
+        assert current.status=='review'
+        assert operator._last(board,repair,'operator_failed_review_rework') is None
+        assert native_dispatch._account_crashes(board,sweep.crash_details)==[repair]
+        assert kb.get_task(board,repair).status=='blocked'
+        return
+    assert current.status=='ready' and current.assignee=='pilot'
+    assert current.current_run_id is None and current.worker_pid is None
+    event=operator._last(board,repair,'operator_failed_review_rework')
+    assert operator._payload(event)['source']=='worker_protocol'
+    assert operator._last(board,repair,'protocol_violation')['run_id']==review.current_run_id
+    assert native_dispatch._account_crashes(board,sweep.crash_details)==[]
+    assert operator._last(board,repair,'gave_up') is None
+    assert kb.get_task(board,tid).block_kind=='dependency'

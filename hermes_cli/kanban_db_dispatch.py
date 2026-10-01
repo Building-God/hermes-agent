@@ -1365,6 +1365,38 @@ class _CrashSweep:
 def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None) -> _CrashSweep:
     """Release every host-local ``running`` task whose worker PID is dead."""
     sweep = _CrashSweep()
+    # A dead owned reviewer without a terminal call rejected no candidate and
+    # proved no success. Return that failure through native bounded rework
+    # before the generic protocol breaker loses the owned review run identity.
+    # No PID is terminated here; host, launch grace and process identity apply.
+    from hermes_cli.kanban_operator import return_owned_review_failure, policy, repair_authority, repair_contract
+    cfg=policy(conn)
+    for row in conn.execute("SELECT id,current_run_id,worker_pid,worker_started_at,claim_lock,assignee,"
+                            "(SELECT started_at FROM task_runs WHERE id=tasks.current_run_id) AS run_started_at "
+                            "FROM tasks WHERE status='running' AND created_by='operator-repair' AND worker_pid IS NOT NULL").fetchall():
+        if not cfg.get('enabled') or _kb._retry_status_for_run(conn,row['id'])!='review':
+            continue
+        authority=repair_authority(conn,row['id'])
+        contract,failure=repair_contract(conn,row['id']) if authority else (None,None)
+        if not authority or authority['event']['task_id'] not in cfg.get('cohort_task_ids',[]) or not contract or failure:
+            continue
+        if not (row['claim_lock'] or '').startswith(_kb._host_prefix()):
+            continue
+        if row['run_started_at'] is not None and time.time()-row['run_started_at']<_kb._resolve_crash_grace_seconds():
+            continue
+        if _worker_alive(row['worker_pid'],row['worker_started_at']):
+            continue
+        dead=_classify_dead_worker(int(row['worker_pid']),row['claim_lock'],task_id=row['id'],board=board)
+        if not dead.protocol_violation:
+            continue
+        returned=return_owned_review_failure(conn,row['id'],dead.error_text,expected_run_id=row['current_run_id'],source='worker_protocol')
+        if not returned:
+            continue
+        with _kb.write_txn(conn):
+            _kb._append_event(conn,row['id'],'protocol_violation',dict(dead.event_payload,owned_review_rework=True),run_id=row['current_run_id'])
+        sweep.crashed.append(row['id'])
+        sweep.exited_hook_payloads.append({'task_id':row['id'],'assignee':row['assignee'],'run_id':row['current_run_id'],
+            'worker_pid':row['worker_pid'],'exit_kind':dead.kind,'exit_code':dead.code,'outcome':'changes_requested','retry_status':'ready'})
     with _kb.write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, "
