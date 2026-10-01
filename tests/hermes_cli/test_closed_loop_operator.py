@@ -164,6 +164,184 @@ def test_reviewed_repair_resumes_exact_original_task(board,monkeypatch):
     assert kb.get_task(board, tid).status == "ready"
 
 
+def _owned_repair_candidate(board,monkeypatch):
+    tid=kb.create_task(board,title='failed genuine work',assignee='pilot',user_origin={'platform':'discord','chat_id':'channel','message_id':'message','user_id':'harry','text':entry()['message']})
+    kb.claim_task(board,tid)
+    dispatch._record_task_failure(board,tid,'controlled crash',outcome='crashed',failure_limit=1,release_claim=True,end_run=True)
+    settings={'enabled':True,'attempt_seconds':120}
+    operator.reconcile(board,settings=settings)
+    monkeypatch.setattr(operator,'policy',lambda conn:settings)
+    repair=board.execute("SELECT id FROM tasks WHERE created_by='operator-repair'").fetchone()[0]
+    build=kb.claim_task(board,repair)
+    assert kb.request_review(board,repair,reviewer='reviewer',summary='candidate',expected_run_id=build.current_run_id)
+    return tid,repair,kb.claim_review_task(board,repair),settings
+
+
+def test_repair_wrong_ownership_rejects_native_completion_and_reworks(board,monkeypatch):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    with kb.write_txn(board):
+        board.execute("UPDATE tasks SET block_kind='needs_input' WHERE id=?",(tid,))
+    operator.reconcile(board,settings=settings)
+    assert not kb.complete_task(board,repair,result='All tests pass: needs_input',expected_run_id=review.current_run_id,
+                                metadata={'acceptance_receipts':['SQL query passes']})
+    assert kb.get_task(board,repair).status=='ready'
+    assert kb.get_task(board,repair).assignee=='pilot'
+    assert kb.get_task(board,tid).block_kind=='dependency'
+    assert operator._last(board,repair,'completed') is None
+    change=operator._payload(operator._last(board,repair,'changes_requested'))
+    assert 'native authority contract' in change['reason']
+    lines=[];kb._ctx_header(lines,board,kb.get_task(board,repair))
+    assert entry()['message'] in '\n'.join(lines)
+    assert tid in '\n'.join(lines)
+
+
+def test_repair_authority_rechecked_after_external_acceptance_collection(board,monkeypatch):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    def race(*args):
+        with kb.write_txn(board):
+            board.execute("UPDATE tasks SET block_kind='needs_input' WHERE id=?",(tid,))
+        return None
+    monkeypatch.setattr('hermes_cli.kanban_pr_acceptance_store.prepare_acceptance',race)
+    with pytest.raises(ValueError,match='native authority contract'):
+        kb.complete_task(board,repair,result='passed',expected_run_id=review.current_run_id,
+                         metadata={'acceptance_receipts':{'reproduction':'passed'}})
+    assert kb.get_task(board,repair).status=='running'
+    assert operator._last(board,repair,'completed') is None
+
+
+def test_native_repair_contract_is_machine_created_and_resume_is_exact(board,monkeypatch):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    assert kb.complete_task(board,repair,result='original transition reproduced',expected_run_id=review.current_run_id,
+                            metadata={'acceptance_receipts':{'reproduction':'passed'},'operator_repair_contract':{'owner':'harry'}})
+    receipt=operator._payload(operator._last(board,repair,'completed'))['operator_repair_contract']
+    assert receipt['owner']=='agent'
+    assert receipt['original_task_id']==tid
+    assert receipt['origin_message_id']==entry()['message_id']
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,tid).status=='ready'
+
+
+def test_agent_question_answer_cannot_become_harry_confirmation(board,monkeypatch):
+    monkeypatch.setattr(operator,'policy',lambda conn:{'enabled':True})
+    tid=kb.create_task(board,title='reasoning interface',assignee='pilot',user_origin={'platform':'discord','chat_id':'channel','message_id':'reason','user_id':'harry','text':'Make dash a reasoning partner'})
+    build=kb.claim_task(board,tid)
+    kb.add_comment(board,tid,author='default',body='AGENT[agent][q_28089d279474ab74]: It reasons like Discord now')
+    kb.add_comment(board,tid,author='default',body='HARRY[q_unrelated]: That other item works')
+    assert kb.request_review(board,tid,reviewer='reviewer',summary='candidate',expected_run_id=build.current_run_id)
+    review=kb.claim_review_task(board,tid)
+    assert not kb.complete_task(board,tid,result='Harry confirmed it on the live system',expected_run_id=review.current_run_id,
+                                metadata={'acceptance_receipts':['Stored answer and185seconds means genuine user interaction']})
+    assert kb.get_task(board,tid).status=='ready'
+    assert 'False human acceptance' in operator._payload(operator._last(board,tid,'changes_requested'))['reason']
+    assert operator._last(board,tid,'completed') is None
+    assert operator._last(board,tid,'result_receipt') is None
+    assert operator.agent_answer_claim_failure(board,tid,'Objective source and serving mode verified; human confirmation unobserved') is None
+    assert operator.agent_answer_claim_failure(board,tid,"Harry's confirmation remains unobserved") is None
+    assert operator.agent_answer_claim_failure(board,tid,'No authenticated Harry confirmation; source verified') is None
+    kb.add_comment(board,tid,author='default',body='HARRY[q_28089d279474ab74]: I tested that exact change')
+    assert operator.agent_answer_claim_failure(board,tid,'Harry confirmed this change') is None
+    assert operator._last(board,tid,'result_receipt') is None
+
+
+def test_completed_false_human_acceptance_gets_one_bounded_corrective_review(board,monkeypatch):
+    tid=kb.create_task(board,title='legacy wrong acceptance',assignee='reviewer',user_origin={'platform':'discord','chat_id':'c','message_id':'bad','user_id':'harry','text':'Make dash reason with me'})
+    kb.claim_task(board,tid)
+    assert kb.complete_task(board,tid,result='Harry confirmed it works')
+    kb.add_comment(board,tid,author='default',body='AGENT[agent][q_old]: It reasons like Discord now')
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'operator_acceptance_recovery',{'due_at':1,'owner':'agent'})
+    settings={'enabled':True,'cohort_task_ids':[tid],'acceptance_recheck_assignee':'pilot','attempt_seconds':120}
+    monkeypatch.setattr(operator,'policy',lambda conn:settings)
+    operator.reconcile(board,settings=settings,now=100)
+    assert kb.get_task(board,tid).status=='review'
+    assert kb.get_task(board,tid).assignee=='pilot'
+    assert operator._payload(operator._last(board,tid,'operator_acceptance_recovery'))['due_at']==220
+    operator.reconcile(board,settings=settings,now=219)
+    assert kb.get_task(board,tid).status=='review'
+    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_acceptance_invalidated'",(tid,)).fetchone()[0]==1
+    operator.reconcile(board,settings=settings,now=220)
+    assert kb.get_task(board,tid).status=='blocked'
+    assert kb.get_task(board,tid).block_kind!='needs_input'
+    assert operator._last(board,tid,'result_receipt') is None
+
+
+def test_repair_cannot_wait_on_its_own_verification_descendant(board,monkeypatch):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    assert kb.request_changes(board,repair,reason='Reproduce the real outcome',expected_run_id=review.current_run_id)[0]
+    build=kb.claim_task(board,repair)
+    child=kb.create_task(board,title='verification child',assignee='reviewer',parents=[repair])
+    with pytest.raises(ValueError,match='verification descendant'):
+        kb.block_task(board,repair,reason='Wait for '+child+' to verify',kind='dependency',expected_run_id=build.current_run_id)
+    assert kb.get_task(board,repair).status=='running'
+    assert kb.get_task(board,child).status=='todo'
+
+
+def test_existing_circular_repair_hold_gets_one_bounded_review(board,monkeypatch):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    assert kb.request_changes(board,repair,reason='Correct candidate',expected_run_id=review.current_run_id)[0]
+    build=kb.claim_task(board,repair)
+    kb.save_task_checkpoint(board,repair,expected_run_id=build.current_run_id,progress={'fault_reproduced':'native circular verification hold','next':'independent review existing changed evidence'})
+    child=kb.create_task(board,title='verification child',assignee='reviewer',parents=[repair])
+    monkeypatch.setattr(operator,'policy',lambda conn:{'enabled':False})
+    assert kb.block_task(board,repair,reason='Wait for '+child+' to verify',kind='dependency',expected_run_id=build.current_run_id)
+    with kb.write_txn(board):
+        board.execute("UPDATE tasks SET block_kind='dependency' WHERE id=?",(repair,))
+    settings['acceptance_recheck_assignee']='reviewer'
+    monkeypatch.setattr(operator,'policy',lambda conn:settings)
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,repair).status=='review',operator._payload(operator._last(board,repair,'operator_exception'))
+    assert kb.get_task(board,repair).assignee=='reviewer'
+    first=operator._payload(operator._last(board,repair,'operator_agent_review_handoff'))
+    operator.reconcile(board,settings=settings,now=first['due_at']-1)
+    assert kb.get_task(board,repair).status=='review'
+    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_agent_dependency_review_handoff'",(repair,)).fetchone()[0]==1
+    operator.reconcile(board,settings=settings,now=first['due_at'])
+    assert kb.get_task(board,repair).status=='blocked'
+    assert kb.get_task(board,tid).block_kind=='dependency'
+
+
+def test_original_deadline_stops_idle_work_and_creates_one_owned_repair(board,monkeypatch):
+    tid=kb.create_task(board,title='overdue real request',assignee='pilot',user_origin={'platform':'discord','chat_id':'c','message_id':'overdue','user_id':'harry','text':'Do this work'})
+    with kb.write_txn(board):
+        board.execute('UPDATE tasks SET created_at=100 WHERE id=?',(tid,))
+    settings={'enabled':True,'attempt_seconds':60,'request_seconds':120,'cohort_task_ids':[tid]}
+    monkeypatch.setattr(operator,'policy',lambda conn:settings)
+    operator.reconcile(board,settings=settings,now=220)
+    assert kb.get_task(board,tid).status=='blocked'
+    assert kb.get_task(board,tid).block_kind=='dependency'
+    assert operator._payload(operator._last(board,tid,'operator_request_stopped'))['due_at']==220
+    assert operator._last(board,tid,'operator_repair_created') is not None
+    operator.reconcile(board,settings=settings,now=221)
+    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_repair_created'",(tid,)).fetchone()[0]==1
+
+
+def test_verified_late_repair_hands_original_to_acceptance_without_replaying_work(board,monkeypatch):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    assert kb.complete_task(board,repair,result='Transition repaired and independently reproduced',expected_run_id=review.current_run_id,metadata={'acceptance_receipts':{'probe':'reproduced'}})
+    due=operator._payload(operator._last(board,tid,'operator_deadline'))['due_at']
+    operator.reconcile(board,settings=settings,now=due+1)
+    assert kb.get_task(board,tid).status=='review',operator._payload(operator._last(board,tid,'operator_exception'))
+    assert operator._payload(operator._last(board,tid,'operator_repair_verified'))['disposition']=='bounded_original_acceptance'
+    phase=operator._payload(operator._last(board,tid,'operator_acceptance_recovery'))
+    operator.reconcile(board,settings=settings,now=due+2)
+    assert kb.get_task(board,tid).status=='review'
+    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_repair_verified'",(tid,)).fetchone()[0]==1
+    assert phase['due_at']==due+121
+    original_review=kb.claim_review_task(board,tid)
+    assert kb.request_changes(board,tid,reason='Original outcome not yet proved',expected_run_id=original_review.current_run_id)[0]
+    operator.reconcile(board,settings=settings,now=due+3)
+    assert kb.get_task(board,tid).status=='blocked'
+    assert kb.get_task(board,tid).block_kind!='needs_input'
+
+
+def test_unverified_repair_cannot_open_original_acceptance_phase(board,monkeypatch):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    ok,reason=kb.request_review(board,tid,reviewer='reviewer',resume_verified_repair=True,with_reason=True)
+    assert not ok
+    assert 'independently verified native repair' in reason
+    assert kb.get_task(board,tid).status=='blocked'
+
+
 def test_formal_agent_dependency_resumes_without_harry(board):
     parent = kb.create_task(board, title="release", assignee="pilot")
     tid = kb.create_task(board, title="prove live result", assignee="reviewer", parents=[parent])
@@ -398,9 +576,10 @@ def test_historical_review_hold_routes_candidate_to_owned_review_without_accepti
     review=kb.claim_review_task(board,repair)
     with pytest.raises(ValueError,match="acceptance evidence required"):
         kb.complete_task(board,repair,result="Report claims independence",expected_run_id=review.current_run_id)
-    assert kb.complete_task(board,repair,result="Different reviewer reproduced the outcome",expected_run_id=review.current_run_id,metadata={"acceptance_receipts":{"reproduction":"actual controlled probe"}})
-    operator.reconcile(board,settings=settings,now=info["due_at"]+2)
-    assert kb.get_task(board,tid).status == "ready"
+    assert not kb.complete_task(board,repair,result="Different reviewer reproduced the outcome",expected_run_id=review.current_run_id,metadata={"acceptance_receipts":{"reproduction":"actual controlled probe"}})
+    assert kb.get_task(board,repair).assignee=='pilot'
+    assert operator._last(board,repair,'changes_requested') is not None
+    assert kb.get_task(board,tid).status=='blocked'
 
 
 def test_repair_review_has_fixed_separate_deadline_and_no_duplicate_handoff(board,monkeypatch):

@@ -3201,7 +3201,8 @@ def complete_task(
         return False
     from hermes_cli.kanban_operator import policy
     governed = conn.execute("SELECT 1 FROM task_user_origins WHERE task_id=? UNION SELECT 1 FROM tasks WHERE id=? AND created_by='operator-repair'",(task_id,task_id)).fetchone()
-    if policy(conn).get("enabled", False) and governed:
+    operator_guarded=bool(policy(conn).get("enabled", False) and governed)
+    if operator_guarded:
         review = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='review_requested' ORDER BY id DESC LIMIT 1",(task_id,)).fetchone()
         run_id = expected_run_id or _current_run_id(conn,task_id)
         actor = conn.execute("SELECT profile FROM task_runs WHERE id=?",(run_id,)).fetchone() if run_id else None
@@ -3215,6 +3216,23 @@ def complete_task(
         receipts = metadata.get("acceptance_receipts") if isinstance(metadata,dict) else None
         if not isinstance(receipts,(dict,list)) or not receipts:
             raise ValueError("Independent acceptance evidence required: include actual reproduction/probe/source receipts in metadata.acceptance_receipts; a reassuring summary is insufficient.")
+        from hermes_cli.kanban_operator import repair_contract,agent_answer_claim_failure
+        claim_failure=agent_answer_claim_failure(conn,task_id,str(result or '')+' '+str(summary or ''))
+        if claim_failure:
+            accepted,detail=request_changes(conn,task_id,reason=claim_failure,expected_run_id=run_id)
+            if not accepted:
+                raise ValueError(claim_failure+' Native rework refused: '+str(detail))
+            return False
+        contract, failure = repair_contract(conn,task_id)
+        if failure:
+            accepted,detail=request_changes(conn,task_id,reason=failure,expected_run_id=run_id)
+            if not accepted:
+                raise ValueError(failure + ' Native rework refused: ' + str(detail))
+            return False
+        if contract:
+            metadata={**metadata,'operator_repair_contract':contract}
+        elif isinstance(metadata,dict):
+            metadata={k:v for k,v in metadata.items() if k!='operator_repair_contract'}
         if result is None and summary:
             result = summary  # The canonical card result must retain the substantive answer.
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
@@ -3232,6 +3250,14 @@ def complete_task(
     staged_copies: list[Path] = []
     try:
         with write_txn(conn):
+            if operator_guarded:
+                claim_failure=agent_answer_claim_failure(conn,task_id,str(result or '')+' '+str(summary or ''))
+                if claim_failure:
+                    raise ValueError(claim_failure)
+            if operator_guarded and isinstance(metadata,dict) and metadata.get('operator_repair_contract'):
+                current_contract,contract_failure=repair_contract(conn,task_id)
+                if contract_failure or current_contract != metadata['operator_repair_contract']:
+                    raise ValueError(contract_failure or 'Repair authority changed during acceptance; retry owned review before completion.')
             # Hard invariant even for human review approval: a parent may have
             # reopened while this task waited.
             if not _parents_satisfied(conn, task_id):
@@ -3422,6 +3448,8 @@ def _completed_event_payload(
     if isinstance(metadata, dict):
         if metadata.get("acceptance_receipts"):
             payload["acceptance_receipts"] = metadata["acceptance_receipts"]
+        if metadata.get("operator_repair_contract"):
+            payload["operator_repair_contract"] = metadata["operator_repair_contract"]
         cleaned = _cleaned_artifact_paths(metadata)
         if cleaned:
             payload["artifacts"] = cleaned
@@ -3754,11 +3782,14 @@ def block_task(
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
-    if kind == "needs_input":
-        from hermes_cli.kanban_operator import policy
+    if kind in ('needs_input','dependency'):
+        from hermes_cli.kanban_operator import policy,repair_descendant_hold
         repair = conn.execute("SELECT created_by FROM tasks WHERE id=?",(task_id,)).fetchone()
         if repair and repair["created_by"] == "operator-repair" and policy(conn).get("enabled",False):
-            raise ValueError("Agent-owned repair cannot ask Harry: request independent review from a different profile, or record an agent exception with dependency/transient/capability.")
+            if kind=='needs_input':
+                raise ValueError("Agent-owned repair cannot ask Harry: request independent review from a different profile, or record an agent exception with dependency/transient/capability.")
+            if repair_descendant_hold(conn,task_id,reason):
+                raise ValueError('A verification descendant cannot be a repair prerequisite. Request independent review of the candidate through request_review; do not block on its own child or ask Harry.')
     # A worker blocking its own matching run will exit through its in-band
     # lifecycle. Any unowned/operator block must prove the worker tree gone
     # before it may erase the claim.
@@ -3915,6 +3946,7 @@ def request_review(
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
     resume_agent_repair: bool = False,
+    resume_verified_repair: bool = False,
     resume_audited_origin: bool = False,
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
@@ -3968,11 +4000,14 @@ def request_review(
             ).fetchone()
             if trow is None:
                 return _ret(False, "task not found")
+            from hermes_cli.kanban_operator import repair_descendant_hold
+            repair_block=_last_hold(conn,task_id)
+            circular_hold=(trow['block_kind']=='dependency' and repair_block and repair_descendant_hold(conn,task_id,_json_dict(repair_block['payload']).get('reason')))
             repair_handoff = (resume_agent_repair and policy(conn).get("enabled",False) and
                               trow["created_by"]=="operator-repair" and trow["status"]=="blocked" and
-                              trow["block_kind"]=="needs_input" and trow["claim_lock"] is None)
+                              (trow["block_kind"]=="needs_input" or circular_hold) and trow["claim_lock"] is None)
             if resume_agent_repair and not repair_handoff:
-                return _ret(False,"agent review recovery requires an unclaimed operator repair held as needs_input")
+                return _ret(False,"agent review recovery requires an unclaimed operator repair with a human-review misclassification or verified circular descendant hold")
             if repair_handoff and (not reviewer or _canonical_assignee(reviewer)==trow["assignee"]):
                 return _ret(False,"agent repair review requires a different named reviewer")
             origin_policy=policy(conn)
@@ -3981,9 +4016,12 @@ def request_review(
             last_block=_last_hold(conn,task_id)
             audited_hold=(trow["status"] in ('blocked','triage') and last_block and
                           audited_fault.get("blocked_event_id")==last_block["id"] and audited_fault.get("source") and audited_fault.get("reason"))
-            origin_handoff=(resume_audited_origin and origin_policy.get("enabled",False) and origin and
-                            task_id in origin_policy.get("cohort_task_ids",[]) and trow["claim_lock"] is None and
-                            (trow["status"]=='done' or audited_hold))
+            from hermes_cli.kanban_operator import verified_repair_for_original
+            verified_hold=(resume_verified_repair and trow['status']=='blocked' and verified_repair_for_original(conn,task_id))
+            origin_handoff=(origin_policy.get("enabled",False) and origin and trow["claim_lock"] is None and
+                            ((resume_audited_origin and task_id in origin_policy.get("cohort_task_ids",[]) and (trow["status"]=='done' or audited_hold)) or verified_hold))
+            if resume_verified_repair and not origin_handoff:
+                return _ret(False,'original acceptance requires a completed independently verified native repair and an unclaimed blocked original')
             if resume_audited_origin and not origin_handoff:
                 return _ret(False,"origin review recovery requires a completed audited cohort request or an exact declared agent fault; genuine human choices are preserved")
             if origin_handoff and (not reviewer or _canonical_assignee(reviewer)==trow["assignee"]):
@@ -4737,6 +4775,15 @@ def _ctx_header(lines: list[str], conn: sqlite3.Connection, task: Task) -> None:
     lines.append(f"# Kanban task {task.id}: {task.title}")
     origin = conn.execute("SELECT platform,chat_id,message_id,user_id,text FROM task_user_origins WHERE task_id=?",
                           (task.id,)).fetchone()
+    if task.created_by == 'operator-repair':
+        from hermes_cli.kanban_operator import repair_authority
+        authority=repair_authority(conn,task.id)
+        if authority:
+            origin=authority['origin']
+            lines.extend(['## Native repair authority', 'Original task: '+authority['event']['task_id'],
+                          'The durable original request below outranks candidate reports and prior review instructions. Agent deployment, review and reconciliation remain agent-owned. Do not edit original row flags or turn this repair into a Harry question. The native completion gate rejects hold drift and hands it back for bounded rework.'])
+            if not origin and authority['original']:
+                lines.extend(['## Original internal task',_ctx_cap(authority['original']['body'],6000)])
     if origin:
         lines.extend(["## Original authenticated request",
                       _ctx_cap(origin["text"], 6000),

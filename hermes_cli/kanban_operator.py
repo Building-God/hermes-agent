@@ -17,6 +17,81 @@ def _last_hold(conn,task_id):
     return conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind IN ('blocked','block_loop_detected','dependency_wait') ORDER BY id DESC LIMIT 1",(task_id,)).fetchone()
 
 
+def repair_authority(conn, repair_id):
+    """Resolve a repair's original from durable native provenance, never its prose."""
+    rows = conn.execute("SELECT * FROM task_events WHERE kind='operator_repair_created' AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.repair_task_id') END=?",(repair_id,)).fetchall()
+    if len(rows) != 1:
+        return None
+    event = rows[0]
+    original = conn.execute("SELECT * FROM tasks WHERE id=?",(event['task_id'],)).fetchone()
+    origin = conn.execute("SELECT * FROM task_user_origins WHERE task_id=?",(event['task_id'],)).fetchone()
+    return {'event':event,'original':original,'origin':origin}
+
+
+def repair_descendant_hold(conn,repair_id,reason):
+    from hermes_cli import kanban_db as kb
+    return any(ref!=repair_id and kb._would_cycle(conn,ref,repair_id) for ref in set(re.findall(r'\bt_[a-zA-Z0-9]+\b',str(reason or ''))))
+
+
+def verified_repair_for_original(conn,original_id):
+    event=_last(conn,original_id,'operator_repair_created')
+    if not event:
+        return None
+    repair_id=_payload(event).get('repair_task_id')
+    repair=conn.execute('SELECT status FROM tasks WHERE id=?',(repair_id,)).fetchone()
+    completed=_last(conn,repair_id,'completed');review=_last(conn,repair_id,'review_requested')
+    if not repair or repair['status']!='done' or not completed or not review or completed['id']<=review['id']:
+        return None
+    payload=_payload(completed);contract=payload.get('operator_repair_contract') or {}
+    implementer=_payload(review).get('implementer')
+    run=conn.execute('SELECT profile FROM task_runs WHERE id=?',(completed['run_id'],)).fetchone()
+    claim=conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed' ORDER BY id DESC LIMIT 1",(repair_id,completed['run_id'])).fetchone()
+    if not implementer or not isinstance(contract,dict) or contract.get('original_task_id')!=original_id or contract.get('owner')!='agent' or not payload.get('acceptance_receipts') or not run or run['profile']==implementer or not claim or json.loads(claim['payload'] or '{}').get('source_status')!='review':
+        return None
+    return {'repair_task_id':repair_id,'review_run_id':completed['run_id']}
+
+
+def repair_contract(conn, repair_id):
+    """Machine check the owned transition; this is not functional acceptance."""
+    authority=repair_authority(conn,repair_id)
+    if authority is None:
+        return None,None
+    original=authority['original']; event=authority['event']
+    changes=_last(conn,repair_id,'changes_requested')
+    boundary=changes['id'] if changes else event['id']
+    drift=conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='operator_repair_hold_reconciled' AND id>? ORDER BY id DESC LIMIT 1",(event['task_id'],boundary)).fetchone()
+    if original is None or original['status']!='blocked' or original['block_kind']!='dependency' or original['claim_lock'] is not None or drift:
+        return None,('Repair failed its native authority contract: keep the original agent-owned dependency hold until independent acceptance. '
+                     'Do not relabel it needs_input or edit its row directly. Reproduce and repair the original requested outcome; '
+                     'changing ownership flags or asking Harry for deployment/review is not acceptance.')
+    return {'original_task_id':event['task_id'],'fault_event_id':_payload(event).get('fault_event_id'),
+            'origin_message_id':authority['origin']['message_id'] if authority['origin'] else None,
+            'owner':'agent','checks':['original_hold_intact','no_execution_claim','no_hold_drift_this_candidate']},None
+
+
+def agent_answer_claim_failure(conn,task_id,text):
+    """Reject the observed counterexample: agent taps promoted to Harry proof.
+
+    This guards explicit Harry confirmation/testing claims, not all prose truth.
+    Transport receipt remains a separate authenticated result-reply event.
+    """
+    prose=re.sub(r"\bHarry(?:'s)?\s+(?:authenticated\s+)?confirmation\s+(?:(?:is|remains|was)\s+)?(?:unobserved|unproved|unverified|missing)\b",'',str(text or ''),flags=re.I)
+    prose=re.sub(r"\b(?:no|without)\s+(?:authenticated\s+)?Harry(?:'s)?\s+confirmation\b",'',prose,flags=re.I)
+    if not re.search(r"\bHarry(?:'s)?\s+(?:authenticated\s+)?(?:confirm(?:ed|ation)|tested|said|answered)\b",prose,re.I):
+        return None
+    comments=conn.execute("SELECT body FROM task_comments WHERE task_id=? AND (body LIKE 'AGENT[%' OR body LIKE 'HARRY[%')",(task_id,)).fetchall()
+    agent_questions=set()
+    for row in comments:
+        if row['body'].startswith('AGENT['):
+            agent_questions.update(re.findall(r'q_[a-zA-Z0-9]+',row['body']))
+    human_questions={qid for row in comments for qid in re.findall(r'^HARRY\[(q_[a-zA-Z0-9]+)\]:',row['body'])}
+    if agent_questions - human_questions:
+        return ('False human acceptance: this task has agent-labeled question answers and no authenticated Harry confirmation. '
+                'Do not promote an AGENT tap, elapsed time, successful send or stored answer into Harry proof. '
+                'Retain objective reproduction and correct the result; human acceptance and result receipt stay unobserved.')
+    return None
+
+
 def policy(conn=None) -> dict:
     """Lifecycle policy belongs to the bound board, independent of worker profile.
 
@@ -110,6 +185,36 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
     runtime = max(60, int(cfg.get("attempt_seconds", 900)))
     deadline = max(runtime, int(cfg.get("request_seconds", 7200)))
     actions = []
+    try:
+        from hermes_cli.kanban_release_entrypoint import reconcile_entrypoint
+        release_action=reconcile_entrypoint(cfg.get('release_entrypoint'),now=now)
+        if release_action:
+            actions.append(release_action)
+    except Exception as error:
+        actions.append({'exception':'release_entry_reconciliation_failed','owner':'agent','error':type(error).__name__})
+    # Reconcile the observed false acceptance even when an earlier audit phase
+    # completed. One corrective review, bounded independently, preserves effects.
+    for tid in cfg.get('cohort_task_ids',[]):
+        task=kb.get_task(conn,tid)
+        completed=_last(conn,tid,'completed')
+        if not task or task.status!='done' or task.claim_lock or not completed or _last(conn,tid,'operator_acceptance_invalidated'):
+            continue
+        failure=agent_answer_claim_failure(conn,tid,str(task.result or '')+' '+str(_payload(completed).get('summary','')))
+        if not failure:
+            continue
+        try:
+            reviewer=dispatch_owner(conn,cfg.get('acceptance_recheck_assignee','architect'))
+            if reviewer==task.assignee:
+                raise ValueError('corrective acceptance reviewer must differ from the false-claim actor')
+            ok,reason=kb.request_review(conn,tid,reviewer=reviewer,summary=failure+' Independently verify objective outcome and issue a corrected substantive result in the original conversation. Do not repeat external effects.',resume_audited_origin=True,with_reason=True)
+            if not ok:
+                raise ValueError(reason or 'native corrective review refused')
+            with kb.write_txn(conn):
+                kb._append_event(conn,tid,'operator_acceptance_invalidated',{'owner':'agent','source_completed_event_id':completed['id'],'reason':failure,'reviewer':reviewer})
+                kb._append_event(conn,tid,'operator_acceptance_recovery',{'owner':'agent','source_completed_event_id':completed['id'],'due_at':now+runtime,'reviewer':reviewer,'acceptance':'unproved','corrective_review':True})
+            actions.append({'task_id':tid,'false_acceptance_recheck':reviewer})
+        except Exception as error:
+            _exception(conn,tid,'false_acceptance_recovery_failed',error=str(error)[:300])
     # Audit-selected legacy outcomes cannot stay green without acceptance, and
     # an exact diagnosed deployment fault is not a new human choice. This is a
     # single native reviewer handoff; no original external action is replayed.
@@ -136,7 +241,7 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
             actions.append({"task_id":tid,"acceptance_recovery":reviewer})
         except Exception as error:
             _exception(conn,tid,"acceptance_recovery_failed",error=str(error)[:300])
-    for event in conn.execute("SELECT e.* FROM task_events e JOIN tasks t ON t.id=e.task_id WHERE e.kind='operator_acceptance_recovery' AND t.status IN ('review','running')").fetchall():
+    for event in conn.execute("SELECT e.* FROM task_events e JOIN tasks t ON t.id=e.task_id WHERE e.kind='operator_acceptance_recovery' AND t.status IN ('review','running') AND e.id=(SELECT MAX(latest.id) FROM task_events latest WHERE latest.task_id=e.task_id AND latest.kind='operator_acceptance_recovery')").fetchall():
         info=_payload(event);tid=event["task_id"]
         if now < info["due_at"]:
             continue
@@ -154,6 +259,21 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
     # The live pilot mislabeled reviewer approval as Harry input. Repairs are
     # provably agent-owned: hand existing candidate evidence to a real reviewer,
     # never approve it or restart implementation merely to escape the hold.
+    for row in conn.execute("SELECT * FROM tasks WHERE created_by='operator-repair' AND status='blocked' AND block_kind='dependency' AND claim_lock IS NULL").fetchall():
+        tid=row['id'];blocked=_last_hold(conn,tid)
+        if _last(conn,tid,'operator_agent_dependency_review_handoff') or not blocked or not repair_descendant_hold(conn,tid,_payload(blocked).get('reason')):
+            continue
+        try:
+            reviewer=dispatch_owner(conn,cfg.get('acceptance_recheck_assignee','architect'))
+            accepted,reason=kb.request_review(conn,tid,reviewer=reviewer,summary='Circular review hold is agent-owned. A verification descendant cannot be this repair prerequisite. Review the original authenticated outcome and native ownership contract; do not ask Harry or accept relabeling agent work as needs_input.',resume_agent_repair=True,with_reason=True)
+            if not accepted:
+                raise ValueError(reason or 'native circular review recovery refused')
+            with kb.write_txn(conn):
+                kb._append_event(conn,tid,'operator_agent_dependency_review_handoff',{'owner':'agent','source_blocked_event_id':blocked['id'],'reviewer':reviewer,'due_at':now+runtime,'acceptance':'unproved'})
+                kb._append_event(conn,tid,'operator_agent_review_handoff',{'owner':'agent','source_event_id':blocked['id'],'reviewer':reviewer,'due_at':now+runtime,'corrective_review':True,'acceptance':'unproved'})
+            actions.append({'task_id':tid,'circular_review_recovered':reviewer})
+        except Exception as error:
+            _exception(conn,tid,'circular_review_recovery_failed',error=str(error)[:300])
     for row in conn.execute("SELECT * FROM tasks WHERE created_by='operator-repair' AND status='blocked' AND block_kind='needs_input' AND claim_lock IS NULL").fetchall():
         tid=row["id"]; blocked=_last(conn,tid,"blocked")
         try:
@@ -260,6 +380,19 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
                                   "status": row["status"], "assignee": row["assignee"],
                                   "human_choice_pending": row["block_kind"] == "needs_input"})
             actions.append({"task_id": tid, "exception": "request_deadline_exceeded"})
+        acceptance_phase=_last(conn,tid,'operator_acceptance_recovery')
+        bounded_acceptance=acceptance_phase and row['status'] in ('review','running') and now<_payload(acceptance_phase).get('due_at',0)
+        if now>=due and row['status'] in ('ready','running','review') and not bounded_acceptance:
+            if row['status']=='running':
+                stopped=kb.block_task(conn,tid,reason='Agent-owned original request deadline exhausted; do not start another external action.')
+            else:
+                with kb.write_txn(conn):
+                    stopped=conn.execute("UPDATE tasks SET status='blocked',block_kind=NULL WHERE id=? AND status=? AND claim_lock IS NULL",(tid,row['status'])).rowcount>0
+            if stopped:
+                with kb.write_txn(conn):
+                    kb._append_event(conn,tid,'operator_request_stopped',{'owner':'agent','due_at':due})
+                    kb._append_event(conn,tid,'gave_up',{'owner':'agent','error':'Original request deadline exhausted','operator_rework':True,'sticky':True})
+                actions.append({'task_id':tid,'original_deadline_stopped':True})
 
     # Rework deadlines are actionable transitions, not timestamps in a journal.
     for row in conn.execute("SELECT t.* FROM tasks t WHERE t.status IN ('ready','running')").fetchall():
@@ -353,9 +486,31 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
             run = conn.execute("SELECT profile FROM task_runs WHERE id=?", (completed["run_id"],)).fetchone()
             implementer = _payload(reviewed).get("implementer")
             evidence = _payload(completed).get("acceptance_receipts")
+            contract = _payload(completed).get('operator_repair_contract')
             claim = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed' ORDER BY id DESC LIMIT 1",(repair.id,completed["run_id"])).fetchone()
-            if not run or not implementer or run["profile"] == implementer or not evidence or not claim or json.loads(claim["payload"] or "{}").get("source_status") != "review":
+            if not run or not implementer or run["profile"] == implementer or not evidence or not isinstance(contract,dict) or contract.get('original_task_id')!=tid or contract.get('owner')!='agent' or not claim or json.loads(claim["payload"] or "{}").get("source_status") != "review":
                 _exception(conn,tid,"repair_acceptance_unproved",repair_task_id=repair.id)
+                continue
+            if _last(conn,tid,'operator_repair_verified'):
+                continue  # This one repair cannot repeatedly renew original execution.
+            original_deadline=_last(conn,tid,'operator_deadline')
+            if original_deadline and now>=_payload(original_deadline).get('due_at',0):
+                try:
+                    original=kb.get_task(conn,tid)
+                    reviewer=dispatch_owner(conn,cfg.get('review_assignee','reviewer'))
+                    if reviewer==original.assignee:
+                        reviewer=dispatch_owner(conn,cfg.get('acceptance_recheck_assignee','architect'))
+                    with kb.write_txn(conn):
+                        conn.execute("UPDATE tasks SET max_runtime_seconds=MIN(COALESCE(max_runtime_seconds,?),?) WHERE id=? AND status='blocked' AND claim_lock IS NULL",(runtime,runtime,tid))
+                    accepted,reason=kb.request_review(conn,tid,reviewer=reviewer,summary='The bounded agent repair passed native independent acceptance. Verify the original requested outcome against existing effects and repair evidence, and deliver a substantive result. Original execution time is exhausted: do not replay external actions or claim Harry receipt.',resume_verified_repair=True,with_reason=True)
+                    if not accepted:
+                        raise ValueError(reason or 'native original acceptance handoff refused')
+                    with kb.write_txn(conn):
+                        kb._append_event(conn,tid,'operator_repair_verified',{'repair_task_id':repair.id,'review_run_id':completed['run_id'],'disposition':'bounded_original_acceptance'})
+                        kb._append_event(conn,tid,'operator_acceptance_recovery',{'owner':'agent','repair_task_id':repair.id,'reviewer':reviewer,'due_at':now+runtime,'acceptance':'unproved'})
+                    actions.append({'task_id':tid,'verified_repair_acceptance':repair.id})
+                except Exception as error:
+                    _exception(conn,tid,'verified_repair_acceptance_handoff_failed',error=str(error)[:300])
                 continue
             if kb.unblock_task(conn, tid):
                 with kb.write_txn(conn):
