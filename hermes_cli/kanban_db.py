@@ -4106,6 +4106,13 @@ def request_review(
                 implementer = arow["profile"] if arow else None
             if implementer is None and trow["assignee"] != reviewer:
                 implementer = trow["assignee"]
+            if repair_handoff:
+                prior_review=_last(conn,task_id,'review_requested')
+                prior_implementer=_payload(prior_review).get('implementer')
+                if prior_implementer:
+                    implementer=prior_implementer
+                if reviewer==implementer:
+                    return _ret(False,'Corrective repair review must differ from the preserved implementation owner; prior reviewers do not inherit deployment responsibility')
             assignee_sql = ", assignee = ?" if reviewer is not None else ""
             run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
             params: tuple[Any, ...] = (
@@ -4253,8 +4260,11 @@ def request_changes(
         from hermes_cli.kanban_operator import policy
         operator_policy = policy(conn)
         if operator_policy.get("enabled", False):
-            cycles = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='changes_requested'",
-                                  (task_id,)).fetchone()[0]
+            from hermes_cli.kanban_operator import _last as _operator_last
+            phase=_operator_last(conn,task_id,'operator_agent_review_handoff')
+            phase_boundary=phase['id'] if phase else 0
+            cycles = conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='changes_requested' AND id>?",
+                                  (task_id,phase_boundary)).fetchone()[0]
             _append_event(conn, task_id, "operator_rework_due",
                           {"owner": "agent", "implementer": implementer,
                            "review_cycles": cycles, "due_at": int(time.time()) + int(operator_policy.get("rework_seconds", 900))})
