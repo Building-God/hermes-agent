@@ -129,3 +129,14 @@ hand its existing evidence to one bounded original acceptance review through a
 native API guarded by actual repair completion, independent review and machine
 contract provenance. This phase forbids external-action replay. Rejection cannot
 restart expired implementation; the original stays an agent-owned exception.
+
+
+2026-10-01 audited outcome and terminal corrections:
+
+- Deadline and repair-stop receipts fence the central native claim transaction even if queue promotion makes a task ready again. Only a later bounded acceptance handoff may claim review; original effects cannot replay.
+- Genuine originals and operator repairs cannot archive around acceptance. Archival requires owned independent completion and, for an original, matching result delivery. Human receipt remains separate and is not required or inferred.
+- An audited cohort request archived after invalidation is restored to one bounded independent acceptance phase. Its old result and archive reason remain evidence. The deadline is fixed and cannot renew through reconciliation.
+- Native completion context includes bounded declared-request and live-platform facts. A positive overall health claim contradicted by those facts returns to rework. Exact independently audited bad-completion receipts can trigger one corrective review without reclassifying later human choices.
+- These gates prevent observed false claims and state escapes. They do not establish general semantic truth or capability parity; real outcome probes and same-thread readback are still mandatory.
+
+An exact historical repair fault may receive one bounded ownership correction review. Its generated native receipt is explicitly limited to authority; the independent reviewer still owes reproduced functional evidence. The audit must match the latest hold/rejection, preserve the original dependency fence, and cannot authorize another implementation run.

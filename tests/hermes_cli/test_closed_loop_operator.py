@@ -1,6 +1,7 @@
 """Controlled failure drills using actual board APIs and isolated Hermes homes."""
 import json
 import pytest
+from hermes_cli import kanban_acceptance_truth as truth
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_dispatch as dispatch
@@ -28,6 +29,144 @@ def board(tmp_path, monkeypatch):
 def entry():
     return dict(platform="discord", conversation_id="channel", thread_id="thread", user_id="harry",
                 message_id="message", message="Produce the weekly briefing", idempotency_key="discord:channel:message")
+
+
+def accepted_origin(board, monkeypatch, text="Independently verified result"):
+    tid=kb.create_task(board,title="real outcome",assignee="pilot",user_origin={"platform":"discord","chat_id":"c","message_id":"audit","user_id":"harry","text":"Explain the result"})
+    settings={"enabled":True,"cohort_task_ids":[tid],"acceptance_recheck_assignee":"pilot"}
+    monkeypatch.setattr(operator,"policy",lambda conn:settings)
+    worker=kb.claim_task(board,tid)
+    assert kb.request_review(board,tid,reviewer="reviewer",expected_run_id=worker.current_run_id)
+    reviewer=kb.claim_review_task(board,tid)
+    assert kb.complete_task(board,tid,result=text,expected_run_id=reviewer.current_run_id,metadata={"acceptance_receipts":{"probe":"actual source and live result reproduced"}})
+    return tid,settings
+
+
+def test_global_health_claim_requires_request_outcomes_not_board_counts(board,monkeypatch):
+    other=kb.create_task(board,title="failed request",assignee="pilot")
+    assert kb.block_task(board,other,kind="capability",reason="agent-owned repair pending")
+    settings={"enabled":True,"cohort_task_ids":[other]}
+    assert truth.completion_failure(board,"current","System is OPERATIONAL & HEALTHY",settings)
+    assert truth.completion_failure(board,"current","No silent failures",settings)
+    assert truth.completion_failure(board,"current","One request remains blocked on an agent repair; human receipt is unobserved.",settings) is None
+    snapshot=truth.health_snapshot(board,settings)
+    assert snapshot['requests'][0]['unresolved_agent_fault']
+    assert snapshot['human_result_receipt']=='separate; not inferred'
+
+
+def test_archive_cannot_discard_failed_request_to_stop_churn(board,monkeypatch):
+    tid=ensure_continuation(entry())
+    monkeypatch.setattr(operator,"policy",lambda conn:{"enabled":True,"cohort_task_ids":[tid]})
+    assert kb.block_task(board,tid,kind="capability",reason="agent review failed")
+    with pytest.raises(ValueError,match="Archival cannot bypass"):
+        kb.archive_task(board,tid,reason="Stop deadline churn")
+    assert kb.get_task(board,tid).status=='blocked'
+
+
+def test_archive_requires_same_origin_delivery_but_not_human_receipt(board,monkeypatch):
+    tid,settings=accepted_origin(board,monkeypatch)
+    complete=operator._last(board,tid,'completed')
+    with pytest.raises(ValueError,match="same-thread delivery"):
+        kb.archive_task(board,tid)
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'result_delivered',{'event_id':complete['id'],'platform':'discord','chat_id':'wrong'})
+    with pytest.raises(ValueError,match="same-thread delivery"):
+        kb.archive_task(board,tid)
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'result_delivered',{'event_id':complete['id'],'platform':'discord','chat_id':'c'})
+    kb.archive_task(board,tid)
+    assert kb.get_task(board,tid).status=='archived'
+    assert operator._last(board,tid,'result_receipt') is None
+
+
+def test_native_claim_fence_survives_explicit_queue_promotion(board,monkeypatch):
+    tid=ensure_continuation(entry())
+    monkeypatch.setattr(operator,"policy",lambda conn:{"enabled":True})
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'operator_request_stopped',{'owner':'agent','due_at':1})
+    assert kb.block_task(board,tid,kind="capability",reason="deadline exhausted")
+    assert kb.unblock_task(board,tid)
+    before=board.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=?',(tid,)).fetchone()[0]
+    assert kb.claim_task(board,tid) is None
+    assert board.execute('SELECT COUNT(*) FROM task_runs WHERE task_id=?',(tid,)).fetchone()[0]==before
+
+
+def test_stopped_repair_cannot_be_claimed_after_auto_unblock(board,monkeypatch):
+    tid=kb.create_task(board,title="bounded repair",assignee="pilot",created_by="operator-repair")
+    monkeypatch.setattr(operator,"policy",lambda conn:{"enabled":True})
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'operator_repair_stopped',{'owner':'agent','due_at':1})
+    assert kb.block_task(board,tid,kind="capability",reason="repair deadline exhausted")
+    assert kb.unblock_task(board,tid)
+    assert kb.claim_task(board,tid) is None
+
+
+def test_declared_bad_completion_gets_exact_once_corrective_review(board,monkeypatch):
+    tid,settings=accepted_origin(board,monkeypatch)
+    completed=operator._last(board,tid,'completed')
+    settings['agent_owned_faults']={tid:{'completed_event_id':completed['id'],'source':'independent audit','reason':'Board totals were falsely presented as overall health'}}
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,tid).status=='review'
+    due=operator._payload(operator._last(board,tid,'operator_acceptance_recovery'))['due_at']
+    operator.reconcile(board,settings=settings)
+    assert operator._payload(operator._last(board,tid,'operator_acceptance_recovery'))['due_at']==due
+    reviewer=kb.claim_review_task(board,tid)
+    assert kb.complete_task(board,tid,result="Qualified answer with concrete unresolved agent faults",expected_run_id=reviewer.current_run_id,metadata={'acceptance_receipts':{'audit':'reproduced live faults'}})
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,tid).status=='done'
+
+
+def test_historical_invalidated_archive_gets_one_bounded_acceptance_phase(board,monkeypatch):
+    tid,settings=accepted_origin(board,monkeypatch)
+    completed=operator._last(board,tid,'completed')
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'operator_acceptance_invalidated',{'source_completed_event_id':completed['id'],'reason':'false human confirmation'})
+        board.execute("UPDATE tasks SET status='archived' WHERE id=?",(tid,))
+        kb._append_event(board,tid,'archived',{'reason':'legacy bypass'})
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,tid).status=='review'
+    recovery=operator._last(board,tid,'operator_acceptance_recovery')
+    assert operator._last(board,tid,'operator_terminal_review_handoff')
+    assert kb.claim_review_task(board,tid) is not None
+    operator.reconcile(board,settings=settings)
+    assert operator._last(board,tid,'operator_acceptance_recovery')['id']==recovery['id']
+    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_terminal_recovered'",(tid,)).fetchone()[0]==1
+
+
+def test_audited_repair_authority_fault_has_fixed_review_not_execution_replay(board,monkeypatch):
+    tid=kb.create_task(board,title='Original authorized outcome',assignee='pilot',user_origin={'platform':'discord','chat_id':'c','message_id':'repair-audit','user_id':'harry','text':'Repair the original outcome'})
+    kb.claim_task(board,tid)
+    dispatch._record_task_failure(board,tid,'controlled crash',outcome='crashed',failure_limit=1,release_claim=True,end_run=True)
+    settings={'enabled':True,'cohort_task_ids':[tid],'acceptance_recheck_assignee':'reviewer','attempt_seconds':120}
+    operator.reconcile(board,settings=settings)
+    repair=operator._payload(operator._last(board,tid,'operator_repair_created'))['repair_task_id']
+    assert kb.block_task(board,repair,kind='capability',reason='A profile routing decision is needed before agent deployment')
+    hold=operator._last_hold(board,repair)
+    settings['audited_repair_faults']={repair:{'event_id':hold['id'],'source':'independent exact audit','reason':'Deployment is already authorized; routing belongs to the agent'}}
+    monkeypatch.setattr(operator,'policy',lambda conn:settings)
+    with kb.write_txn(board):
+        kb._append_event(board,repair,'operator_repair_stopped',{'due_at':1,'owner':'agent'})
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,repair).status=='review'
+    handoff=operator._last(board,repair,'operator_authority_review_handoff')
+    assert operator._payload(handoff)['due_at']>hold['created_at']
+    assert kb.claim_review_task(board,repair)
+    operator.reconcile(board,settings=settings)
+    assert operator._last(board,repair,'operator_authority_review_handoff')['id']==handoff['id']
+    assert kb.get_task(board,tid).status=='blocked'
+    assert kb.get_task(board,tid).block_kind=='dependency'
+
+
+def test_stale_repair_audit_does_not_override_a_later_fault(board,monkeypatch):
+    tid,repair,info,settings=historical_repair_review_hold(board)
+    hold=operator._last_hold(board,repair)
+    settings.update(cohort_task_ids=[tid],audited_repair_faults={repair:{'event_id':hold['id'],'source':'audit','reason':'old agent fault'}})
+    assert kb.unblock_task(board,repair)
+    assert kb.block_task(board,repair,kind='capability',reason='New independently observed credentials failure')
+    monkeypatch.setattr(operator,'policy',lambda conn:settings)
+    operator.reconcile(board,settings=settings)
+    assert operator._last(board,repair,'operator_authority_review_handoff') is None
+    assert kb.get_task(board,repair).status=='blocked'
 
 
 def test_deadline_creates_owned_runnable_task_and_exact_route_once(board):
@@ -94,7 +233,7 @@ def test_total_repair_deadline_stops_new_attempts_without_harry_input(board):
     due=operator._payload(operator._last(board,tid,"operator_repair_created"))["due_at"]
     operator.reconcile(board,settings=settings,now=due)
     assert kb.get_task(board,repair).status == "blocked"
-    assert kb.get_task(board,repair).block_kind is None
+    assert kb.get_task(board,repair).block_kind == 'capability'
     assert kb.get_task(board,tid).status == "blocked"
     operator.reconcile(board,settings=settings,now=due+60)
     assert dispatch.dispatch_once(board,dry_run=True).spawned == []
