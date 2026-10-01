@@ -97,7 +97,7 @@ def add_notify_sub(
     # delivery mechanism at all. Explicit modes still win.
     insert_mode = valid_mode or ("notify+wake" if platform == "api_server" else "notify")
     key = _sub_key(task_id, platform, chat_id, thread_id)
-    with _kb.write_txn(conn):
+    with _kb.write_txn(conn, allow_nested=True):
         existing = conn.execute(
             "SELECT delivery_metadata FROM kanban_notify_subs " + _SUB_KEY_WHERE,
             key,
@@ -209,13 +209,13 @@ def count_notify_subs(
     chat_id: Optional[str] = None,
     thread_id: Optional[str] = None,
 ) -> int:
-    """Count ``kanban_notify_subs`` rows via a read-only connection — the
+    """Count ``kanban_notify_subs`` rows via a read-only connection - the
     notifier's cheap zero-subscription early exit. Unlike :func:`connect` it
     never creates the file, runs init/migration or opens writable; WAL rows are
     still visible so a fresh sub is never missed. Missing DB / missing table
     counts as zero; platform matches case-insensitively (as notifier routing),
     chat/thread exactly. Raises :class:`sqlite3.Error` if the DB exists but is
-    unreadable — callers pick their own fallback.
+    unreadable - callers pick their own fallback.
     """
     path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
     if not path.exists():
@@ -275,15 +275,15 @@ def purge_stale_done_notify_subs(conn: sqlite3.Connection, *, max_age_days: int 
     Subs survive ``done`` because a reopened task must still notify its origin,
     which accumulates forever on never-archiving boards. ``blocked`` is
     abandoned (unlike ``backlog``/``ready``) so it reaps on the same clock. Age
-    = latest event, else ``completed_at``, else ``created_at`` — any activity,
+    = latest event, else ``completed_at``, else ``created_at`` - any activity,
     including a reopen, exempts the sub.
 
     The notifier keeps subscriptions alive through ``done`` because a completed task can be reopened (review
     corrections, continuation) and the reopened cycle must still notify its origin session. On boards that
-    never archive, that retention would otherwise accumulate subscription rows forever — each one scanned
+    never archive, that retention would otherwise accumulate subscription rows forever - each one scanned
     every notifier tick. This GC bounds that: a task that has been ``done`` with no new events for the
     retention window is treated as settled and its subscriptions are purged. ``blocked`` tasks
-    (circuit-breaker trips, dead workers) are reaped on the same clock — they are abandoned, not idle,
+    (circuit-breaker trips, dead workers) are reaped on the same clock - they are abandoned, not idle,
     unlike a ``backlog``/``ready`` card that is merely waiting for pickup (#100955).
     """
     try:
@@ -407,15 +407,96 @@ def advance_notify_cursor(
 
 def record_notify_ping(
     conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
-    thread_id: Optional[str] = None, event_id: int,
+    thread_id: Optional[str] = None, event_id: int, message_id: Optional[str] = None,
 ) -> None:
     """Checkpoint a sent ping independently of the retryable wake cursor."""
     with _kb.write_txn(conn):
+        row = conn.execute("SELECT last_ping_event_id FROM kanban_notify_subs " + _SUB_KEY_WHERE,
+                           _sub_key(task_id, platform, chat_id, thread_id)).fetchone()
         conn.execute(
             "UPDATE kanban_notify_subs SET last_ping_event_id = MAX(last_ping_event_id, ?) "
             + _SUB_KEY_WHERE,
             (int(event_id), *_sub_key(task_id, platform, chat_id, thread_id)),
         )
+        if row and row["last_ping_event_id"] < event_id:
+            _kb._append_event(conn, task_id, "result_transport_sent",
+                              {"event_id": event_id, "platform": platform, "chat_id": chat_id,
+                               "thread_id": thread_id or "", "message_id": message_id,
+                               "human_receipt": "unobserved"})
+
+
+def record_notify_artifacts(conn, *, task_id, platform, chat_id, thread_id=None, event_id, artifacts=None):
+    with _kb.write_txn(conn):
+        row = conn.execute("SELECT last_artifact_event_id FROM kanban_notify_subs " + _SUB_KEY_WHERE,
+                           _sub_key(task_id, platform, chat_id, thread_id)).fetchone()
+        conn.execute("UPDATE kanban_notify_subs SET last_artifact_event_id=MAX(last_artifact_event_id,?), "
+                     "delivery_failures=0, retry_after=0 " + _SUB_KEY_WHERE,
+                     (event_id, *_sub_key(task_id, platform, chat_id, thread_id)))
+        if row and row["last_artifact_event_id"] < event_id:
+            _kb._append_event(conn, task_id, "result_delivered",
+                              {"event_id":event_id, "platform":platform, "chat_id":chat_id,
+                               "thread_id":thread_id or "", "artifacts":artifacts or [],
+                               "human_receipt":"unobserved"})
+
+
+def record_delivery_failure(conn, *, task_id, platform, chat_id, thread_id=None, phase="delivery"):
+    with _kb.write_txn(conn):
+        key = _sub_key(task_id, platform, chat_id, thread_id)
+        row = conn.execute("SELECT delivery_failures FROM kanban_notify_subs " + _SUB_KEY_WHERE, key).fetchone()
+        if not row:
+            return
+        failures = int(row["delivery_failures"]) + 1
+        due = int(time.time()) + min(300, 10 * 2 ** min(failures - 1, 5))
+        conn.execute("UPDATE kanban_notify_subs SET delivery_failures=?,retry_after=? " + _SUB_KEY_WHERE,
+                     (failures, due, *key))
+        _kb._append_event(conn, task_id, "result_delivery_failed",
+                          {"platform":platform, "chat_id":chat_id, "thread_id":thread_id or "",
+                           "phase":phase, "failures":failures, "retry_at":due, "owner":"agent"})
+
+
+def record_result_reply(conn, *, platform, chat_id, thread_id, user_id, message_id,
+                        reply_to_message_id, internal=False) -> list[str]:
+    """An authenticated reply to the exact delivered result is receipt evidence,
+    not acceptance. Internal wakes, wrong users and unrelated turns never count.
+    """
+    if internal or not all((platform, chat_id, user_id, message_id, reply_to_message_id)):
+        return []
+    matches = conn.execute(
+        "SELECT e.task_id,e.payload,o.user_id FROM task_events e JOIN task_user_origins o ON o.task_id=e.task_id "
+        "WHERE e.kind='result_transport_sent' AND json_extract(e.payload,'$.message_id')=?",
+        (str(reply_to_message_id),),
+    ).fetchall()
+    received = []
+    for row in matches:
+        payload = json.loads(row["payload"])
+        if (payload.get("platform"), payload.get("chat_id"), payload.get("thread_id", ""), row["user_id"]) != (
+            platform, str(chat_id), str(thread_id or ""), str(user_id)):
+            continue
+        target = conn.execute("SELECT kind FROM task_events WHERE id=?", (payload["event_id"],)).fetchone()
+        if not target or target["kind"] != "completed":
+            continue
+        with _kb.write_txn(conn):
+            prior = conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='result_receipt' "
+                                 "AND json_extract(payload,'$.message_id')=?", (row["task_id"], str(message_id))).fetchone()
+            if not prior:
+                _kb._append_event(conn, row["task_id"], "result_receipt",
+                                  {"event_id":payload["event_id"], "platform":str(platform), "chat_id":str(chat_id),
+                                     "thread_id":str(thread_id or ""), "message_id":str(message_id), "reply_to_message_id":str(reply_to_message_id),
+                                   "user_id":str(user_id), "kind":"replied_to_result", "acceptance":"unobserved"})
+        received.append(row["task_id"])
+    return received
+
+
+def record_inbound_result_reply(event, source):
+    conn = _kb.connect()
+    try:
+        record_result_reply(conn, platform=getattr(source.platform, "value", str(source.platform)),
+                            chat_id=source.chat_id, thread_id=getattr(source,"thread_id",None),
+                            user_id=source.user_id, message_id=getattr(event,"message_id",None),
+                            reply_to_message_id=getattr(event,"reply_to_message_id",None),
+                            internal=getattr(event,"internal",False))
+    finally:
+        conn.close()
 
 
 def rewind_notify_cursor(

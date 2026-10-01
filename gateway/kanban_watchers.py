@@ -158,19 +158,25 @@ class GatewayKanbanWatchersMixin:
         """
         raw_paths: list[str] = []
         prose_paths: list[str] = []
+        from gateway.platforms.base import BasePlatformAdapter
+        extract_files = getattr(adapter, "extract_local_files", BasePlatformAdapter.extract_local_files)
         if isinstance(event_payload, dict):
             raw = event_payload.get("artifacts")
             if isinstance(raw, (list, tuple)):
                 raw_paths += [item for item in raw if isinstance(item, str)]
             summary = event_payload.get("summary")
             if isinstance(summary, str) and summary:
-                prose_paths += adapter.extract_local_files(summary)[0]
+                prose_paths += extract_files(summary)[0]
         if task is not None and getattr(task, "result", None):
-            prose_paths += adapter.extract_local_files(str(task.result))[0]
+            prose_paths += extract_files(str(task.result))[0]
         # A staged copy and the scratch original it was copied from are the
         # same deliverable; on a review handoff the original still exists, so
         # prose mentions of it must not upload the file a second time.
         staged_names = {os.path.basename(p) for p in raw_paths}
+        declared_paths = list(raw_paths)
+        missing = [p for p in declared_paths if not os.path.isfile(os.path.expanduser(p))]
+        if missing:
+            raise RuntimeError("declared result artifact is missing")
         raw_paths += [p for p in prose_paths if os.path.basename(p) not in staged_names]
         candidates: list[str] = []
         for path in raw_paths:
@@ -178,12 +184,15 @@ class GatewayKanbanWatchersMixin:
             if expanded and expanded not in candidates and os.path.isfile(expanded):
                 candidates.append(expanded)
         if not candidates:
-            return
+            return []
 
         from gateway.platforms.base import BasePlatformAdapter
-        candidates = BasePlatformAdapter.filter_local_delivery_paths(candidates)
+        allowed = BasePlatformAdapter.filter_local_delivery_paths(candidates)
+        if any(os.path.expanduser(p) not in allowed for p in declared_paths):
+            raise RuntimeError("declared result artifact cannot be delivered by path policy")
+        candidates = allowed
         if not candidates:
-            return
+            return []
 
         from urllib.parse import quote as _quote
 
@@ -191,19 +200,25 @@ class GatewayKanbanWatchersMixin:
         image_paths = [p for p in candidates if Path(p).suffix.lower() in _IMAGE_EXTS]
         other_paths = [p for p in candidates if Path(p).suffix.lower() not in _IMAGE_EXTS]
         if image_paths:
-            try:
-                batch = [(f"file://{_quote(p)}", "") for p in image_paths]
-                await adapter.send_multiple_images(chat_id=chat_id, images=batch, metadata=metadata)
-            except Exception as exc:
-                logger.warning("kanban notifier: image batch upload failed: %s", exc)
+            batch = [(f"file://{_quote(p)}", "") for p in image_paths]
+            result = await adapter.send_multiple_images(chat_id=chat_id, images=batch, metadata=metadata)
+            results = result if isinstance(result, (list, tuple)) else [result]
+            if any(getattr(item, "success", True) is False for item in results):
+                raise RuntimeError("result image delivery failed")
         for path in other_paths:
-            try:
-                if Path(path).suffix.lower() in _VIDEO_EXTS:
-                    await adapter.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
-                else:
-                    await adapter.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
-            except Exception as exc:
-                logger.warning("kanban notifier: artifact upload (%s) failed: %s", path, exc)
+            if Path(path).suffix.lower() in _VIDEO_EXTS:
+                result = await adapter.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
+            else:
+                result = await adapter.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+            if getattr(result, "success", True) is False:
+                raise RuntimeError("result document delivery failed")
+        import hashlib
+        receipts = []
+        for path in candidates:
+            with open(path, "rb") as handle:
+                digest = hashlib.file_digest(handle, "sha256").hexdigest()
+            receipts.append({"filename": Path(path).name, "size": Path(path).stat().st_size, "sha256": digest})
+        return receipts
 
     def _kanban_dispatcher_boot(self) -> Optional[tuple]:
         """Resolve config, kanban_db and the singleton lock; None when the dispatcher must not run.

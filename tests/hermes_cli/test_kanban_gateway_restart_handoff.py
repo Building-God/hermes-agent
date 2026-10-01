@@ -16,6 +16,7 @@ from hermes_cli import kanban_db_dispatch as kbd
 
 @pytest.fixture
 def worker_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, kb.Task]:
+    monkeypatch.setattr(kbd, "_live_worker_procs", {})
     root = tmp_path / ".hermes"
     profile = root / "profiles" / "coder"
     profile.mkdir(parents=True)

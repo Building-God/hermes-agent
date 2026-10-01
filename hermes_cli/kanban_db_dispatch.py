@@ -808,6 +808,11 @@ def _defer_reclaim_for_live_worker(
         payload = {"reason": reason, "claim_lock": claim_lock, "claim_expires_now": grace}
         payload.update(termination)
         _kb._append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+        prior = conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='operator_exception' AND run_id IS ?", (task_id,run_id)).fetchone()
+        if not prior:
+            _kb._append_event(conn,task_id,"operator_exception",
+                {"owner":"agent","reason":"worker_tree_survived_stop", "claim_retained":True,
+                 "duplicate_execution_fenced":True,"repair_due_at":now+300},run_id=run_id)
 
 
 def heartbeat_worker(
@@ -863,6 +868,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_started_at, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
+        "       (SELECT MAX(created_at) FROM task_checkpoints WHERE task_id=t.id AND run_id=r.id) AS progress_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -878,7 +884,14 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         # so retries must be measured from the active task_runs row.
         elapsed = now - int(row["active_started_at"])
         limit = int(row["max_runtime_seconds"])
-        if elapsed < limit:
+        from hermes_cli.kanban_operator import policy
+        operator_policy = policy(conn)
+        progress_limit = int(operator_policy.get("progress_seconds", 0)) if operator_policy.get("enabled", False) else 0
+        progress_at = int(row["progress_at"] or row["active_started_at"])
+        progress_age = now - progress_at
+        stalled = (progress_limit > 0 and progress_age >= progress_limit
+                   and int(row["active_started_at"]) >= int(operator_policy.get("activation_at", 0)))
+        if elapsed < limit and not stalled:
             continue
 
         pid = int(row["worker_pid"])
@@ -889,6 +902,13 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             # it is neither signalled nor released beside (duplicate). It is reclaimed once it exits.
             _kb._log.warning("kanban: task %s worker pid %s exceeded max runtime but has no verified "
                              "identity; not signalled", tid, pid)
+            if not conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='operator_exception' "
+                                "AND run_id=(SELECT current_run_id FROM tasks WHERE id=?)", (tid,tid)).fetchone():
+                with _kb.write_txn(conn):
+                    _kb._append_event(conn, tid, "operator_exception",
+                        {"owner":"agent", "reason":"worker_identity_unverified", "pid":pid,
+                         "claim_retained":True, "duplicate_execution_fenced":True},
+                        run_id=_kb.get_task(conn,tid).current_run_id)
             continue
         # Snapshot and terminate the entire verified worker tree before releasing
         # the claim. A root-only kill can orphan a shell/runtime child and let a
@@ -904,7 +924,8 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
             continue
         killed = bool(termination.get("sigkill"))
 
-        error = f"elapsed {int(elapsed)}s > limit {limit}s"
+        error = (f"no durable checkpoint for {progress_age}s > progress limit {progress_limit}s"
+                 if stalled and elapsed < limit else f"elapsed {int(elapsed)}s > limit {limit}s")
         with _kb.write_txn(conn):
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
@@ -922,6 +943,8 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     "limit_seconds": limit,
                     "sigkill": killed,
                     "retry_status": retry_status,
+                    "timeout_kind": "progress" if stalled and elapsed < limit else "runtime",
+                    "last_durable_progress_at": progress_at,
                 }
                 payload.update(termination)
                 run_id = _kb._end_run(
@@ -1344,7 +1367,8 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee, "
+            "(SELECT MAX(started_at) FROM task_runs WHERE task_id=tasks.id AND status='running') AS run_started_at "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -1355,7 +1379,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 continue
             # Launch-window grace so a freshly-spawned worker isn't reclaimed
             # before its PID is visible on /proc.
-            started_at = _kb._row_get(row, "started_at")
+            started_at = _kb._row_get(row, "run_started_at") or _kb._row_get(row, "started_at")
             if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
                 continue
             if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
@@ -2849,6 +2873,14 @@ def _dispatch_once_locked(
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
     result = DispatchResult()
+    from hermes_cli.kanban_operator import reconcile
+    reconcile(conn, board=board)
+    try:
+        from hermes_constants import get_hermes_home
+        from gateway.front_door_deadline import recover_unowned_intake
+        recover_unowned_intake(get_hermes_home(), board=board)
+    except Exception:
+        _kb._log.exception("deadline intake recovery failed; native dispatch continues")
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,

@@ -567,7 +567,7 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
     fire the same event kind again (e.g. a worker that crashes, gets
     reclaimed, and crashes a second time); the user must hear about the
     second event too. Subscriptions are removed only when the task hits
-    a truly final status (done / archived) — see the comment on
+    a truly final status (done / archived) - see the comment on
     TERMINAL_KINDS in gateway/run.py and PR #21398.
     """
     import hermes_cli.kanban_db as kb
@@ -650,7 +650,7 @@ async def test_notifier_unsubs_after_abnormal_events(kind, kanban_home):
 # tick (`_tick_once_for_board`) used to call `_kb.connect(board=slug)`
 # immediately followed by `_kb.init_db(board=slug)`. Since `connect()`
 # already runs the schema + idempotent migration on first open per process,
-# the explicit `init_db()` was redundant — and worse, `init_db()`
+# the explicit `init_db()` was redundant - and worse, `init_db()`
 # deliberately busts the per-process cache and re-runs the migration on a
 # *second* connection, which races the first.  On legacy DBs this surfaced
 # as `duplicate column name: <col>` (now tolerated by
@@ -803,7 +803,7 @@ async def test_gateway_autosubscribe_roundtrips_user_id_alt_for_session_key(
     ``build_session_key`` keys the participant on ``user_id_alt or user_id``
     (Signal UUID / Feishu union_id carry the canonical participant in the alt
     slot). If the subscription row drops ``user_id_alt``, the replayed source
-    falls back to ``user_id`` and lands in a different session — the woken turn
+    falls back to ``user_id`` and lands in a different session - the woken turn
     answers into a parallel conversation. Drive the real handler and compare the
     key built from the original source with the key rebuilt from the persisted
     row.
@@ -867,14 +867,14 @@ async def test_gateway_autosubscribe_roundtrips_user_id_alt_for_session_key(
         replayed, thread_sessions_per_user=thread_sessions_per_user
     )
     assert original_key == replayed_key
-    # Regression guard: the canonical alt id — not the raw user_id — is what
+    # Regression guard: the canonical alt id - not the raw user_id - is what
     # keys the participant. Proves the alt id actually reached the key.
     assert "union-id" in replayed_key
     assert "open-id" not in replayed_key
 
 
 @pytest.mark.asyncio
-async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_path, monkeypatch):
+async def test_notifier_artifact_delivery_retains_failed_declared_files(kanban_home, tmp_path, monkeypatch):
     """Missing legacy artifact references are skipped, while existing files
     are delivered. Explicit worker artifacts are a stricter completion
     contract and must not contain missing paths."""
@@ -953,14 +953,19 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
             timeout=10.0,
         )
 
-    # Only the real file was uploaded.
-    assert len(documents_uploaded) == 1
-    assert "real.pdf" in documents_uploaded[0]
+    # A declared missing artifact prevents a false delivered receipt. The route survives.
+    assert documents_uploaded == []
+    check = kbc.connect()
+    try:
+        assert check.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='result_delivered'",(tid,)).fetchone()[0] == 0
+        assert check.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id=?",(tid,)).fetchone()[0] == 1
+    finally:
+        check.close()
 
 
 @pytest.mark.asyncio
 async def test_notifier_uploads_review_handoff_artifacts(kanban_home, tmp_path, monkeypatch):
-    """A review handoff's files are uploaded from the durable staged copy —
+    """A review handoff's files are uploaded from the durable staged copy -
     not the scratch original the reviewer's completion is about to delete."""
     import hermes_cli.kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
@@ -1039,7 +1044,7 @@ async def test_notifier_uploads_review_handoff_artifacts(kanban_home, tmp_path, 
 # Migration backfill: pre-delivery_mode gateway subscriptions keep active wake.
 #
 # Before the delivery_mode column existed, the notifier woke the originating
-# session unconditionally whenever the task carried a session_id — so every
+# session unconditionally whenever the task carried a session_id - so every
 # pre-existing gateway subscription had de facto active wake. The column's
 # 'notify' DEFAULT alone would silently disable that on upgrade. The migration
 # backfills first-add rows: gateway platforms -> 'notify+wake', tui -> 'notify'.
@@ -1107,7 +1112,7 @@ def test_migration_backfill_runs_only_on_first_add(kanban_home):
 
 # ---------------------------------------------------------------------------
 # Issue #73030: _inherit_notify_subs (link_tasks / decompose path) must copy
-# EVERY routing column — chat_type, user_id_alt, delivery_mode, and
+# EVERY routing column - chat_type, user_id_alt, delivery_mode, and
 # delivery_metadata. Before the fix it copied only platform/chat/thread/user/
 # profile, so a DM-originated child completion fell back to chat_type='group'
 # and woke a fresh group-scoped session instead of the originating DM, and
@@ -1134,7 +1139,7 @@ def _assert_full_inherited_sub(subs):
     assert s["user_id"] == "user1"
     assert s["user_id_alt"] == "alt-1", "user_id_alt dropped during inheritance"
     assert s["chat_type"] == "dm", (
-        "chat_type dropped during inheritance — wake would key to a "
+        "chat_type dropped during inheritance - wake would key to a "
         "group-scoped session instead of the originating DM (issue #73030)"
     )
     assert s["delivery_mode"] == "notify+wake"
@@ -1153,7 +1158,7 @@ def test_link_tasks_inherits_all_routing_columns(kanban_home):
     try:
         parent = kb.create_task(conn, title="root", assignee=None)
         _add_full_parent_sub(kb, conn, parent)
-        # Pre-existing child, linked after the fact — exercises
+        # Pre-existing child, linked after the fact - exercises
         # _inherit_notify_subs directly (not the create_task parents path).
         child = kb.create_task(conn, title="existing child", assignee="w1")
         kb.link_tasks(conn, parent, child)
@@ -1224,7 +1229,7 @@ def test_gc_purges_stale_done_sub_keeps_fresh_one(kanban_home):
 
         assert purged == 1
         assert kbn.list_notify_subs(conn, stale) == []
-        # A done task inside the retention window keeps its subscription —
+        # A done task inside the retention window keeps its subscription -
         # it may still be reopened for review corrections.
         assert len(kbn.list_notify_subs(conn, fresh)) == 1
     finally:
@@ -1278,7 +1283,7 @@ def test_gc_spares_reopened_task_even_when_old(kanban_home):
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
             kb._append_event(conn, tid, "status", {"status": "ready"})
-        # Backdate the reopen event too — status alone must protect it.
+        # Backdate the reopen event too - status alone must protect it.
         _backdate_task(kb, conn, tid, days=90)
 
         assert kbn.purge_stale_done_notify_subs(conn, max_age_days=30) == 0
