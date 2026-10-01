@@ -279,16 +279,30 @@ class A2AAdapter(BasePlatformAdapter):
         # An explicitly configured interactive client is a transport identity,
         # never proof of a particular human or a result receipt. Only named
         # per-peer credentials qualify; body labels and shared-token IPs do not.
-        interactive=extra.get('interactive_peers')
-        if interactive is None and self._active_profile in ('','default'):
+        a2a_config={}
+        if self._active_profile in ('','default'):
             try:
                 from hermes_cli.config import load_config
-                interactive=((load_config() or {}).get('a2a') or {}).get('interactive_peers',[])
+                a2a_config=(load_config() or {}).get('a2a') or {}
             except Exception:
-                interactive=[]
-        named={name for _token,name in self._security_context.peer_tokens if not name.startswith('ip:')}
+                a2a_config={}
+        interactive=extra.get('interactive_peers',a2a_config.get('interactive_peers',[]))
+        import hmac
+        peers=self._security_context.peer_tokens
+        shared=self._security_context.bearer_token
+        named={name for token,name in peers if token and not name.startswith('ip:')
+               and not (shared and hmac.compare_digest(token,shared))
+               and sum(hmac.compare_digest(token,other) for other,_name in peers)==1}
         configured_interactive=interactive if isinstance(interactive,list) else []
         self._interactive_peers=frozenset(str(name) for name in configured_interactive if str(name) in named)
+        expiries=extra.get('interactive_peer_expires_at',a2a_config.get('interactive_peer_expires_at',{}))
+        self._interactive_expiries=dict(expiries) if isinstance(expiries,dict) else {}
+        identities=extra.get('peer_identities',a2a_config.get('peer_identities',{}))
+        identities=identities if isinstance(identities,dict) else {}
+        self._interactive_identities={peer:dict(identities[peer]) for peer in self._interactive_peers
+                                      if isinstance(identities.get(peer),dict)
+                                      and identities[peer].get('frame')=='operator'
+                                      and str(identities[peer].get('user') or '').strip()}
         # Captured here (construction runs inside _profile_runtime_scope), not read at request time:
         # do_GET/do_POST run on ThreadingHTTPServer's per-connection OS threads, which never inherit
         # the profile scope contextvar (same class as A2A_PORT above).
@@ -548,7 +562,12 @@ class A2AAdapter(BasePlatformAdapter):
         # Independent interactive turns must not exhaust an autonomous
         # ping-pong budget. Rate limits, authentication and task deadlines still
         # apply. Ordinary agents retain the existing context loop limit.
-        turn = 0 if peer in self._interactive_peers else self._turns.track(context_id)
+        interactive=peer in self._interactive_peers
+        expiry=self._interactive_expiries.get(peer)
+        if interactive and expiry is not None:
+            try:interactive=time.time()<float(expiry)
+            except (TypeError,ValueError):interactive=False
+        turn = 0 if interactive else self._turns.track(context_id)
         max_turns = protocol.max_pingpong_turns()
         rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
         if turn > max_turns:
@@ -558,7 +577,8 @@ class A2AAdapter(BasePlatformAdapter):
                                   f"{max_turns} turns. Start a new context or increase A2A_MAX_PINGPONG_TURNS.")
         if not text:
             return self._end_task(rec, protocol.STATE_REJECTED, "Empty task - nothing to do.")
-        framed = security.wrap_inbound(peer, text)
+        identity=self._interactive_identities.get(peer) if interactive else None
+        framed = text if identity else security.wrap_inbound(peer, text)
         security.audit("inbound", peer, task_id, text)
         protocol.persist_message(context_id, "user", text, task_id)
         protocol.metrics.inbound_total += 1
@@ -575,7 +595,7 @@ class A2AAdapter(BasePlatformAdapter):
             return self._end_task(rec, protocol.STATE_FAILED, "Agent gateway not ready to accept A2A tasks.")
         fut = self._add_pending(task_id, context_id)
         event = MessageEvent(text=framed, message_type=MessageType.TEXT, message_id=task_id,
-                             source=self.build_source(chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer))
+                             source=self.build_source(chat_id=context_id, chat_name=str(identity.get('user_name') or peer) if identity else f"a2a:{peer}", chat_type="dm", user_id=str(identity['user']) if identity else peer, user_name=str(identity.get('user_name') or peer) if identity else peer))
         try:
             asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
         except Exception as e:

@@ -4883,6 +4883,9 @@ def _ctx_header(lines: list[str], conn: sqlite3.Connection, task: Task) -> None:
                       "The original requested outcome is authoritative. A mismatched card is an agent-owned intake defect; repair it instead of completing unrelated work."])
     from hermes_cli.kanban_operator import policy
     operator_policy = policy(conn)
+    canonical_original=bool(origin and task.id in operator_policy.get('cohort_task_ids',[]))
+    if operator_policy.get('enabled') and canonical_original and task.created_by!='operator-repair':
+        lines[0]=f"# Kanban task {task.id}: Authenticated original request"
     if operator_policy.get("enabled", False):
         from hermes_cli.kanban_acceptance_truth import health_snapshot
         lines.extend(['## Native closed-loop facts',json.dumps(health_snapshot(conn,operator_policy,current_task=task.id)),
@@ -4924,7 +4927,7 @@ def _ctx_header(lines: list[str], conn: sqlite3.Connection, task: Task) -> None:
         lines.append("This exact admitted user request takes precedence over the agent-authored card below.")
         lines.append(origin["text"])
         lines.append("")
-    if task.created_by=='operator-repair' and authority and operator_policy.get('enabled'):
+    if operator_policy.get('enabled') and (canonical_original or (task.created_by=='operator-repair' and authority)):
         lines.extend(['## Candidate description retained as history',
                       'The editable title/body are not injected as work instructions for this native repair. Read kanban_get only for candidate artifact references when needed; the original request and current owned step above remain authoritative.'])
     elif task.body and task.body.strip():

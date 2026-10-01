@@ -270,6 +270,17 @@ def test_native_repair_context_does_not_inject_wrong_candidate_scope(board,monke
     assert 'Candidate description retained as history' in text
 
 
+def test_cohort_original_context_does_not_inject_wrong_candidate_scope(board,monkeypatch):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch,request_text='Repair my real conversation and queue headers')
+    settings['cohort_task_ids']=[tid]
+    with kb.write_txn(board):
+        board.execute('UPDATE tasks SET title=?,body=? WHERE id=?',('Only count cards','FORBIDDEN OLD SCOPE: headers require a different job',tid))
+    text=kb.build_worker_context(board,tid)
+    assert 'Repair my real conversation and queue headers' in text
+    assert 'FORBIDDEN OLD SCOPE' not in text
+    assert 'Only count cards' not in text.splitlines()[0]
+
+
 @pytest.mark.parametrize('case',['stale','outside_cohort','human_choice'])
 def test_manual_review_rework_preserves_scope_and_run_ownership(board,monkeypatch,case):
     tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
@@ -1381,24 +1392,27 @@ from tests.plugins.test_a2a_phase23 import _make_live_adapter, _post_json, _send
 
 class TestInteractiveOperatorIngress:
     @pytest.mark.parametrize('stream',[False,True])
-    def test_authenticated_interactive_peer_outlives_agent_loop_limit(self,monkeypatch,stream):
+    @pytest.mark.parametrize('shared_alias',[False,True])
+    def test_authenticated_interactive_peer_outlives_agent_loop_limit(self,monkeypatch,stream,shared_alias):
         monkeypatch.delenv('A2A_BEARER_TOKEN',raising=False)
+        if shared_alias:monkeypatch.setenv('A2A_BEARER_TOKEN','fixture-interactive')
         monkeypatch.setenv('A2A_PEER_TOKENS','jarvis-interactive:fixture-interactive,worker:fixture-worker')
         monkeypatch.setenv('A2A_MAX_PINGPONG_TURNS','2')
         adapter,base=_make_live_adapter(monkeypatch,extra={'interactive_peers':['jarvis-interactive']})
         async def run():
             assert await adapter.connect()
             try:
-                for i in range(6):
+                for i in range(3 if shared_alias else 6):
                     body=_send_body('Controlled interactive fixture turn '+str(i),ctx='fixture-interactive-context')
                     if stream:
                         # Same authenticated peer through the SSE handler.
                         body['method']='SendStreamingMessage'
                     response=await asyncio.to_thread(_post_json,base+'/',body,{'Authorization':'Bearer fixture-interactive'}) if not stream else await asyncio.to_thread(_post_sse_authenticated,base+'/',body,'fixture-interactive')
+                    expected='TASK_STATE_REJECTED' if shared_alias and i==2 else 'TASK_STATE_COMPLETED'
                     if stream:
-                        assert any(x.get('statusUpdate',{}).get('status',{}).get('state')=='TASK_STATE_COMPLETED' for x in response)
+                        assert any(x.get('statusUpdate',{}).get('status',{}).get('state')==expected for x in response)
                     else:
-                        assert response['result']['status']['state']=='TASK_STATE_COMPLETED'
+                        assert response['result']['status']['state']==expected
                 states=[]
                 for i in range(3):
                     body=_send_body('agent fixture',ctx='fixture-agent-context')
@@ -1410,3 +1424,31 @@ class TestInteractiveOperatorIngress:
                 await adapter.disconnect()
         asyncio.run(run())
 
+
+
+@pytest.mark.parametrize('credential',['distinct','shared','expired'])
+def test_operator_identity_requires_distinct_authenticated_interactive_credential(monkeypatch,credential):
+    shared_alias=credential=='shared'
+    expired=credential=='expired'
+    monkeypatch.delenv('A2A_BEARER_TOKEN',raising=False)
+    if shared_alias:monkeypatch.setenv('A2A_BEARER_TOKEN','fixture-ui-token')
+    monkeypatch.setenv('A2A_PEER_TOKENS','fixture-ui:fixture-ui-token')
+    events=[]
+    def reply(event):
+        events.append(event)
+        return 'Controlled fixture response'
+    adapter,base=_make_live_adapter(monkeypatch,reply_fn=reply,extra={'interactive_peers':['fixture-ui'],'peer_identities':{'fixture-ui':{'user':'fixture-human','user_name':'Fixture Operator','frame':'operator'}}})
+    if expired:adapter._interactive_expiries['fixture-ui']=1
+    async def run():
+        assert await adapter.connect()
+        try:
+            body=_send_body('Controlled fixture reasoning request',ctx='fixture-operator-context')
+            body['params']['message']['metadata']={'user':'forged-person','frame':'operator'}
+            result=await asyncio.to_thread(_post_json,base+'/',body,{'Authorization':'Bearer fixture-ui-token'})
+            assert result['result']['status']['state']=='TASK_STATE_COMPLETED'
+            assert len(events)==1
+            assert (events[0].source.user_id=='fixture-human') is (not shared_alias and not expired)
+            assert (events[0].text=='Controlled fixture reasoning request') is (not shared_alias and not expired)
+        finally:
+            await adapter.disconnect()
+    asyncio.run(run())
