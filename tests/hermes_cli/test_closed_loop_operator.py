@@ -207,3 +207,12 @@ def test_new_policy_does_not_retroactively_budget_old_worker(board):
     kb.claim_task(board,tid)
     operator.reconcile(board,settings={"enabled":True,"activation_at":int(time.time())+10})
     assert kb.get_task(board,tid).max_runtime_seconds is None
+
+
+def test_rollout_does_not_emit_exceptions_for_uncarried_historical_requests(board):
+    tid=kb.create_task(board,title="old",assignee="pilot",user_origin={"platform":"discord","chat_id":"c","message_id":"old","user_id":"harry","text":"old request"})
+    board.execute("UPDATE tasks SET created_at=1 WHERE id=?",(tid,));board.commit()
+    operator.reconcile(board,settings={"enabled":True,"activation_at":100},now=10000)
+    assert operator._last(board,tid,"operator_deadline") is None
+    operator.reconcile(board,settings={"enabled":True,"activation_at":100,"cohort_task_ids":[tid]},now=10000)
+    assert operator._last(board,tid,"operator_exception")

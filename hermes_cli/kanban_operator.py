@@ -132,6 +132,9 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
                         "WHERE t.status NOT IN ('archived')").fetchall()
     for row in rows:
         tid = row["id"]
+        floor = int(cfg.get("activation_at", 0))
+        if int(row["created_at"]) < floor and tid not in cfg.get("cohort_task_ids", []):
+            continue  # Historical exceptions stay in the audit; do not flood old routes at rollout.
         armed = _last(conn, tid, "operator_deadline")
         if not armed:
             due = int(row["created_at"]) + deadline
