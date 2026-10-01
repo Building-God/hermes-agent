@@ -209,6 +209,18 @@ def test_worker_goal_repairs_follow_authentic_request_and_owned_review_step(boar
     assert 'kanban_request_changes' not in kb.task_goal_text(board,review,for_completion=True)
 
 
+def test_safe_release_authority_reaches_worker_context_only_for_declared_cohort(board,monkeypatch):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    settings.update(cohort_task_ids=[tid],agent_action_authority={'safe_live_release':True,'source':'Controlled explicit human build authorization'})
+    text=kb.build_worker_context(board,repair)
+    assert 'Harry has authorized implementation, deployment and live reproduction' in text
+    assert 'Your owned step is independent review' in text
+    assert 'Do not edit the immutable serving tree' in text
+    assert 'Do not relabel AGENT answers as HARRY' in text
+    settings['cohort_task_ids']=[]
+    assert 'Harry has authorized implementation, deployment and live reproduction' not in kb.task_goal_text(board,review)
+
+
 def test_stale_repair_audit_does_not_override_a_later_fault(board,monkeypatch):
     tid,repair,info,settings=historical_repair_review_hold(board)
     hold=operator._last_hold(board,repair)
@@ -646,6 +658,8 @@ def test_agent_question_answer_cannot_become_harry_confirmation(board,monkeypatc
     assert operator.agent_answer_claim_failure(board,tid,'Objective source and serving mode verified; human confirmation unobserved') is None
     assert operator.agent_answer_claim_failure(board,tid,"Harry's confirmation remains unobserved") is None
     assert operator.agent_answer_claim_failure(board,tid,'No authenticated Harry confirmation; source verified') is None
+    kb.add_comment(board,tid,author='pilot',body='HARRY[q_28089d279474ab74]: It reasons like Discord now')
+    assert operator.agent_answer_claim_failure(board,tid,'Harry confirmed this change')
     kb.add_comment(board,tid,author='default',body='HARRY[q_28089d279474ab74]: I tested that exact change')
     assert operator.agent_answer_claim_failure(board,tid,'Harry confirmed this change') is None
     assert operator._last(board,tid,'result_receipt') is None
@@ -1214,6 +1228,37 @@ def test_stale_audit_cannot_override_a_new_human_only_choice(board,monkeypatch):
     assert kb.get_task(board,tid).status == before.status
     assert kb.get_task(board,tid).block_kind == "needs_input"
     assert operator._last(board,tid,"operator_acceptance_recovery") is None
+
+
+@pytest.mark.parametrize('case',['reviewer','stale','implementer','outside_cohort','human_hold'])
+def test_actual_worker_goal_callback_returns_failed_review_to_implementer(board,monkeypatch,case):
+    import contextlib,sys,types
+    from hermes_cli import cli_single_query as worker
+    from hermes_cli import goals
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    settings['cohort_task_ids']=[] if case=='outside_cohort' else [tid]
+    if case=='human_hold':
+        with kb.write_txn(board):board.execute("UPDATE tasks SET block_kind='needs_input' WHERE id=?",(tid,))
+    active=review
+    if case=='implementer':
+        assert kb.request_changes(board,repair,reason='Actual functional probe fails',expected_run_id=review.current_run_id)[0]
+        active=kb.claim_task(board,repair)
+    monkeypatch.setenv('HERMES_KANBAN_TASK',repair)
+    monkeypatch.setenv('HERMES_KANBAN_RUN_ID',str(active.current_run_id+1 if case=='stale' else active.current_run_id))
+    monkeypatch.setitem(sys.modules,'cli',types.SimpleNamespace(_int_or=lambda v,d:int(v),_sync_cli_session_id_from_agent=lambda c:None))
+    @contextlib.contextmanager
+    def connected():yield board
+    monkeypatch.setattr('hermes_cli.kanban_db_connect.connect_closing',connected)
+    monkeypatch.setattr(goals,'run_kanban_goal_loop',lambda **kw:kw['block_fn']('Goal-mode judge ruled the goal unachievable: code review finished but deployment and live functional probe remain pending'))
+    worker._run_kanban_goal_loop_q(types.SimpleNamespace(),first_response='Actual review cannot accept undeployed work')
+    task=kb.get_task(board,repair)
+    assert task.status==('ready' if case=='reviewer' else 'running' if case=='stale' else 'blocked')
+    if case=='reviewer':
+        assert task.assignee=='pilot'
+        assert operator._last(board,repair,'operator_failed_review_rework')
+        assert kb.claim_task(board,repair)
+    assert kb.get_task(board,tid).status=='blocked'
+    assert task.block_kind!='needs_input'
 
 
 def test_intake_recovery_reconciles_concurrent_foreground_stop_receipt(board,monkeypatch):

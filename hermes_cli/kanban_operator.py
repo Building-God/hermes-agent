@@ -94,17 +94,36 @@ def agent_answer_claim_failure(conn,task_id,text):
     prose=re.sub(r"\b(?:no|without)\s+(?:authenticated\s+)?Harry(?:'s)?\s+confirmation\b",'',prose,flags=re.I)
     if not re.search(r"\bHarry(?:'s)?\s+(?:authenticated\s+)?(?:confirm(?:ed|ation)|tested|said|answered)\b",prose,re.I):
         return None
-    comments=conn.execute("SELECT body FROM task_comments WHERE task_id=? AND (body LIKE 'AGENT[%' OR body LIKE 'HARRY[%')",(task_id,)).fetchall()
+    comments=conn.execute("SELECT author,body FROM task_comments WHERE task_id=? AND (body LIKE 'AGENT[%' OR body LIKE 'HARRY[%')",(task_id,)).fetchall()
     agent_questions=set()
     for row in comments:
         if row['body'].startswith('AGENT['):
             agent_questions.update(re.findall(r'q_[a-zA-Z0-9]+',row['body']))
-    human_questions={qid for row in comments for qid in re.findall(r'^HARRY\[(q_[a-zA-Z0-9]+)\]:',row['body'])}
+    # Match the authenticated question bridge's author contract. A worker
+    # copying HARRY[...] into its comment does not change its runtime identity.
+    human_questions={qid for row in comments if str(row['author'] or '').strip().lower() in {'default','harry'} for qid in re.findall(r'^HARRY\[(q_[a-zA-Z0-9]+)\]:',row['body'])}
     if agent_questions - human_questions:
         return ('False human acceptance: this task has agent-labeled question answers and no authenticated Harry confirmation. '
                 'Do not promote an AGENT tap, elapsed time, successful send or stored answer into Harry proof. '
                 'Retain objective reproduction and correct the result; human acceptance and result receipt stay unobserved.')
     return None
+
+
+def handle_worker_goal_failure(conn,task_id,reason,*,expected_run_id=None):
+    """Owned review rejection is rework, not a terminal implementation verdict."""
+    from hermes_cli import kanban_db as kb
+    cfg=policy(conn);task=kb.get_task(conn,task_id)
+    authority=repair_authority(conn,task_id) if task and task.created_by=='operator-repair' else None
+    contract,failure=repair_contract(conn,task_id) if authority else (None,None)
+    claimed=conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed' ORDER BY id DESC LIMIT 1",(task_id,task.current_run_id)).fetchone() if task and task.current_run_id else None
+    if (cfg.get('enabled') and authority and contract and not failure and authority['event']['task_id'] in cfg.get('cohort_task_ids',[])
+        and task.status=='running' and task.current_run_id==expected_run_id and claimed and _payload(claimed).get('source_status')=='review'):
+        ok,owner=kb.request_changes(conn,task_id,reason=reason,expected_run_id=expected_run_id)
+        if ok:
+            with kb.write_txn(conn):
+                kb._append_event(conn,task_id,'operator_failed_review_rework',{'owner':'agent','implementer':owner,'review_run_id':expected_run_id,'reason':reason,'scope':'Failed owned review returned through native rework; original deadlines and current phase limits remain'})
+            return True
+    return kb.block_task(conn,task_id,reason=reason,expected_run_id=expected_run_id)
 
 
 def policy(conn=None) -> dict:
