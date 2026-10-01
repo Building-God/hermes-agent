@@ -318,6 +318,11 @@ def recover_unowned_intake(home, *, board=None):
             logger.warning("intake recovery retained %s: %s", key, type(error).__name__)
             results.append({"key":key,"owner":"agent","error":type(error).__name__})
             continue
+        newest=next((saved for saved in reversed(read_journal(home)) if saved.get("idempotency_key")==key),{})
+        if newest.get("foreground_stopped"):
+            row["foreground_stopped"]=True
+            row["foreground_fenced"]=False
+            settle_foreground_fence(row,home,None)
         row["status"] = "owned_after_intake_recovery"
         with journal_path(home).open("a",encoding="utf-8") as handle:
             handle.write(json.dumps(row,ensure_ascii=True,sort_keys=True)+"\n")
@@ -330,7 +335,7 @@ def settle_foreground_fence(entry, home, worker_done):
     """Do not dispatch replacement work beside an interrupted foreground worker."""
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect
-    stopped = worker_done.wait(300) if worker_done is not None else True
+    stopped = worker_done.wait(300) if worker_done is not None else bool(entry.get("foreground_stopped"))
     slug = entry.get("recovery_board") or kb.get_current_board()
     target = Path(home)/"kanban.db" if slug == "default" else Path(home)/"kanban/boards"/slug/"kanban.db"
     conn=connect(target)
@@ -343,6 +348,7 @@ def settle_foreground_fence(entry, home, worker_done):
                 entry["card_id"]=tid
         if stopped:
             entry["foreground_fenced"]=False
+            entry["foreground_stopped"]=True
             entry["status"]="foreground_stopped"
             with journal_path(home).open("a",encoding="utf-8") as handle:
                 handle.write(json.dumps(entry,ensure_ascii=True,sort_keys=True)+"\n")

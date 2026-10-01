@@ -1867,6 +1867,7 @@ DEFAULT_CONFIG = {
             "repair_assignee": "pilot",
             "max_pending_repairs": 1,
             "repair_window_seconds": 172800,
+            "user_work_priority": 100,
         },
         # Seconds between dispatcher ticks. Lower = snappier pickup; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,

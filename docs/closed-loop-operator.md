@@ -42,3 +42,16 @@ service entrypoints consume its sealed runtime selector. The candidate has its
 own interpreter/source directory; the editable checkout and its saved unfinished
 changes are preserved. Manifest selection is deployment intent; serving process
 identity, health, request transitions and platform readback prove execution.
+
+Original requests cannot self-certify completion: a different profile must hold
+a native review run. Canonical results retain the substantive review answer. An
+internal dependency missing a formal link remains an agent-owned hold. The
+operator reconciles one exact referenced parent through the native cycle guard;
+a missing, ambiguous or cyclic reference gets one bounded reviewed repair. It
+never guesses away an explicit needs_input choice.
+
+All native Windows restart entrypoints honor the same sealed selector and hash
+of the selected controller as the existing service paths. Worker import is
+verified outside the source root with PYTHONPATH/cwd disabled; gateway imports
+alone are insufficient. Runtime preparation must bind only its own interpreter
+to its own release source, never repoint the editable install.

@@ -17,6 +17,7 @@ def board(tmp_path, monkeypatch):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(dispatch, "_dispatch_profile_allowlist", lambda normalize: None)
     monkeypatch.setattr(dispatch, "_profile_exists_fn", lambda: lambda name: name in {"pilot","reviewer"})
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda name: name in {"pilot","reviewer"})
     from hermes_cli.config import load_config
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban":{"default_assignee":"pilot"}})
     conn = kb.connect()
@@ -109,7 +110,7 @@ def test_attempt_budget_does_not_depend_on_heartbeat(board):
     assert kb.get_task(board, tid).max_runtime_seconds == 120
 
 
-def test_reviewed_repair_resumes_exact_original_task(board):
+def test_reviewed_repair_resumes_exact_original_task(board,monkeypatch):
     tid = kb.create_task(board, title="failed work", assignee="pilot")
     kb.claim_task(board, tid)
     dispatch._record_task_failure(board, tid, "controlled crash", outcome="crashed", failure_limit=1,
@@ -120,7 +121,10 @@ def test_reviewed_repair_resumes_exact_original_task(board):
     build = kb.claim_task(board, repair)
     assert kb.request_review(board, repair, summary="fault reproduced and fixed", reviewer="reviewer", expected_run_id=build.current_run_id)
     review = kb.claim_review_task(board, repair)
-    assert kb.complete_task(board, repair, result="independent reproduction passed", expected_run_id=review.current_run_id)
+    monkeypatch.setattr(operator,"policy",lambda conn: settings)
+    with pytest.raises(ValueError,match="acceptance evidence required"):
+        kb.complete_task(board, repair, result="reviewer says fixed", expected_run_id=review.current_run_id)
+    assert kb.complete_task(board, repair, result="independent reproduction passed", expected_run_id=review.current_run_id,metadata={"acceptance_receipts":{"reproduction":"controlled failure reproduced then passed"}})
     assert kb.get_task(board, tid).status == "blocked"
     operator.reconcile(board, settings=settings)
     assert kb.get_task(board, tid).status == "ready"
@@ -216,3 +220,124 @@ def test_rollout_does_not_emit_exceptions_for_uncarried_historical_requests(boar
     assert operator._last(board,tid,"operator_deadline") is None
     operator.reconcile(board,settings={"enabled":True,"activation_at":100,"cohort_task_ids":[tid]},now=10000)
     assert operator._last(board,tid,"operator_exception")
+
+
+def test_missing_internal_dependency_never_becomes_harry_input(board,monkeypatch):
+    monkeypatch.setattr(operator,"policy",lambda *a: {"enabled":True})
+    parent=kb.create_task(board,title="deployment",assignee="pilot")
+    tid=kb.create_task(board,title="verify",assignee="reviewer")
+    run=kb.claim_task(board,tid)
+    assert kb.block_task(board,tid,reason="Wait for "+parent,kind="dependency",expected_run_id=run.current_run_id)
+    assert kb.get_task(board,tid).block_kind == "dependency"
+    kb.recompute_ready(board)
+    assert kb.get_task(board,tid).status == "blocked"
+    operator.reconcile(board,settings={"enabled":True})
+    assert kb.parent_ids(board,tid) == [parent]
+    assert kb.get_task(board,tid).status == "todo"
+    kb.complete_task(board,parent,result="live release reproduced")
+    operator.reconcile(board,settings={"enabled":True})
+    kb.recompute_ready(board)
+    assert kb.get_task(board,tid).status == "ready"
+
+
+def test_dependency_cycle_gets_bounded_agent_repair_not_harry_question(board,monkeypatch):
+    monkeypatch.setattr(operator,"policy",lambda *a: {"enabled":True})
+    tid=kb.create_task(board,title="original",assignee="pilot")
+    verification=kb.create_task(board,title="verification",assignee="reviewer",parents=[tid])
+    run=kb.claim_task(board,tid)
+    assert kb.block_task(board,tid,reason="Wait for "+verification,kind="dependency",expected_run_id=run.current_run_id)
+    operator.reconcile(board,settings={"enabled":True,"repair_assignee":"pilot"})
+    assert kb.get_task(board,tid).block_kind == "dependency"
+    assert operator._last(board,tid,"operator_repair_created")
+    assert board.execute("SELECT COUNT(*) FROM tasks WHERE created_by='operator-repair'").fetchone()[0] == 1
+    operator.reconcile(board,settings={"enabled":True,"repair_assignee":"pilot"})
+    assert board.execute("SELECT COUNT(*) FROM tasks WHERE created_by='operator-repair'").fetchone()[0] == 1
+
+
+def test_explicit_harry_only_choice_is_preserved(board,monkeypatch):
+    monkeypatch.setattr(operator,"policy",lambda *a: {"enabled":True})
+    tid=kb.create_task(board,title="human-only preference",assignee="pilot")
+    run=kb.claim_task(board,tid)
+    kb.block_task(board,tid,reason="Which of these mutually exclusive choices do you want?",kind="needs_input",expected_run_id=run.current_run_id)
+    operator.reconcile(board,settings={"enabled":True})
+    assert kb.get_task(board,tid).block_kind == "needs_input"
+    assert operator._last(board,tid,"operator_repair_created") is None
+
+
+def test_native_restart_uses_sealed_launcher_and_refuses_changed_controller(tmp_path):
+    import hashlib
+    from hermes_cli.gateway_windows import _selected_release_launcher
+    runtime=tmp_path/"runtime";runtime.mkdir()
+    launcher=runtime/"controller.py";launcher.write_text("verified controller")
+    pointer=runtime/"active-release.json";pointer.write_text(json.dumps({"launcher":str(launcher),"launcher_sha256":hashlib.sha256(launcher.read_bytes()).hexdigest()}))
+    assert _selected_release_launcher(tmp_path,"python.exe") == ["python.exe",str(launcher)]
+    launcher.write_text("changed code")
+    with pytest.raises(ValueError,match="launcher changed"):
+        _selected_release_launcher(tmp_path,"python.exe")
+
+
+def test_original_request_cannot_self_certify_and_keeps_canonical_result(board,monkeypatch):
+    monkeypatch.setattr(operator,"policy",lambda *a: {"enabled":True})
+    tid=kb.create_task(board,title="real request",assignee="pilot",user_origin={"platform":"discord","chat_id":"c","message_id":"m","user_id":"harry","text":"Deliver the requested result"})
+    build=kb.claim_task(board,tid)
+    with pytest.raises(ValueError,match="Independent review required"):
+        kb.complete_task(board,tid,summary="I say it works",expected_run_id=build.current_run_id)
+    assert kb.get_task(board,tid).status == "running"
+    assert kb.request_review(board,tid,summary="Candidate ready",reviewer="reviewer",expected_run_id=build.current_run_id)
+    review=kb.claim_review_task(board,tid)
+    with pytest.raises(ValueError,match="Independent acceptance evidence required"):
+        kb.complete_task(board,tid,summary="Reassuring summary only",expected_run_id=review.current_run_id)
+    assert kb.complete_task(board,tid,summary="Independent outcome reproduced",expected_run_id=review.current_run_id,
+                            metadata={"acceptance_receipts":{"controlled_reproduction":"passed"}})
+    assert kb.get_task(board,tid).result == "Independent outcome reproduced"
+
+
+def test_original_default_priority_beats_internal_backlog_without_overriding_explicit_priority(board,monkeypatch):
+    # Real dispatch ordering with deterministic host capacity; unrelated live boards
+    # and this machine's memory pressure are outside this isolated queue drill.
+    monkeypatch.setattr(dispatch,"count_running_tasks_other_boards",lambda board: 0)
+    monkeypatch.setattr(dispatch,"_memory_pressure_level",lambda: "normal")
+    internal=kb.create_task(board,title="internal backlog",assignee="pilot")
+    original=kb.create_task(board,title="original request",assignee="pilot",user_origin={"platform":"discord","chat_id":"c","message_id":"priority","user_id":"harry","text":"Do my work"})
+    explicit=kb.create_task(board,title="explicit priority",assignee="pilot",priority=5,user_origin={"platform":"discord","chat_id":"c","message_id":"explicit","user_id":"harry","text":"Do this later"})
+    operator.reconcile(board,settings={"enabled":True})
+    assert kb.get_task(board,original).priority > kb.get_task(board,internal).priority
+    assert kb.get_task(board,explicit).priority == 5
+    picked=dispatch.dispatch_once(board,dry_run=True,max_spawn=1,max_in_progress=1)
+    assert picked.spawned and picked.spawned[0][0] == original, picked
+
+
+def test_new_attempt_cap_is_visible_before_claim_not_changed_under_worker(board):
+    tid=kb.create_task(board,title="new attempt",assignee="pilot",max_runtime_seconds=5400)
+    operator.reconcile(board,settings={"enabled":True,"attempt_seconds":900})
+    assert kb.get_task(board,tid).max_runtime_seconds == 900
+    run=kb.claim_task(board,tid)
+    assert board.execute("SELECT max_runtime_seconds FROM task_runs WHERE id=?",(run.current_run_id,)).fetchone()[0] == 900
+
+
+def test_unknown_foreground_shutdown_retains_fence(board):
+    from gateway.front_door_deadline import settle_foreground_fence
+    from hermes_constants import get_hermes_home
+    item=entry();item["foreground_fenced"]=True
+    tid=ensure_continuation(item)
+    settle_foreground_fence(item,get_hermes_home(),None)
+    assert kb.get_task(board,tid).status == "blocked"
+    assert operator._payload(operator._last(board,tid,"operator_exception"))["reason"] == "foreground_shutdown_unconfirmed"
+
+
+def test_intake_recovery_reconciles_concurrent_foreground_stop_receipt(board,monkeypatch):
+    import gateway.front_door_deadline as fd
+    from hermes_constants import get_hermes_home
+    item=entry();item["foreground_fenced"]=True
+    fd.journal_request(get_hermes_home(),item)
+    real=fd.ensure_continuation
+    def create_with_racing_stop(row,**kwargs):
+        tid=real(row,**kwargs)
+        stopped=dict(item,foreground_stopped=True,foreground_fenced=False,status="foreground_stopped")
+        with fd.journal_path(get_hermes_home()).open("a",encoding="utf-8") as handle:
+            handle.write(json.dumps(stopped)+"\n")
+        return tid
+    monkeypatch.setattr(fd,"ensure_continuation",create_with_racing_stop)
+    recovered=fd.recover_unowned_intake(get_hermes_home())
+    assert kb.get_task(board,recovered[0]["card_id"]).status == "ready"
+    assert fd.recover_unowned_intake(get_hermes_home()) == []

@@ -3199,6 +3199,24 @@ def complete_task(
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
+    from hermes_cli.kanban_operator import policy
+    governed = conn.execute("SELECT 1 FROM task_user_origins WHERE task_id=? UNION SELECT 1 FROM tasks WHERE id=? AND created_by='operator-repair'",(task_id,task_id)).fetchone()
+    if policy(conn).get("enabled", False) and governed:
+        review = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='review_requested' ORDER BY id DESC LIMIT 1",(task_id,)).fetchone()
+        run_id = expected_run_id or _current_run_id(conn,task_id)
+        actor = conn.execute("SELECT profile FROM task_runs WHERE id=?",(run_id,)).fetchone() if run_id else None
+        claim = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed' ORDER BY id DESC LIMIT 1",(task_id,run_id)).fetchone() if run_id else None
+        review_phase = json.loads(claim["payload"] or "{}").get("source_status") == "review" if claim else False
+        implementer = json.loads(review["payload"] or "{}").get("implementer") if review else None
+        if not review or not actor or not implementer or actor["profile"] == implementer or not review_phase:
+            with write_txn(conn):
+                _append_event(conn,task_id,"completion_review_required",{"owner":"agent","reason":"original request needs a different profile's owned review run"},run_id=run_id)
+            raise ValueError("Independent review required: request_review first, then a different profile verifies and completes its owned review run.")
+        receipts = metadata.get("acceptance_receipts") if isinstance(metadata,dict) else None
+        if not isinstance(receipts,(dict,list)) or not receipts:
+            raise ValueError("Independent acceptance evidence required: include actual reproduction/probe/source receipts in metadata.acceptance_receipts; a reassuring summary is insufficient.")
+        if result is None and summary:
+            result = summary  # The canonical card result must retain the substantive answer.
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
@@ -3402,6 +3420,8 @@ def _completed_event_payload(
     if verified_cards:
         payload["verified_cards"] = verified_cards
     if isinstance(metadata, dict):
+        if metadata.get("acceptance_receipts"):
+            payload["acceptance_receipts"] = metadata["acceptance_receipts"]
         cleaned = _cleaned_artifact_paths(metadata)
         if cleaned:
             payload["artifacts"] = cleaned
@@ -3787,13 +3807,22 @@ def block_task(
         # kind with none open would park in ``todo`` and ``recompute_ready``
         # would promote+respawn it context-free on the next tick. Re-kind to
         # ``needs_input`` so it is sticky until a human unblocks.
+        unresolved_agent_dependency = False
         if kind == "dependency" and _parents_satisfied(conn, task_id):
-            kind = "needs_input"
-            rekind_reason = "no_open_parent"
+            from hermes_cli.kanban_operator import policy
+            if policy(conn).get("enabled", False):
+                unresolved_agent_dependency = True
+            else:
+                kind = "needs_input"
+                rekind_reason = "no_open_parent"
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
         )
+        if unresolved_agent_dependency:
+            # Never turn missing agent linkage into a Harry choice or an immediate respawn.
+            new_status, event_kind = "blocked", "blocked"
+            payload.update(owner="agent", dependency_unresolved=True, requested_kind="dependency")
         if rekind_reason:
             payload["requested_kind"] = requested_kind
             payload["rekind_reason"] = rekind_reason
@@ -4688,6 +4717,8 @@ def _ctx_header(lines: list[str], conn: sqlite3.Connection, task: Task) -> None:
     from hermes_cli.kanban_operator import policy
     operator_policy = policy(conn)
     if operator_policy.get("enabled", False):
+        if origin or task.created_by == "operator-repair":
+            lines.append("This original request requires independent review. Request review from a different installed profile; the owned reviewer must reproduce the outcome before completing it. A self-written success summary is rejected. Include the actual reproduction/probe/source evidence in metadata.acceptance_receipts.")
         lines.append("Commit meaningful durable progress with kanban_checkpoint within "
                      + str(operator_policy.get("progress_seconds", 600)) +
                      " seconds. Heartbeats do not renew progress or overall deadlines. Use an internal dependency/transient block for agent faults; ask Harry only for a human-only choice.")
