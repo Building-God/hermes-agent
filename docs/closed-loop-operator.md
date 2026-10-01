@@ -55,3 +55,9 @@ of the selected controller as the existing service paths. Worker import is
 verified outside the source root with PYTHONPATH/cwd disabled; gateway imports
 alone are insufficient. Runtime preparation must bind only its own interpreter
 to its own release source, never repoint the editable install.
+
+A repair's total deadline stops further goal-mode attempts through the native
+external block path, which verifies the entire worker tree before clearing a
+claim. Refused or unknown process identities retain the claim and original hold.
+An exhausted repair remains an agent exception; it cannot spawn another repair
+or turn into a Harry input request.

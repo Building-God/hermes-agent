@@ -269,17 +269,32 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
             evidence = _payload(completed).get("acceptance_receipts")
             claim = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed' ORDER BY id DESC LIMIT 1",(repair.id,completed["run_id"])).fetchone()
             if not run or not implementer or run["profile"] == implementer or not evidence or not claim or json.loads(claim["payload"] or "{}").get("source_status") != "review":
+                _exception(conn,tid,"repair_acceptance_unproved",repair_task_id=repair.id)
                 continue
             if kb.unblock_task(conn, tid):
                 with kb.write_txn(conn):
                     kb._append_event(conn, tid, "operator_repair_verified",
                                      {"repair_task_id": repair.id, "review_run_id": completed["run_id"]})
                 actions.append({"task_id": tid, "resumed_after_repair": repair.id})
-        elif now >= info["due_at"] and not _last(conn, tid, "operator_repair_overdue"):
-            with kb.write_txn(conn):
-                kb._append_event(conn, tid, "operator_repair_overdue",
-                                 {"repair_task_id": repair.id, "owner": "agent", "due_at": info["due_at"]})
-            actions.append({"task_id": tid, "exception": "repair_deadline_exceeded"})
+        elif now >= info["due_at"]:
+            if not _last(conn, tid, "operator_repair_overdue"):
+                with kb.write_txn(conn):
+                    kb._append_event(conn, tid, "operator_repair_overdue",
+                                     {"repair_task_id": repair.id, "owner": "agent", "due_at": info["due_at"]})
+                actions.append({"task_id": tid, "exception": "repair_deadline_exceeded"})
+            # A total repair deadline must prevent endless goal-mode attempts.
+            # Native external block proves the worker tree gone before clearing
+            # its claim; refused/unknown identities remain fenced and retry here.
+            stopped = False
+            if repair.status in ("ready","running"):
+                stopped = kb.block_task(conn,repair.id,reason="Agent-owned repair deadline exhausted; original request remains fenced.")
+            elif repair.status in ("review","todo","triage") and repair.claim_lock is None:
+                with kb.write_txn(conn):
+                    stopped = conn.execute("UPDATE tasks SET status='blocked',block_kind=NULL WHERE id=? AND status=? AND claim_lock IS NULL",(repair.id,repair.status)).rowcount > 0
+            if stopped:
+                with kb.write_txn(conn):
+                    kb._append_event(conn,repair.id,"operator_repair_stopped",{"owner":"agent","due_at":info["due_at"],"original_task_id":tid})
+                actions.append({"task_id":tid,"repair_stopped":repair.id})
     return actions
 
 
