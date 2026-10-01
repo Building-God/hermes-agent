@@ -94,9 +94,12 @@ def require_archive_acceptance(conn,tid):
 
 def native_state_report(conn,tid,cfg):
     """Answer declared status requests with independent native reads, not shell claims."""
-    if tid not in cfg.get('state_report_task_ids',[]) or tid not in cfg.get('cohort_task_ids',[]):return None
-    if not conn.execute('SELECT 1 FROM task_user_origins WHERE task_id=?',(tid,)).fetchone():return None
-    facts=health_snapshot(conn,cfg,current_task=tid)
+    from hermes_cli.kanban_operator import repair_authority
+    authority=repair_authority(conn,tid)
+    original_id=authority['event']['task_id'] if authority else tid
+    if original_id not in cfg.get('state_report_task_ids',[]) or original_id not in cfg.get('cohort_task_ids',[]):return None
+    if not conn.execute('SELECT 1 FROM task_user_origins WHERE task_id=?',(original_id,)).fetchone():return None
+    facts=health_snapshot(conn,cfg,current_task=original_id)
     lines=['Live evidence for the recent requests I audited:']
     for name in ('discord','api_server','whatsapp'):
         lines.append('- '+name+': '+str(facts['platforms'].get(name,'unproved'))+'.')

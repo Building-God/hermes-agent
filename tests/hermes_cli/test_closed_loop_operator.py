@@ -277,6 +277,31 @@ def test_failed_corrective_acceptance_has_one_final_terminal_phase(board,monkeyp
     assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_terminal_review_handoff'",(tid,)).fetchone()[0]==1
 
 
+def test_state_query_failure_repairs_and_delivers_original_without_inline_shell_or_harry(board,monkeypatch):
+    tid,repair,settings=failed_origin_repair(board)
+    settings['state_report_task_ids']=[tid]
+    settings['acceptance_recheck_assignee']='reviewer'
+    monkeypatch.setattr(operator,'policy',lambda conn:settings)
+    child=kb.create_task(board,title='Agent sign-off child',assignee='reviewer')
+    kb.link_tasks(board,parent_id=repair,child_id=child)
+    claim=kb.claim_task(board,repair)
+    assert kb.block_task(board,repair,reason='Goal judge says external sign-off on '+child+' is outside agent authority',expected_run_id=claim.current_run_id)
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'operator_deadline',{'due_at':1,'owner':'agent'})
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,repair).status=='review'
+    review=kb.claim_review_task(board,repair)
+    assert kb.complete_task(board,repair,result='Inline shell is restricted; cannot verify',expected_run_id=review.current_run_id)
+    assert operator._payload(operator._last(board,repair,'completed'))['acceptance_receipts']['native_live_state']
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,tid).status=='review'
+    review=kb.claim_review_task(board,tid)
+    assert kb.complete_task(board,tid,expected_run_id=review.current_run_id)
+    assert 'Live evidence' in kb.get_task(board,tid).result
+    assert 'receipt is separate' in kb.get_task(board,tid).result
+    assert operator._last(board,tid,'result_receipt') is None
+
+
 def test_deadline_creates_owned_runnable_task_and_exact_route_once(board):
     first = ensure_continuation(entry())
     assert ensure_continuation(entry()) == first
