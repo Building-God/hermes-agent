@@ -13,6 +13,10 @@ from pathlib import Path
 import time
 
 
+def _last_hold(conn,task_id):
+    return conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind IN ('blocked','block_loop_detected','dependency_wait') ORDER BY id DESC LIMIT 1",(task_id,)).fetchone()
+
+
 def policy(conn=None) -> dict:
     """Lifecycle policy belongs to the bound board, independent of worker profile.
 
@@ -106,6 +110,76 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
     runtime = max(60, int(cfg.get("attempt_seconds", 900)))
     deadline = max(runtime, int(cfg.get("request_seconds", 7200)))
     actions = []
+    # Audit-selected legacy outcomes cannot stay green without acceptance, and
+    # an exact diagnosed deployment fault is not a new human choice. This is a
+    # single native reviewer handoff; no original external action is replayed.
+    for tid in cfg.get("cohort_task_ids",[]):
+        row=kb.get_task(conn,tid)
+        if not row or row.claim_lock or _last(conn,tid,"operator_acceptance_recovery"):
+            continue
+        completed=_last(conn,tid,"completed")
+        declared=(cfg.get("agent_owned_faults") or {}).get(tid,{})
+        current_block=_last_hold(conn,tid)
+        if row.status in ('blocked','triage') and (not current_block or declared.get("blocked_event_id")!=current_block["id"]):
+            continue  # A later human choice invalidates the old diagnosis.
+        if not ((row.status=='done' and completed and (not row.result or not _payload(completed).get("acceptance_receipts"))) or
+                (row.status in ('blocked','triage') and declared)):
+            continue
+        try:
+            reviewer=dispatch_owner(conn,cfg.get("review_assignee","reviewer"))
+            summary="Audit acceptance against the exact authenticated original request and existing evidence. Do not repeat prior external effects. Independently reproduce the requested outcome, retain a substantive result and actual acceptance receipts, and separate objective delivery from unobserved Harry receipt or subjective confirmation. " + str(declared.get("reason","Legacy completion has no substantive independently verified result."))
+            accepted,reason=kb.request_review(conn,tid,reviewer=reviewer,summary=summary,resume_audited_origin=True,with_reason=True)
+            if not accepted:
+                raise ValueError(reason or "native origin review refused")
+            with kb.write_txn(conn):
+                kb._append_event(conn,tid,"operator_acceptance_recovery",{"owner":"agent","reviewer":reviewer,"source_completed_event_id":completed["id"] if completed else None,"source_blocked_event_id":declared.get("blocked_event_id"),"due_at":now+runtime,"acceptance":"unproved"})
+            actions.append({"task_id":tid,"acceptance_recovery":reviewer})
+        except Exception as error:
+            _exception(conn,tid,"acceptance_recovery_failed",error=str(error)[:300])
+    for event in conn.execute("SELECT e.* FROM task_events e JOIN tasks t ON t.id=e.task_id WHERE e.kind='operator_acceptance_recovery' AND t.status IN ('review','running')").fetchall():
+        info=_payload(event);tid=event["task_id"]
+        if now < info["due_at"]:
+            continue
+        _exception(conn,tid,"acceptance_review_deadline_exceeded",due_at=info["due_at"])
+        task=kb.get_task(conn,tid)
+        if task.status=='running':
+            stopped=kb.block_task(conn,tid,reason="Agent-owned acceptance review deadline exhausted.")
+        else:
+            with kb.write_txn(conn):
+                stopped=conn.execute("UPDATE tasks SET status='blocked',block_kind=NULL WHERE id=? AND status='review' AND claim_lock IS NULL",(tid,)).rowcount > 0
+        if stopped:
+            with kb.write_txn(conn):
+                kb._append_event(conn,tid,"gave_up",{"owner":"agent","error":"Acceptance review deadline exhausted","source_event_id":event["id"]})
+            actions.append({"task_id":tid,"acceptance_review_stopped":True})
+    # The live pilot mislabeled reviewer approval as Harry input. Repairs are
+    # provably agent-owned: hand existing candidate evidence to a real reviewer,
+    # never approve it or restart implementation merely to escape the hold.
+    for row in conn.execute("SELECT * FROM tasks WHERE created_by='operator-repair' AND status='blocked' AND block_kind='needs_input' AND claim_lock IS NULL").fetchall():
+        tid=row["id"]; blocked=_last(conn,tid,"blocked")
+        try:
+            reviewer=dispatch_owner(conn,cfg.get("review_assignee","reviewer"))
+            if reviewer==row["assignee"]:
+                raise ValueError("repair reviewer must differ from implementer")
+            workspace=Path(row["workspace_path"]) if row["workspace_path"] else None
+            database=Path(next(r[2] for r in conn.execute("PRAGMA database_list") if r[1]=='main'))
+            artifacts=[]
+            if workspace and workspace.resolve()==(database.parent/"workspaces"/tid).resolve():
+                for name in ("REPAIR_EVIDENCE.md","VERIFICATION_OUTPUT.txt"):
+                    path=workspace/name
+                    if path.is_file() and path.resolve().parent==workspace.resolve():
+                        artifacts.append(str(path))
+            summary="Agent-owned independent review: verify the repair against the original request and authority. Do not accept relabeling agent deployment or review as Harry input. Prior implementation run/comments are candidate evidence. " + str(_payload(blocked).get("reason", ""))
+            accepted,reason=kb.request_review(conn,tid,summary=summary,reviewer=reviewer,metadata={"artifacts":artifacts,"_explicit_artifacts":list(artifacts)} if artifacts else None,with_reason=True,resume_agent_repair=True)
+            if not accepted:
+                raise ValueError(reason or "native review handoff refused")
+            with kb.write_txn(conn):
+                kb._append_event(conn,tid,"operator_agent_review_handoff",{"owner":"agent","reviewer":reviewer,"source_event_id":blocked["id"] if blocked else None,"due_at":now+runtime,"acceptance":"unproved"})
+            actions.append({"task_id":tid,"agent_review_handoff":reviewer})
+        except Exception as error:
+            _exception(conn,tid,"agent_review_handoff_failed",error=str(error)[:300])
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET block_kind='capability' WHERE id=? AND status='blocked' AND block_kind='needs_input' AND claim_lock IS NULL",(tid,))
+                kb._append_event(conn,tid,"operator_agent_hold_reconciled",{"owner":"agent","reason":"independent review handoff failed; Harry does not own this repair"})
     # Repair the exact historical auto-rekind bug; explicit needs_input is never guessed away.
     for row in conn.execute("SELECT * FROM tasks WHERE status IN ('blocked','triage') AND claim_lock IS NULL").fetchall():
         tid=row["id"]
@@ -254,12 +328,24 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
         pending += 1
 
     for event in conn.execute("SELECT e.* FROM task_events e JOIN tasks t ON t.id=e.task_id "
-                              "WHERE e.kind='operator_repair_created' AND t.status='blocked'").fetchall():
+                              "WHERE e.kind='operator_repair_created' AND t.status!='archived'").fetchall():
         tid = event["task_id"]
         info = _payload(event)
         repair = kb.get_task(conn, info["repair_task_id"])
         if not repair:
             continue
+        # Repair workers have direct terminal tools. Reconcile accidental raw
+        # row edits with the durable hold instead of trusting a relabeled flag.
+        if not _last(conn,tid,"operator_repair_verified"):
+            original=kb.get_task(conn,tid)
+            if original.claim_lock is not None:
+                if not kb.block_task(conn,tid,reason="Agent-owned repair "+repair.id+" requires independent acceptance before execution.",kind="dependency"):
+                    _exception(conn,tid,"repair_hold_worker_stop_unproved",repair_task_id=repair.id)
+                original=kb.get_task(conn,tid)
+            if original.claim_lock is None and (original.status!='blocked' or original.block_kind!='dependency'):
+                with kb.write_txn(conn):
+                    conn.execute("UPDATE tasks SET status='blocked',block_kind='dependency' WHERE id=? AND claim_lock IS NULL",(tid,))
+                    kb._append_event(conn,tid,"operator_repair_hold_reconciled",{"owner":"agent","repair_task_id":repair.id,"previous_status":original.status,"previous_block_kind":original.block_kind})
         reviewed = _last(conn, repair.id, "review_requested")
         completed = _last(conn, repair.id, "completed")
         # A bare done flag, copied summary or self-marked repair is insufficient.
@@ -276,11 +362,16 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
                     kb._append_event(conn, tid, "operator_repair_verified",
                                      {"repair_task_id": repair.id, "review_run_id": completed["run_id"]})
                 actions.append({"task_id": tid, "resumed_after_repair": repair.id})
-        elif now >= info["due_at"]:
+        else:
+            first_review=conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='review_requested' ORDER BY id LIMIT 1",(repair.id,)).fetchone()
+            review_handoff=_last(conn,repair.id,"operator_agent_review_handoff")
+            phase_due=(_payload(review_handoff)["due_at"] if review_handoff else first_review["created_at"]+runtime) if first_review else info["due_at"]
+            if now < phase_due:
+                continue
             if not _last(conn, tid, "operator_repair_overdue"):
                 with kb.write_txn(conn):
                     kb._append_event(conn, tid, "operator_repair_overdue",
-                                     {"repair_task_id": repair.id, "owner": "agent", "due_at": info["due_at"]})
+                                     {"repair_task_id": repair.id, "owner": "agent", "due_at": phase_due,"phase":"review" if first_review else "implementation"})
                 actions.append({"task_id": tid, "exception": "repair_deadline_exceeded"})
             # A total repair deadline must prevent endless goal-mode attempts.
             # Native external block proves the worker tree gone before clearing
@@ -293,7 +384,7 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
                     stopped = conn.execute("UPDATE tasks SET status='blocked',block_kind=NULL WHERE id=? AND status=? AND claim_lock IS NULL",(repair.id,repair.status)).rowcount > 0
             if stopped:
                 with kb.write_txn(conn):
-                    kb._append_event(conn,repair.id,"operator_repair_stopped",{"owner":"agent","due_at":info["due_at"],"original_task_id":tid})
+                    kb._append_event(conn,repair.id,"operator_repair_stopped",{"owner":"agent","due_at":phase_due,"original_task_id":tid})
                 actions.append({"task_id":tid,"repair_stopped":repair.id})
     return actions
 

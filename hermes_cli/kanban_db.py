@@ -3754,6 +3754,11 @@ def block_task(
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    if kind == "needs_input":
+        from hermes_cli.kanban_operator import policy
+        repair = conn.execute("SELECT created_by FROM tasks WHERE id=?",(task_id,)).fetchone()
+        if repair and repair["created_by"] == "operator-repair" and policy(conn).get("enabled",False):
+            raise ValueError("Agent-owned repair cannot ask Harry: request independent review from a different profile, or record an agent exception with dependency/transient/capability.")
     # A worker blocking its own matching run will exit through its in-band
     # lifecycle. Any unowned/operator block must prove the worker tree gone
     # before it may erase the claim.
@@ -3909,6 +3914,8 @@ def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
+    resume_agent_repair: bool = False,
+    resume_audited_origin: bool = False,
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
 
@@ -3935,7 +3942,7 @@ def request_review(
     metadata = redact_review_value(metadata)
     # Rejected work must change before a fresh review. A new narration of the
     # same candidate is not rework (live release card repeated this five times).
-    from hermes_cli.kanban_operator import policy, _last, _payload, candidate_fingerprint
+    from hermes_cli.kanban_operator import policy, _last, _last_hold, _payload, candidate_fingerprint
     candidate_hash = candidate_fingerprint(conn, task_id, metadata) if policy(conn).get("enabled", False) else None
     if policy(conn).get("enabled", False):
         changes = _last(conn, task_id, "changes_requested")
@@ -3957,10 +3964,30 @@ def request_review(
                 return _ret(False, "parent dependencies are not satisfied")
             trow = conn.execute(
                 "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
-                "worker_started_at FROM tasks WHERE id = ?", (task_id,),
+                "worker_started_at,created_by,block_kind FROM tasks WHERE id = ?", (task_id,),
             ).fetchone()
             if trow is None:
                 return _ret(False, "task not found")
+            repair_handoff = (resume_agent_repair and policy(conn).get("enabled",False) and
+                              trow["created_by"]=="operator-repair" and trow["status"]=="blocked" and
+                              trow["block_kind"]=="needs_input" and trow["claim_lock"] is None)
+            if resume_agent_repair and not repair_handoff:
+                return _ret(False,"agent review recovery requires an unclaimed operator repair held as needs_input")
+            if repair_handoff and (not reviewer or _canonical_assignee(reviewer)==trow["assignee"]):
+                return _ret(False,"agent repair review requires a different named reviewer")
+            origin_policy=policy(conn)
+            origin=conn.execute("SELECT 1 FROM task_user_origins WHERE task_id=?",(task_id,)).fetchone()
+            audited_fault=(origin_policy.get("agent_owned_faults") or {}).get(task_id,{})
+            last_block=_last_hold(conn,task_id)
+            audited_hold=(trow["status"] in ('blocked','triage') and last_block and
+                          audited_fault.get("blocked_event_id")==last_block["id"] and audited_fault.get("source") and audited_fault.get("reason"))
+            origin_handoff=(resume_audited_origin and origin_policy.get("enabled",False) and origin and
+                            task_id in origin_policy.get("cohort_task_ids",[]) and trow["claim_lock"] is None and
+                            (trow["status"]=='done' or audited_hold))
+            if resume_audited_origin and not origin_handoff:
+                return _ret(False,"origin review recovery requires a completed audited cohort request or an exact declared agent fault; genuine human choices are preserved")
+            if origin_handoff and (not reviewer or _canonical_assignee(reviewer)==trow["assignee"]):
+                return _ret(False,"origin acceptance review requires a different named reviewer")
             # Refuse to clear a live worker's claim without proof of ownership
             # (expected_run_id) or an explicit human override (force=True);
             # the same fence as complete_task (_claim_is_live).
@@ -4011,7 +4038,7 @@ def request_review(
                        worker_pid    = NULL
                 """ + assignee_sql + """
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready'""" + (", 'blocked'" if repair_handoff else ", 'blocked', 'triage', 'done'" if origin_handoff else "") + """)
                 """ + run_guard,
                 params,
             )
@@ -4719,6 +4746,8 @@ def _ctx_header(lines: list[str], conn: sqlite3.Connection, task: Task) -> None:
     if operator_policy.get("enabled", False):
         if origin or task.created_by == "operator-repair":
             lines.append("This original request requires independent review. Request review from a different installed profile; the owned reviewer must reproduce the outcome before completing it. A self-written success summary is rejected. Include the actual reproduction/probe/source evidence in metadata.acceptance_receipts.")
+        if task.created_by == "operator-repair":
+            lines.append("Independent review is agent-owned. Do not block it as needs_input. Review the original authority and requested outcome: relabeling an agent deployment/review step as Harry input is a failed repair. The implementer's 'independent verification' report is candidate evidence until a different profile reproduces the outcome.")
         lines.append("Commit meaningful durable progress with kanban_checkpoint within "
                      + str(operator_policy.get("progress_seconds", 600)) +
                      " seconds. Heartbeats do not renew progress or overall deadlines. Use an internal dependency/transient block for agent faults; ask Harry only for a human-only choice.")
