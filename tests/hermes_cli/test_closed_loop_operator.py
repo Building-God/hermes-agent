@@ -225,6 +225,58 @@ def test_terminal_recovery_has_new_actual_evidence_after_rejected_candidate(boar
     assert operator._last(board,tid,'completed')['id']==completed['id']
 
 
+def test_state_answer_is_native_verified_facts_not_unreproduced_shell_narration(board,monkeypatch):
+    tid,settings=accepted_origin(board,monkeypatch)
+    other=kb.create_task(board,title='Unresolved real work',assignee='pilot')
+    assert kb.block_task(board,other,kind='capability',reason='Agent failure remains')
+    settings['cohort_task_ids'].append(other)
+    settings['state_report_task_ids']=[tid]
+    assert kb.request_review(board,tid,reviewer='pilot',resume_audited_origin=True)
+    review=kb.claim_review_task(board,tid)
+    assert kb.complete_task(board,tid,result='System OPERATIONAL & HEALTHY; all problems fixed',expected_run_id=review.current_run_id)
+    answer=kb.get_task(board,tid).result
+    assert other in answer and 'blocked' in answer and 'agent-owned failure remains unresolved' in answer
+    assert 'HEALTHY' not in answer
+    assert 'Older cards outside this audit remain unverified' in answer
+    complete=operator._payload(operator._last(board,tid,'completed'))
+    facts=complete['acceptance_receipts']['native_live_state']['requests']
+    assert any(item['task_id']==other and item['status']=='blocked' for item in facts)
+    assert operator._last(board,tid,'operator_narrative_superseded')
+
+
+def test_native_review_rejects_wrong_ownership_predicate_without_spending_rework(board,monkeypatch):
+    tid,repair,settings=failed_origin_repair(board)
+    monkeypatch.setattr(operator,'policy',lambda conn:settings)
+    worker=kb.claim_task(board,repair)
+    assert kb.request_review(board,repair,reviewer='reviewer',expected_run_id=worker.current_run_id)
+    review=kb.claim_review_task(board,repair)
+    ok,reason=kb.request_changes(board,repair,reason="block_kind is STILL dependency, not needs_input. Execute the SQL UPDATE on the live database.",expected_run_id=review.current_run_id)
+    assert not ok and 'contradicts native repair authority' in reason
+    assert kb.get_task(board,repair).status=='running'
+    assert kb.get_task(board,tid).block_kind=='dependency'
+    assert operator._last(board,repair,'changes_requested') is None
+    assert operator._last(board,repair,'operator_review_contract_rejected')
+    ok,reason=kb.request_changes(board,repair,reason='The old reviewer was wrong to require needs_input; the actual Discord outcome still fails reproduction.',expected_run_id=review.current_run_id)
+    assert ok
+
+
+def test_failed_corrective_acceptance_has_one_final_terminal_phase(board,monkeypatch):
+    tid,settings=accepted_origin(board,monkeypatch)
+    completed=operator._last(board,tid,'completed')
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'operator_acceptance_invalidated',{'source_completed_event_id':completed['id'],'reason':'False acceptance'})
+        kb._append_event(board,tid,'operator_acceptance_stopped',{'owner':'agent','due_at':1})
+        board.execute("UPDATE tasks SET status='blocked',block_kind='capability' WHERE id=?",(tid,))
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,tid).status=='review'
+    phase=operator._last(board,tid,'operator_acceptance_recovery')
+    due=operator._payload(phase)['due_at']
+    operator.reconcile(board,settings=settings,now=due)
+    operator.reconcile(board,settings=settings,now=due+1)
+    assert operator._last(board,tid,'operator_acceptance_recovery')['id']==phase['id']
+    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_terminal_review_handoff'",(tid,)).fetchone()[0]==1
+
+
 def test_deadline_creates_owned_runnable_task_and_exact_route_once(board):
     first = ensure_continuation(entry())
     assert ensure_continuation(entry()) == first

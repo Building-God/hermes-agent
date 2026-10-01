@@ -3216,6 +3216,13 @@ def complete_task(
             with write_txn(conn):
                 _append_event(conn,task_id,"completion_review_required",{"owner":"agent","reason":"original request needs a different profile's owned review run"},run_id=run_id)
             raise ValueError("Independent review required: request_review first, then a different profile verifies and completes its owned review run.")
+        from hermes_cli.kanban_acceptance_truth import native_state_report
+        native_report=native_state_report(conn,task_id,policy(conn))
+        if native_report:
+            narrative=str(result or '')+' '+str(summary or '')
+            result,report_facts=native_report
+            summary=result
+            metadata={**(metadata if isinstance(metadata,dict) else {}),'acceptance_receipts':{'native_live_state':report_facts},'operator_narrative_sha256':hashlib.sha256(narrative.encode()).hexdigest()}
         receipts = metadata.get("acceptance_receipts") if isinstance(metadata,dict) else None
         if not isinstance(receipts,(dict,list)) or not receipts:
             raise ValueError("Independent acceptance evidence required: include actual reproduction/probe/source receipts in metadata.acceptance_receipts; a reassuring summary is insufficient.")
@@ -3260,6 +3267,12 @@ def complete_task(
                 if claim_failure:
                     raise ValueError(claim_failure)
                 metadata['operator_health_snapshot']=health_snapshot(conn,policy(conn),task_id)
+                native_report=native_state_report(conn,task_id,policy(conn))
+                if native_report:
+                    result,report_facts=native_report
+                    summary=handoff_summary=result
+                    metadata['acceptance_receipts']={'native_live_state':report_facts}
+                    _append_event(conn,task_id,'operator_narrative_superseded',{'owner':'agent','reason':'Declared live-state answer uses independent native facts; caller narration is not acceptance evidence','narrative_sha256':metadata['operator_narrative_sha256']},run_id=run_id)
             if operator_guarded and isinstance(metadata,dict) and metadata.get('operator_repair_contract'):
                 current_contract,contract_failure=repair_contract(conn,task_id)
                 if contract_failure or current_contract != metadata['operator_repair_contract']:
@@ -4190,6 +4203,12 @@ def request_changes(
         claimed_payload = _json_dict(_row_get(claimed_event, "payload"))
         if claimed_payload.get("source_status") != "review":
             return False, "active run was not claimed from review"
+
+        from hermes_cli.kanban_acceptance_truth import repair_review_failure
+        authority_failure=repair_review_failure(conn,task_id,reason)
+        if authority_failure:
+            _append_event(conn,task_id,'operator_review_contract_rejected',{'owner':'agent','reason':authority_failure,'rejected_reason_sha256':hashlib.sha256(reason.encode()).hexdigest()},run_id=current_run_id)
+            return False,authority_failure
 
         requested_event = _latest_event(conn, task_id, "review_requested")
         if requested_event is None:

@@ -147,3 +147,10 @@ R5 real-request counterexamples corrected in R6:
 - A formal original -> repair edge made an agent repair wait for the failed original, which was itself waiting for that repair. Reconciliation reverses only that exact edge when durable repair provenance, authenticated origin, original dependency hold, and absent claims agree. Other parents remain intact. A remaining cycle rolls back and retains the agent exception.
 - Historical terminal review after a rejected candidate needs genuinely new evidence. The handoff includes native invalidation/terminal event receipts, explicitly limited to failure provenance. It neither renews the phase nor proves the requested functional outcome.
 - Controlled drills include unrelated-parent preservation, transactional cycle rollback, unchanged evidence after rejection, and one bounded terminal handoff. No live R5 intervention occurred during the fixed trial while these inactive corrections were built.
+
+
+Additional R5 observed evidence failures:
+
+- Native review rejects the observed demand to change an agent-owned original from dependency to needs_input. The rejected predicate stays an agent exception; it does not spend another rework attempt or authorize live SQL ownership mutation. Actual functional rejection remains available.
+- Declared authenticated live-state questions use independent native ledger/platform reads in the completion transaction. Their canonical answer names unresolved requests, owners, unavailable/unproved platforms, audit scope, and unverified older cards. Caller narration is superseded with a recorded hash; native factual receipts do not claim repairs are complete or infer human receipt. An owned different-profile review is still required.
+- An invalidated result whose corrective acceptance exhausted its fixed phase gets at most one final terminal correction, using new failure evidence. It cannot restart original execution or renew that final phase through reconciliation.

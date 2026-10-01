@@ -223,7 +223,8 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
     # without erasing its evidence or replaying the original action.
     for tid in cfg.get('cohort_task_ids',[]):
         task=kb.get_task(conn,tid);completed=_last(conn,tid,'completed');invalid=_last(conn,tid,'operator_acceptance_invalidated')
-        if not task or task.status!='archived' or not completed:
+        failed_acceptance=(task and task.status=='blocked' and task.block_kind=='capability' and _last(conn,tid,'operator_acceptance_stopped'))
+        if not task or (task.status!='archived' and not failed_acceptance) or not completed or _last(conn,tid,'operator_terminal_review_handoff'):
             continue
         from hermes_cli.kanban_acceptance_truth import completion_failure
         declared=(cfg.get('agent_owned_faults') or {}).get(tid,{})
@@ -233,11 +234,11 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
         if (not invalid or invalid['id']<=completed['id']) and not failure:
             continue
         with kb.write_txn(conn):
-            changed=conn.execute("UPDATE tasks SET status='blocked',block_kind='capability' WHERE id=? AND status='archived' AND claim_lock IS NULL",(tid,)).rowcount
+            changed=conn.execute("UPDATE tasks SET status='blocked',block_kind='capability' WHERE id=? AND status=? AND claim_lock IS NULL",(tid,task.status)).rowcount
             if changed:
                 if not invalid or invalid['id']<=completed['id']:
                     kb._append_event(conn,tid,'operator_acceptance_invalidated',{'owner':'agent','source_completed_event_id':completed['id'],'reason':failure})
-                kb._append_event(conn,tid,'operator_terminal_recovered',{'owner':'agent','source_completed_event_id':completed['id'],'reason':'Archived an invalidated result without corrected acceptance/delivery'})
+                kb._append_event(conn,tid,'operator_terminal_recovered',{'owner':'agent','source_completed_event_id':completed['id'],'reason':'Invalidated result lacks corrected acceptance/delivery after terminal failure','previous_status':task.status})
                 kb._append_event(conn,tid,'blocked',{'owner':'agent','kind':'capability','reason':'Agent-owned terminal acceptance failure; original request remains owned.'})
     for tid in cfg.get('cohort_task_ids',[]):
         task=kb.get_task(conn,tid);terminal=_last(conn,tid,'operator_terminal_recovered')
