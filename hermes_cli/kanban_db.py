@@ -4030,7 +4030,7 @@ def request_review(
             audit=(policy(conn).get('audited_repair_faults') or {}).get(task_id,{})
             authority=repair_authority(conn,task_id)
             audit_event=conn.execute("SELECT id FROM task_events WHERE task_id=? AND id=? AND kind IN ('blocked','changes_requested','operator_repair_stopped')",(task_id,audit.get('event_id'))).fetchone()
-            native_contract,native_failure=repair_contract(conn,task_id)
+            native_contract,native_failure=repair_contract(conn,task_id,audited_native_restoration=resume_audited_repair)
             audited_repair_hold=(resume_audited_repair and authority and authority['event']['task_id'] in policy(conn).get('cohort_task_ids',[])
                                 and audit_event and audit_event['id']==audited_repair_latest_fault_id(conn,task_id)
                                 and audit.get('source') and audit.get('reason') and not native_failure

@@ -65,7 +65,7 @@ def audited_repair_attempt_allowed(conn,repair_id,audit,cfg=None):
     return not phases or event_id>phases[-1]['id']
 
 
-def repair_contract(conn, repair_id):
+def repair_contract(conn, repair_id, *, audited_native_restoration=False):
     """Machine check the owned transition; this is not functional acceptance."""
     authority=repair_authority(conn,repair_id)
     if authority is None:
@@ -75,13 +75,15 @@ def repair_contract(conn, repair_id):
     review=_last(conn,repair_id,'review_requested')
     boundary=max(changes['id'] if changes else event['id'],review['id'] if review else event['id'])
     drift=conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='operator_repair_hold_reconciled' AND id>? ORDER BY id DESC LIMIT 1",(event['task_id'],boundary)).fetchone()
-    if original is None or original['status']!='blocked' or original['block_kind']!='dependency' or original['claim_lock'] is not None or drift:
+    restored=(audited_native_restoration and drift and _payload(drift).get('owner')=='agent' and _payload(drift).get('repair_task_id')==repair_id)
+    if original is None or original['status']!='blocked' or original['block_kind']!='dependency' or original['claim_lock'] is not None or (drift and not restored):
         return None,('Repair failed its native authority contract: keep the original agent-owned dependency hold until independent acceptance. '
                      'Do not relabel it needs_input or edit its row directly. Reproduce and repair the original requested outcome; '
                      'changing ownership flags or asking Harry for deployment/review is not acceptance.')
     return {'original_task_id':event['task_id'],'fault_event_id':_payload(event).get('fault_event_id'),
             'origin_message_id':authority['origin']['message_id'] if authority['origin'] else None,
-            'owner':'agent','checks':['original_hold_intact','no_execution_claim','no_hold_drift_this_candidate']},None
+            'owner':'agent','historical_native_restoration_event_id':drift['id'] if restored else None,
+            'checks':['original_hold_intact','no_execution_claim','audited_native_restoration_before_new_review' if restored else 'no_hold_drift_this_candidate']},None
 
 
 def agent_answer_claim_failure(conn,task_id,text):
@@ -443,7 +445,7 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
         task=kb.get_task(conn,repair_id)
         if not task or task.claim_lock or task.status not in ('blocked','todo') or not audited_repair_attempt_allowed(conn,repair_id,audit,cfg):
             continue
-        contract,failure=repair_contract(conn,repair_id)
+        contract,failure=repair_contract(conn,repair_id,audited_native_restoration=True)
         if failure or not contract:continue
         try:
             prior_review=_last(conn,repair_id,'review_requested')
@@ -676,6 +678,14 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
         # row edits with the durable hold instead of trusting a relabeled flag.
         if not _last(conn,tid,"operator_repair_verified"):
             original=kb.get_task(conn,tid)
+            hold=_last_hold(conn,tid)
+            diagnosis=(cfg.get('agent_owned_faults') or {}).get(tid,{})
+            diagnosed=(hold and diagnosis.get('blocked_event_id')==hold['id'] and diagnosis.get('source') and diagnosis.get('reason'))
+            if original.block_kind=='needs_input' and hold and hold['id']>event['id'] and _payload(hold).get('kind')=='needs_input' and not diagnosed:
+                # A new typed native choice outranks the older repair diagnosis.
+                # Raw row relabels have no matching native choice event.
+                _exception(conn,tid,'repair_waits_for_new_harry_only_choice',blocked_event_id=hold['id'],repair_task_id=repair.id)
+                continue
             if original.claim_lock is not None:
                 if not kb.block_task(conn,tid,reason="Agent-owned repair "+repair.id+" requires independent acceptance before execution.",kind="dependency"):
                     _exception(conn,tid,"repair_hold_worker_stop_unproved",repair_task_id=repair.id)
