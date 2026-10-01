@@ -88,13 +88,13 @@ KANBAN_LIST_SCHEMA = _schema(
 KANBAN_STATUS_SCHEMA = _schema(
     "kanban_status",
     (
-        "Call this FIRST for any operator question about live agent work — "
+        "Call this FIRST for any operator question about live agent work - "
         "'Are you working?', 'What is happening?', 'Is anything running?', "
         "'What are you doing right now?', 'Anything in progress?'. Returns a "
         "bounded, read-only board snapshot: open/done counts, running vs "
         "blocked vs ready split, open task titles with event/checkpoint "
         "times, preserved-result sources, and notifier cursor state. Gateway "
-        "online is not the same as work running — a board with zero running "
+        "online is not the same as work running - a board with zero running "
         "cards means no active agent work even if you are answering. When "
         "reporting to the operator, exclude 'ledger' / assignee-empty triage "
         "cards from actionable work; those are internal-only rows the "
@@ -141,7 +141,10 @@ KANBAN_COMPLETE_SCHEMA = _schema(
                 "Free-form dict of structured facts about this "
                 "attempt - {\"changed_files\": [...], \"tests_run\": 12, "
                 "\"findings\": [...]}. Surfaced to downstream "
-                "workers alongside ``summary``."
+                "workers alongside ``summary``. Independent closed-loop reviews "
+                "must supply actual evidence in metadata.acceptance_receipts, "
+                "for example {\"acceptance_receipts\": {\"probe\": \"observed result and source\"}}. "
+                "The goal judge receives these structured receipts."
         )),
         "result": _prop("string", (
                 "Short result log line (legacy field, maps to "

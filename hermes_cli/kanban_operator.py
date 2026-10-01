@@ -51,6 +51,15 @@ def verified_repair_for_original(conn,original_id):
     return {'repair_task_id':repair_id,'review_run_id':completed['run_id']}
 
 
+def audited_repair_attempt_allowed(conn,repair_id,audit,cfg=None):
+    cfg=cfg or policy(conn)
+    phases=conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='operator_authority_review_handoff' ORDER BY id",(repair_id,)).fetchall()
+    event_id=audit.get('event_id')
+    if not isinstance(event_id,int) or event_id<=0 or len(phases)>=int(cfg.get('max_audited_repair_faults',3)):return False
+    if any(_payload(p).get('audit_event_id')==event_id for p in phases):return False
+    return not phases or event_id>phases[-1]['id']
+
+
 def repair_contract(conn, repair_id):
     """Machine check the owned transition; this is not functional acceptance."""
     authority=repair_authority(conn,repair_id)
@@ -374,11 +383,41 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
     # The live pilot mislabeled reviewer approval as Harry input. Repairs are
     # provably agent-owned: hand existing candidate evidence to a real reviewer,
     # never approve it or restart implementation merely to escape the hold.
+    # A reviewer mistook our recorded ownership guard for a broken SQL engine.
+    # Only exact native guard provenance permits one evidence-changing rework;
+    # preserve the ended review run and all original stop/deadline evidence.
+    for row in conn.execute("SELECT * FROM tasks WHERE created_by='operator-repair' AND status='blocked' AND claim_lock IS NULL").fetchall():
+        repair_id=row['id']
+        if _last(conn,repair_id,'operator_invalid_review_rework'):continue
+        authority=repair_authority(conn,repair_id);review=_last(conn,repair_id,'review_requested');hold=_last_hold(conn,repair_id)
+        if not authority or not review or not hold or hold['id']<=review['id']:continue
+        reason=str(_payload(hold).get('reason',''))
+        if not re.search(r'kernel|transaction',reason,re.I) or not re.search(r'roll.?back|roll back',reason,re.I):continue
+        guard=conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='operator_repair_hold_reconciled' AND id>? AND id<? ORDER BY id DESC LIMIT 1",(authority['event']['task_id'],review['id'],hold['id'])).fetchone()
+        if not guard or _payload(guard).get('repair_task_id')!=repair_id or _payload(guard).get('previous_block_kind')!='needs_input':continue
+        original=kb.get_task(conn,authority['event']['task_id'])
+        reviewed_run=conn.execute('SELECT profile,outcome FROM task_runs WHERE id=?',(hold['run_id'],)).fetchone()
+        implementer=dispatch_owner(conn,_payload(review).get('implementer'))
+        if not implementer or not original or original.status!='blocked' or original.block_kind!='dependency' or original.claim_lock or not reviewed_run or reviewed_run['profile']!=_payload(review).get('reviewer') or reviewed_run['outcome']!='blocked' or not kb._parents_satisfied(conn,repair_id):continue
+        due=now+min(runtime,int(cfg.get('rework_seconds',900)))
+        proof={'owner':'agent','blocked_event_id':hold['id'],'native_guard_event_id':guard['id'],'review_run_id':hold['run_id'],'implementer':implementer,'due_at':due,'scope':'Native ownership guard caused restoration; kernel rollback diagnosis disproved. Functional repair remains unproved.'}
+        with kb.write_txn(conn):
+            current_original=kb.get_task(conn,authority['event']['task_id'])
+            current_hold=_last_hold(conn,repair_id);current_review=_last(conn,repair_id,'review_requested')
+            if _last(conn,repair_id,'operator_invalid_review_rework') or not current_hold or current_hold['id']!=hold['id'] or not current_review or current_review['id']!=review['id'] or not current_original or current_original.status!='blocked' or current_original.block_kind!='dependency' or current_original.claim_lock or not kb._parents_satisfied(conn,repair_id):continue
+            changed=conn.execute("UPDATE tasks SET status='ready',assignee=?,block_kind=NULL WHERE id=? AND status='blocked' AND claim_lock IS NULL",(implementer,repair_id)).rowcount
+            if not changed:continue
+            kb._append_event(conn,repair_id,'operator_review_contract_rejected',proof)
+            kb._append_event(conn,repair_id,'operator_agent_review_handoff',proof)
+            kb._append_event(conn,repair_id,'changes_requested',{**proof,'source':'native_guard_correction','reason':'Reproduce the original functional outcome. Native reconciliation intentionally restores agent ownership; do not change original block_kind, pause the dispatcher or blame transaction isolation.','reviewer_not_inferred':True})
+            kb._append_event(conn,repair_id,'operator_rework_due',{'due_at':due,'owner':'agent'})
+            kb._append_event(conn,repair_id,'operator_invalid_review_rework',proof)
+        actions.append({'task_id':repair_id,'native_guard_rework_owner':implementer})
     # Exact independently audited historical repair faults get one ownership
     # correction review. This verifies authority only, never functional success.
     for repair_id,audit in (cfg.get('audited_repair_faults') or {}).items():
         task=kb.get_task(conn,repair_id)
-        if not task or task.claim_lock or task.status not in ('blocked','todo') or _last(conn,repair_id,'operator_authority_review_handoff'):
+        if not task or task.claim_lock or task.status not in ('blocked','todo') or not audited_repair_attempt_allowed(conn,repair_id,audit,cfg):
             continue
         contract,failure=repair_contract(conn,repair_id)
         if failure or not contract:continue
@@ -639,7 +678,7 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
                         reviewer=acceptance_owner(conn,cfg,original.assignee)
                     with kb.write_txn(conn):
                         conn.execute("UPDATE tasks SET max_runtime_seconds=MIN(COALESCE(max_runtime_seconds,?),?) WHERE id=? AND status='blocked' AND claim_lock IS NULL",(runtime,runtime,tid))
-                    accepted,reason=kb.request_review(conn,tid,reviewer=reviewer,summary='The bounded agent repair passed native independent acceptance. Verify the original requested outcome against existing effects and repair evidence, and deliver a substantive result. Original execution time is exhausted: do not replay external actions or claim Harry receipt.',resume_verified_repair=True,with_reason=True)
+                    accepted,reason=kb.request_review(conn,tid,reviewer=reviewer,summary='The bounded agent repair passed native independent acceptance. Verify the original requested outcome against existing effects and repair evidence, and deliver a substantive result. Original execution time is exhausted: do not replay external actions or claim Harry receipt.',metadata={'acceptance_receipts':{'native_verified_repair':{'repair_task_id':repair.id,'completed_event_id':completed['id'],'review_run_id':completed['run_id'],'implementer':implementer,'reviewer':run['profile'],'acceptance_receipts':evidence,'operator_repair_contract':contract}}},resume_verified_repair=True,with_reason=True)
                     if not accepted:
                         raise ValueError(reason or 'native original acceptance handoff refused')
                     with kb.write_txn(conn):
