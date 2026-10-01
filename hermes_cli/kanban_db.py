@@ -2662,6 +2662,9 @@ def _claim_and_open_run(
 ) -> Optional[int]:
     """CAS ``source_status -> running``, open a run row, emit ``claimed``; None
     when the CAS lost. Caller holds the txn."""
+    from hermes_cli.kanban_acceptance_truth import execution_claim_allowed
+    if not execution_claim_allowed(conn,task_id,source_status):
+        return None
     cur = conn.execute(
         f"""
         UPDATE tasks
@@ -3216,8 +3219,9 @@ def complete_task(
         receipts = metadata.get("acceptance_receipts") if isinstance(metadata,dict) else None
         if not isinstance(receipts,(dict,list)) or not receipts:
             raise ValueError("Independent acceptance evidence required: include actual reproduction/probe/source receipts in metadata.acceptance_receipts; a reassuring summary is insufficient.")
-        from hermes_cli.kanban_operator import repair_contract,agent_answer_claim_failure
-        claim_failure=agent_answer_claim_failure(conn,task_id,str(result or '')+' '+str(summary or ''))
+        from hermes_cli.kanban_operator import repair_contract
+        from hermes_cli.kanban_acceptance_truth import completion_failure,health_snapshot
+        claim_failure=completion_failure(conn,task_id,str(result or '')+' '+str(summary or ''),policy(conn))
         if claim_failure:
             accepted,detail=request_changes(conn,task_id,reason=claim_failure,expected_run_id=run_id)
             if not accepted:
@@ -3233,6 +3237,7 @@ def complete_task(
             metadata={**metadata,'operator_repair_contract':contract}
         elif isinstance(metadata,dict):
             metadata={k:v for k,v in metadata.items() if k!='operator_repair_contract'}
+        metadata={**metadata,'operator_health_snapshot':health_snapshot(conn,policy(conn),current_task=task_id)}
         if result is None and summary:
             result = summary  # The canonical card result must retain the substantive answer.
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
@@ -3251,9 +3256,10 @@ def complete_task(
     try:
         with write_txn(conn):
             if operator_guarded:
-                claim_failure=agent_answer_claim_failure(conn,task_id,str(result or '')+' '+str(summary or ''))
+                claim_failure=completion_failure(conn,task_id,str(result or '')+' '+str(summary or ''),policy(conn))
                 if claim_failure:
                     raise ValueError(claim_failure)
+                metadata['operator_health_snapshot']=health_snapshot(conn,policy(conn),task_id)
             if operator_guarded and isinstance(metadata,dict) and metadata.get('operator_repair_contract'):
                 current_contract,contract_failure=repair_contract(conn,task_id)
                 if contract_failure or current_contract != metadata['operator_repair_contract']:
@@ -3450,6 +3456,8 @@ def _completed_event_payload(
             payload["acceptance_receipts"] = metadata["acceptance_receipts"]
         if metadata.get("operator_repair_contract"):
             payload["operator_repair_contract"] = metadata["operator_repair_contract"]
+        if metadata.get('operator_health_snapshot'):
+            payload['operator_health_snapshot']=metadata['operator_health_snapshot']
         cleaned = _cleaned_artifact_paths(metadata)
         if cleaned:
             payload["artifacts"] = cleaned
@@ -3946,7 +3954,9 @@ def request_review(
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
     resume_agent_repair: bool = False,
+    resume_audited_repair: bool = False,
     resume_verified_repair: bool = False,
+    resume_failed_terminal: bool = False,
     resume_audited_origin: bool = False,
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
@@ -4003,9 +4013,22 @@ def request_review(
             from hermes_cli.kanban_operator import repair_descendant_hold
             repair_block=_last_hold(conn,task_id)
             circular_hold=(trow['block_kind']=='dependency' and repair_block and repair_descendant_hold(conn,task_id,_json_dict(repair_block['payload']).get('reason')))
+            from hermes_cli.kanban_operator import repair_authority,repair_contract
+            audit=(policy(conn).get('audited_repair_faults') or {}).get(task_id,{})
+            authority=repair_authority(conn,task_id)
+            audit_event=conn.execute("SELECT id FROM task_events WHERE task_id=? AND id=? AND kind IN ('blocked','changes_requested')",(task_id,audit.get('event_id'))).fetchone()
+            native_contract,native_failure=repair_contract(conn,task_id)
+            audited_repair_hold=(resume_audited_repair and authority and authority['event']['task_id'] in policy(conn).get('cohort_task_ids',[])
+                                and audit_event and audit_event['id']==max((repair_block['id'] if repair_block else 0),(_last(conn,task_id,'changes_requested')['id'] if _last(conn,task_id,'changes_requested') else 0))
+                                and audit.get('source') and audit.get('reason') and not native_failure
+                                and not _last(conn,task_id,'operator_authority_review_handoff')
+                                and trow['status'] in ('blocked','todo') and trow['claim_lock'] is None)
             repair_handoff = (resume_agent_repair and policy(conn).get("enabled",False) and
                               trow["created_by"]=="operator-repair" and trow["status"]=="blocked" and
                               (trow["block_kind"]=="needs_input" or circular_hold) and trow["claim_lock"] is None)
+            repair_handoff=repair_handoff or audited_repair_hold
+            if resume_audited_repair and not audited_repair_hold:
+                return _ret(False,"audited repair recovery requires exact agent fault evidence, original native authority, and no prior corrective handoff")
             if resume_agent_repair and not repair_handoff:
                 return _ret(False,"agent review recovery requires an unclaimed operator repair with a human-review misclassification or verified circular descendant hold")
             if repair_handoff and (not reviewer or _canonical_assignee(reviewer)==trow["assignee"]):
@@ -4018,8 +4041,17 @@ def request_review(
                           audited_fault.get("blocked_event_id")==last_block["id"] and audited_fault.get("source") and audited_fault.get("reason"))
             from hermes_cli.kanban_operator import verified_repair_for_original
             verified_hold=(resume_verified_repair and trow['status']=='blocked' and verified_repair_for_original(conn,task_id))
+            from hermes_cli.kanban_acceptance_truth import _last as _truth_last, _data as _truth_data
+            terminal=_truth_last(conn,task_id,'operator_terminal_recovered')
+            terminal_completed=_truth_last(conn,task_id,'completed')
+            terminal_hold=(resume_failed_terminal and trow['status']=='blocked' and terminal and terminal_completed
+                           and not _truth_last(conn,task_id,'operator_terminal_review_handoff')
+                           and task_id in origin_policy.get('cohort_task_ids',[])
+                           and _truth_data(terminal).get('source_completed_event_id')==terminal_completed['id'])
             origin_handoff=(origin_policy.get("enabled",False) and origin and trow["claim_lock"] is None and
-                            ((resume_audited_origin and task_id in origin_policy.get("cohort_task_ids",[]) and (trow["status"]=='done' or audited_hold)) or verified_hold))
+                            ((resume_audited_origin and task_id in origin_policy.get("cohort_task_ids",[]) and (trow["status"]=='done' or audited_hold)) or verified_hold or terminal_hold))
+            if resume_failed_terminal and not origin_handoff:
+                return _ret(False,'terminal recovery requires the exact invalidated cohort completion, no live claim, and no prior terminal handoff')
             if resume_verified_repair and not origin_handoff:
                 return _ret(False,'original acceptance requires a completed independently verified native repair and an unclaimed blocked original')
             if resume_audited_origin and not origin_handoff:
@@ -4076,7 +4108,7 @@ def request_review(
                        worker_pid    = NULL
                 """ + assignee_sql + """
                  WHERE id = ?
-                   AND status IN ('running', 'ready'""" + (", 'blocked'" if repair_handoff else ", 'blocked', 'triage', 'done'" if origin_handoff else "") + """)
+                   AND status IN ('running', 'ready'""" + (", 'blocked', 'todo'" if repair_handoff else ", 'blocked', 'triage', 'done'" if origin_handoff else "") + """)
                 """ + run_guard,
                 params,
             )
@@ -4563,12 +4595,14 @@ def archive_task(
     recorded on the ``archived`` event payload so the audit trail shows why a
     card was cleared, not just that it was archived.
     """
+    from hermes_cli.kanban_acceptance_truth import require_archive_acceptance
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     if not row or row["status"] == "archived":
         return False
 
+    require_archive_acceptance(conn,task_id)
     was_running = row["status"] == "running"
     prev_pid, prev_lock, prev_started = row["worker_pid"], row["claim_lock"], row["worker_started_at"]
     termination = None
@@ -4582,6 +4616,7 @@ def archive_task(
             return False
 
     with write_txn(conn):
+        require_archive_acceptance(conn,task_id)
         # The state observed before the fence is a CAS input.  In particular a
         # dispatcher claim in this read->write window must not be archived.
         if was_running:
@@ -4791,6 +4826,9 @@ def _ctx_header(lines: list[str], conn: sqlite3.Connection, task: Task) -> None:
     from hermes_cli.kanban_operator import policy
     operator_policy = policy(conn)
     if operator_policy.get("enabled", False):
+        from hermes_cli.kanban_acceptance_truth import health_snapshot
+        lines.extend(['## Native closed-loop facts',json.dumps(health_snapshot(conn,operator_policy,current_task=task.id)),
+                      'These request exceptions and platform states outrank reassuring counts and candidate narration. A status answer must disclose unresolved agent faults. Do not archive work to bypass acceptance or delivery.'])
         if origin or task.created_by == "operator-repair":
             lines.append("This original request requires independent review. Request review from a different installed profile; the owned reviewer must reproduce the outcome before completing it. A self-written success summary is rejected. Include the actual reproduction/probe/source evidence in metadata.acceptance_receipts.")
         if task.created_by == "operator-repair":
