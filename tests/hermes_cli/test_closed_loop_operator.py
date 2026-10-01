@@ -369,6 +369,23 @@ def test_lost_original_route_restores_exact_reply_without_replaying_false_histor
     assert operator._last(board,tid,'result_receipt') is None
 
 
+def test_invalid_result_withdrawn_preserves_exact_evidence_and_does_not_clear_later_truth(board,monkeypatch):
+    tid,settings=accepted_origin(board,monkeypatch,text='The old answer wrongly claimed human confirmation')
+    completed=operator._last(board,tid,'completed')
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'operator_acceptance_invalidated',{'source_completed_event_id':completed['id'],'reason':'False acceptance'})
+        board.execute("UPDATE tasks SET status='archived' WHERE id=?",(tid,))
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,tid).result is None
+    withdrawn=operator._payload(operator._last(board,tid,'operator_invalid_result_withdrawn'))
+    assert withdrawn['previous_result']=='The old answer wrongly claimed human confirmation'
+    assert withdrawn['source_completed_event_id']==completed['id']
+    review=kb.claim_review_task(board,tid)
+    assert kb.complete_task(board,tid,result='New independently reproduced answer; human confirmation is unobserved',expected_run_id=review.current_run_id,metadata={'acceptance_receipts':{'probe':'Actual current original outcome'}})
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,tid).result.startswith('New independently reproduced')
+
+
 def test_deadline_creates_owned_runnable_task_and_exact_route_once(board):
     first = ensure_continuation(entry())
     assert ensure_continuation(entry()) == first

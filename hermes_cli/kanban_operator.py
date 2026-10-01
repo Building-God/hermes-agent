@@ -196,6 +196,21 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
     runtime = max(60, int(cfg.get("attempt_seconds", 900)))
     deadline = max(runtime, int(cfg.get("request_seconds", 7200)))
     actions = []
+    # Invalid acceptance cannot remain the card's canonical answer while its
+    # correction is pending. Preserve exact prior text in durable evidence.
+    for tid in cfg.get('cohort_task_ids',[]):
+        invalid=_last(conn,tid,'operator_acceptance_invalidated');completed=_last(conn,tid,'completed')
+        row=conn.execute('SELECT result FROM tasks WHERE id=?',(tid,)).fetchone()
+        if not row or not row['result'] or not invalid or (completed and completed['id']>invalid['id']):continue
+        with kb.write_txn(conn):
+            latest=_last(conn,tid,'completed');current_invalid=_last(conn,tid,'operator_acceptance_invalidated')
+            if (latest and latest['id']>current_invalid['id']) or (latest and completed and latest['id']!=completed['id']):continue
+            previous=conn.execute('SELECT result FROM tasks WHERE id=?',(tid,)).fetchone()['result']
+            if not previous:continue
+            kb._append_event(conn,tid,'operator_invalid_result_withdrawn',{'owner':'agent','source_completed_event_id':latest['id'] if latest else None,'invalidation_event_id':current_invalid['id'],'previous_result':previous,'previous_result_sha256':hashlib.sha256(previous.encode()).hexdigest(),'reason':'Invalidated acceptance is evidence, not a current answer; independent correction remains owed'})
+            conn.execute('UPDATE tasks SET result=NULL WHERE id=?',(tid,))
+        actions.append({'task_id':tid,'invalid_result_withdrawn':True})
+
     # Archival can remove the original delivery subscription. Restore only
     # invalidated authenticated cohort requests, at a fresh cursor; never replay
     # the old false result or stale artifact/lifecycle backlog.
