@@ -7,6 +7,7 @@ worker faults. Repairs are finite, independently reviewed existing-board tasks.
 from __future__ import annotations
 
 import json
+import re
 import hashlib
 from pathlib import Path
 import time
@@ -105,6 +106,37 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
     runtime = max(60, int(cfg.get("attempt_seconds", 900)))
     deadline = max(runtime, int(cfg.get("request_seconds", 7200)))
     actions = []
+    # Repair the exact historical auto-rekind bug; explicit needs_input is never guessed away.
+    for row in conn.execute("SELECT * FROM tasks WHERE status IN ('blocked','triage') AND claim_lock IS NULL").fetchall():
+        tid=row["id"]
+        if _last(conn,tid,"operator_repair_created"):
+            continue
+        event=_last(conn,tid,"blocked"); payload=_payload(event)
+        if not (payload.get("dependency_unresolved") or
+                (payload.get("requested_kind")=="dependency" and payload.get("rekind_reason")=="no_open_parent")):
+            continue
+        if event["created_at"] < int(cfg.get("activation_at",0)) and tid not in cfg.get("cohort_task_ids",[]):
+            continue
+        if _last(conn,tid,"operator_dependency_reconciled") and _last(conn,tid,"operator_dependency_reconciled")["id"] > event["id"]:
+            continue
+        candidates=sorted(set(re.findall(r"\bt_[a-f0-9]{8}\b",payload.get("reason", "")))-{tid})
+        parents=[parent for parent in candidates if kb.get_task(conn,parent) is not None]
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='blocked',block_kind='dependency' WHERE id=? AND claim_lock IS NULL",(tid,))
+        try:
+            if len(parents)!=1:
+                raise ValueError("missing or ambiguous formal agent dependency")
+            kb.link_tasks(conn,parents[0],tid)  # Native cycle guard remains authoritative.
+            with kb.write_txn(conn):
+                conn.execute("UPDATE tasks SET status='todo',block_kind='dependency' WHERE id=? AND status='blocked' AND claim_lock IS NULL",(tid,))
+                kb._append_event(conn,tid,"operator_dependency_reconciled",{"owner":"agent","source_event_id":event["id"],"parent_task_id":parents[0]})
+            actions.append({"task_id":tid,"dependency_reconciled":parents})
+        except ValueError as error:
+            if not _last(conn,tid,"operator_dependency_fault"):
+                with kb.write_txn(conn):
+                    kb._append_event(conn,tid,"operator_dependency_fault",{"owner":"agent","error":str(error),"source_event_id":event["id"],"referenced_tasks":parents,"due_at":now+runtime})
+            _exception(conn,tid,"agent_dependency_unresolved",source_event_id=event["id"])
+
     for row in conn.execute("SELECT id FROM tasks WHERE status='blocked' AND block_kind='dependency' AND claim_lock IS NULL").fetchall():
         tid = row["id"]
         if _last(conn, tid, "operator_repair_created"):
@@ -118,13 +150,13 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
     # Apply a recorded deterministic budget; the existing process-tree enforcer
     # remains the only stop/reclaim implementation.
     with kb.write_txn(conn):
-        for row in conn.execute("SELECT t.id,t.current_run_id,r.started_at AS run_started_at FROM tasks t "
+        for row in conn.execute("SELECT t.id,t.status,t.current_run_id,r.started_at AS run_started_at FROM tasks t "
                                 "LEFT JOIN task_runs r ON r.id=t.current_run_id "
-                                "WHERE t.status='running' AND t.max_runtime_seconds IS NULL").fetchall():
-            if cfg.get("activation_at") and (row["run_started_at"] or 0) < int(cfg["activation_at"]):
+                                "WHERE t.status IN ('ready','review','running') AND (t.max_runtime_seconds IS NULL OR t.max_runtime_seconds > ?)", (runtime,)).fetchall():
+            if row["status"] == "running" and cfg.get("activation_at") and (row["run_started_at"] or 0) < int(cfg["activation_at"]):
                 continue  # Existing attempts did not receive the new deadline contract.
             conn.execute("UPDATE tasks SET max_runtime_seconds=? WHERE id=?", (runtime, row["id"]))
-            conn.execute("UPDATE task_runs SET max_runtime_seconds=? WHERE id=? AND max_runtime_seconds IS NULL",
+            conn.execute("UPDATE task_runs SET max_runtime_seconds=? WHERE id=? AND status='running'",
                          (runtime, row["current_run_id"]))
             kb._append_event(conn, row["id"], "operator_attempt_budget", {"seconds": runtime}, run_id=row["current_run_id"])
 
@@ -135,6 +167,11 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
         floor = int(cfg.get("activation_at", 0))
         if int(row["created_at"]) < floor and tid not in cfg.get("cohort_task_ids", []):
             continue  # Historical exceptions stay in the audit; do not flood old routes at rollout.
+        if row["status"] in ("ready","review") and int(row["priority"] or 0) == 0:
+            # Default-priority original work must not sit behind internally generated backlog.
+            kb.edit_task(conn,tid,priority=int(cfg.get("user_work_priority",100)))
+            with kb.write_txn(conn):
+                kb._append_event(conn,tid,"operator_user_priority",{"owner":"agent","priority":int(cfg.get("user_work_priority",100))})
         armed = _last(conn, tid, "operator_deadline")
         if not armed:
             due = int(row["created_at"]) + deadline
@@ -172,12 +209,12 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
     # Exhausted automatic attempts need a repair owner, not endless blind retries
     # or an invented Harry choice. Respect sticky auth/explicit stop fences.
     pending = conn.execute("SELECT COUNT(*) FROM tasks WHERE created_by='operator-repair' AND status NOT IN ('done','archived','blocked')").fetchone()[0]
-    for row in conn.execute("SELECT * FROM tasks WHERE status='blocked' AND block_kind IS NULL "
+    for row in conn.execute("SELECT * FROM tasks WHERE status='blocked' AND (block_kind IS NULL OR block_kind='dependency') "
                             "AND claim_lock IS NULL ORDER BY created_at DESC").fetchall():
         if pending >= int(cfg.get("max_pending_repairs", 1)):
             break
         tid = row["id"]
-        fault = _last(conn, tid, "gave_up")
+        fault = _last(conn, tid, "operator_dependency_fault") or _last(conn, tid, "gave_up")
         if not fault or (_payload(fault).get("sticky") and not _payload(fault).get("operator_rework")):
             continue
         if now - fault["created_at"] > int(cfg.get("repair_window_seconds", 172800)):
@@ -195,6 +232,7 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
             "## Failure evidence\n" + str(reason)[:1200] + "\n\n"
             "## Acceptance\nReproduce the fault, implement a repair, prove the failing "
             "transition now works, and request independent review with the actual evidence. "
+            "The reviewer must record actual reproduction/probe/source receipts in metadata.acceptance_receipts. "
             "Only verified completion reopens the original task from its checkpoint.\n"
         )
         try:
@@ -228,7 +266,9 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
         if repair.status == "done" and reviewed and completed and completed["id"] > reviewed["id"]:
             run = conn.execute("SELECT profile FROM task_runs WHERE id=?", (completed["run_id"],)).fetchone()
             implementer = _payload(reviewed).get("implementer")
-            if not run or not implementer or run["profile"] == implementer:
+            evidence = _payload(completed).get("acceptance_receipts")
+            claim = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed' ORDER BY id DESC LIMIT 1",(repair.id,completed["run_id"])).fetchone()
+            if not run or not implementer or run["profile"] == implementer or not evidence or not claim or json.loads(claim["payload"] or "{}").get("source_status") != "review":
                 continue
             if kb.unblock_task(conn, tid):
                 with kb.write_txn(conn):

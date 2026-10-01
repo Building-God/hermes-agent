@@ -656,6 +656,21 @@ def _prepend_pythonpath(env_overlay: dict[str, str], entries: list[str]) -> None
     env_overlay["PYTHONPATH"] = os.pathsep.join(clean_entries)
 
 
+def _selected_release_launcher(home: Path, python_exe: str):
+    """Existing native restart paths must honor the same sealed selector as services."""
+    import hashlib
+    pointer=home/"runtime/active-release.json"
+    if not pointer.exists():
+        return None
+    selected=json.loads(pointer.read_text(encoding="utf-8"))
+    launcher=Path(selected["launcher"])
+    if not launcher.is_absolute() or not launcher.is_file():
+        raise ValueError("selected release launcher is missing")
+    if hashlib.sha256(launcher.read_bytes()).hexdigest()!=selected["launcher_sha256"]:
+        raise ValueError("selected release launcher changed")
+    return [python_exe,str(launcher)]
+
+
 def _build_gateway_argv(home: Path | None = None) -> tuple[list[str], str, dict[str, str]]:
     """Build (argv, working_dir, env_overlay) for the gateway subprocess — the same logical command
     as gateway.cmd, assembled as a native argv so no cmd.exe layer sits in between."""
@@ -666,7 +681,8 @@ def _build_gateway_argv(home: Path | None = None) -> tuple[list[str], str, dict[
     python_exe, venv_dir, extra_pythonpath = _resolve_detached_python(python_path)
     env_overlay = {"HERMES_HOME": hermes_home, **dict(_GATEWAY_ENV), "VIRTUAL_ENV": _preserve_hermes_home_path(venv_dir)}
     _prepend_pythonpath(env_overlay, [_preserve_hermes_home_path(p) for p in (PROJECT_ROOT, *extra_pythonpath)])
-    return _gateway_run_argv(python_exe, profile_arg), working_dir, env_overlay
+    selected = _selected_release_launcher(Path(hermes_home),python_exe)
+    return selected or _gateway_run_argv(python_exe, profile_arg), working_dir, env_overlay
 
 
 def windowless_gateway_restart_spec(run_argv: list[str]) -> tuple[list[str], str, dict[str, str]]:
@@ -698,7 +714,8 @@ def windowless_gateway_restart_spec(run_argv: list[str]) -> tuple[list[str], str
     if hermes_home:
         env_overlay["HERMES_HOME"] = hermes_home
     _prepend_pythonpath(env_overlay, [str(PROJECT_ROOT), *extra_pythonpath])
-    return [hidden_console_python, *run_argv[1:]], _stable_gateway_working_dir(PROJECT_ROOT), env_overlay
+    selected = _selected_release_launcher(Path(hermes_home),hidden_console_python) if hermes_home else None
+    return selected or [hidden_console_python, *run_argv[1:]], _stable_gateway_working_dir(PROJECT_ROOT), env_overlay
 
 
 def _spawn_detached(script_path: Path | None = None, home: Path | None = None) -> int:
