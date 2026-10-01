@@ -4032,10 +4032,10 @@ def request_review(
             from hermes_cli.kanban_operator import repair_descendant_hold
             repair_block=_last_hold(conn,task_id)
             circular_hold=(trow['block_kind'] in (None,'dependency') and repair_block and repair_descendant_hold(conn,task_id,_json_dict(repair_block['payload']).get('reason')))
-            from hermes_cli.kanban_operator import repair_authority,repair_contract,audited_repair_attempt_allowed,audited_repair_latest_fault_id
+            from hermes_cli.kanban_operator import repair_authority,repair_contract,audited_repair_attempt_allowed,audited_repair_latest_fault_id,audited_repair_fault_event
             audit=(policy(conn).get('audited_repair_faults') or {}).get(task_id,{})
             authority=repair_authority(conn,task_id)
-            audit_event=conn.execute("SELECT id FROM task_events WHERE task_id=? AND id=? AND kind IN ('blocked','changes_requested','operator_repair_stopped')",(task_id,audit.get('event_id'))).fetchone()
+            audit_event=audited_repair_fault_event(conn,task_id,audit.get('event_id')) if audit.get('event_id') else None
             native_contract,native_failure=repair_contract(conn,task_id,audited_native_restoration=resume_audited_repair)
             audited_repair_hold=(resume_audited_repair and authority and authority['event']['task_id'] in policy(conn).get('cohort_task_ids',[])
                                 and audit_event and audit_event['id']==audited_repair_latest_fault_id(conn,task_id)
