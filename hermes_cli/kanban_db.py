@@ -4786,8 +4786,12 @@ def task_goal_text(conn: sqlite3.Connection, task: Task, *, for_completion: bool
             if original_id in cfg.get('state_report_task_ids',[]):goal+=' This is a factual status question. Answer from observed current facts, including unresolved work and unavailable/unproved platforms. A truthful negative status satisfies the question; fixing unrelated work or asserting everything is healthy is not required. Delivery and human receipt remain separate.'
             claimed=_latest_event(conn,task.id,'claimed',task.current_run_id) if getattr(task,'current_run_id',None) else None
             source_status=_json_dict(claimed['payload']).get('source_status') if claimed else None
-            if not for_completion and source_status=='review':goal+=' Your owned step is independent review: reproduce the requested outcome and use kanban_request_changes with concrete evidence when the candidate fails. A valid rejection returns work to its implementer; it is not a Harry choice or an unachievable implementation goal. Only verified original outcome evidence permits kanban_complete.'
-            else:goal+=' Reproduce the requested outcome with actual probe/source receipts. Independent native acceptance remains mandatory; promises, counts and task-flag edits are not completion.'
+            if source_status=='review':
+                goal+=' Your owned step is independent review. Your own read-only probes and kanban_complete record independent acceptance in this owned review run. No prior review, deployment rights or Harry receipt is required. Reproduce the original functional outcome through available terminal/read-only tools and include actual probe/source/serving receipts in metadata.acceptance_receipts. Never ask the implementer to self-certify or create a review-of-review dependency. Do not require Harry to test an agent-verifiable outcome; missing human confirmation must remain unobserved, not invented. Promises, counts and task-flag edits are not outcome proof.'
+                if not for_completion:
+                    goal+=' Use kanban_request_changes with concrete failed-probe evidence when the candidate fails or needs deployment. A valid rejection returns work to its implementer; it is not a Harry choice or an unachievable implementation goal.'
+            else:
+                goal+=' Reproduce the requested outcome with actual probe/source/serving receipts, then present the candidate for review. Independent acceptance happens after kanban_request_review, by its owned reviewer, not before implementation handoff. Do not self-certify completion or require Harry receipt for agent-verifiable work. Promises, counts and task-flag edits are not completion.'
             return goal
     parts: list[str] = []
     if origin:
@@ -4883,7 +4887,9 @@ def _ctx_header(lines: list[str], conn: sqlite3.Connection, task: Task) -> None:
         if origin or task.created_by == "operator-repair":
             lines.extend(['## Current owned work goal',task_goal_text(conn,task),
                           'Editable card text and prior comments below are candidate history, not a replacement for this original authority or owned step.'])
-            lines.append("This original request requires independent review. Request review from a different installed profile; the owned reviewer must reproduce the outcome before completing it. A self-written success summary is rejected. Include the actual reproduction/probe/source evidence in metadata.acceptance_receipts.")
+            claimed=_latest_event(conn,task.id,'claimed',task.current_run_id) if task.current_run_id else None
+            if not claimed or _json_dict(claimed['payload']).get('source_status')!='review':
+                lines.append("This original request requires independent review. Request review from a different installed profile after your candidate implementation and probes; the owned reviewer then reproduces the outcome and records acceptance by completing their own review run. A self-written success summary is rejected. Include the actual reproduction/probe/source evidence in metadata.acceptance_receipts.")
         if task.created_by == "operator-repair":
             lines.append("Independent review is agent-owned. Do not block it as needs_input. Review the original authority and requested outcome: relabeling an agent deployment/review step as Harry input is a failed repair. The implementer's 'independent verification' report is candidate evidence until a different profile reproduces the outcome.")
         lines.append("Commit meaningful durable progress with kanban_checkpoint within "
