@@ -59,5 +59,26 @@ to its own release source, never repoint the editable install.
 A repair's total deadline stops further goal-mode attempts through the native
 external block path, which verifies the entire worker tree before clearing a
 claim. Refused or unknown process identities retain the claim and original hold.
-An exhausted repair remains an agent exception; it cannot spawn another repair
-or turn into a Harry input request.
+An exhausted implementation remains an agent exception and cannot spawn another
+repair. Independent review is a separate fixed phase: its first native handoff
+gets 900 seconds, unaffected by heartbeats or repeated narration. A historical
+repair incorrectly held as needs_input can hand its existing candidate to a real
+reviewer without restarting implementation or accepting the candidate. The
+original deadline and earlier exceptions remain recorded.
+
+Agent repairs cannot ask Harry for reviewer approval. The native recovery API
+only accepts an unclaimed blocked operator repair, preserves declared candidate
+artifacts atomically, and requires a different named reviewer. It cannot reclassify
+a genuine human choice. Original repair holds are reconciled from durable events
+if an implementer accidentally edits raw row flags; a relabel to needs_input does
+not become a Harry responsibility. Implementer-written verification reports are
+candidate evidence until another profile reproduces the requested outcome.
+
+Only the explicitly audited genuine cohort can recover historical completed
+requests missing a substantive result or acceptance receipts. A blocked/triage
+original additionally needs a declared agent fault bound to its exact latest
+hold event, with source and diagnosis. A later hold invalidates that diagnosis;
+existing human-only choices are preserved. Recovery hands existing work to a
+different reviewer once, with a fixed 900-second deadline and safe native stop
+or bounded repair on exhaustion. It never replays the original external action
+or treats a legacy done flag as acceptance.

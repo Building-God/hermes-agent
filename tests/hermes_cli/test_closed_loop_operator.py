@@ -359,6 +359,124 @@ def test_unknown_foreground_shutdown_retains_fence(board):
     assert operator._payload(operator._last(board,tid,"operator_exception"))["reason"] == "foreground_shutdown_unconfirmed"
 
 
+def test_agent_repair_cannot_turn_reviewer_approval_into_harry_input(board,monkeypatch):
+    repair=kb.create_task(board,title="agent repair",assignee="pilot",created_by="operator-repair")
+    monkeypatch.setattr(operator,"policy",lambda conn:{"enabled":True})
+    with pytest.raises(ValueError,match="Agent-owned repair cannot ask Harry"):
+        kb.block_task(board,repair,reason="Reviewer must approve",kind="needs_input")
+    assert kb.get_task(board,repair).status == "ready"
+
+
+def historical_repair_review_hold(board):
+    from pathlib import Path
+    tid=kb.create_task(board,title="original request",assignee="pilot")
+    kb.claim_task(board,tid)
+    dispatch._record_task_failure(board,tid,"crash",outcome="crashed",failure_limit=1,release_claim=True,end_run=True)
+    settings={"enabled":True,"attempt_seconds":120}
+    operator.reconcile(board,settings=settings)
+    info=operator._payload(operator._last(board,tid,"operator_repair_created"));repair=info["repair_task_id"]
+    claim=kb.claim_task(board,repair)
+    workspace=Path(board.execute("PRAGMA database_list").fetchone()[2]).parent/"workspaces"/repair
+    workspace.mkdir(parents=True)
+    (workspace/"REPAIR_EVIDENCE.md").write_text("Candidate evidence, requires a different profile's reproduction.")
+    (workspace/"VERIFICATION_OUTPUT.txt").write_text("Implementer's controlled probe output.")
+    board.execute("UPDATE tasks SET workspace_path=? WHERE id=?",(str(workspace),repair));board.commit()
+    assert kb.block_task(board,repair,reason="Reviewer should read REPAIR_EVIDENCE.md and VERIFICATION_OUTPUT.txt then approve.",kind="needs_input",expected_run_id=claim.current_run_id)
+    return tid,repair,info,settings
+
+
+def test_historical_review_hold_routes_candidate_to_owned_review_without_accepting_it(board,monkeypatch):
+    tid,repair,info,settings=historical_repair_review_hold(board)
+    # Reproduce the real worker's unjournaled relabeling of the original hold.
+    board.execute("UPDATE tasks SET block_kind='needs_input' WHERE id=?",(tid,));board.commit()
+    monkeypatch.setattr(operator,"policy",lambda conn:settings)
+    operator.reconcile(board,settings=settings,now=info["due_at"]+1)
+    assert kb.get_task(board,repair).status == "review",operator._payload(operator._last(board,repair,"operator_exception"))
+    assert kb.get_task(board,repair).assignee == "reviewer"
+    assert kb.get_task(board,tid).block_kind == "dependency"
+    assert board.execute("SELECT COUNT(*) FROM task_attachments WHERE task_id=?",(repair,)).fetchone()[0] == 2
+    review=kb.claim_review_task(board,repair)
+    with pytest.raises(ValueError,match="acceptance evidence required"):
+        kb.complete_task(board,repair,result="Report claims independence",expected_run_id=review.current_run_id)
+    assert kb.complete_task(board,repair,result="Different reviewer reproduced the outcome",expected_run_id=review.current_run_id,metadata={"acceptance_receipts":{"reproduction":"actual controlled probe"}})
+    operator.reconcile(board,settings=settings,now=info["due_at"]+2)
+    assert kb.get_task(board,tid).status == "ready"
+
+
+def test_repair_review_has_fixed_separate_deadline_and_no_duplicate_handoff(board,monkeypatch):
+    tid,repair,info,settings=historical_repair_review_hold(board)
+    monkeypatch.setattr(operator,"policy",lambda conn:settings)
+    started=info["due_at"]+1
+    operator.reconcile(board,settings=settings,now=started)
+    handoff=operator._payload(operator._last(board,repair,"operator_agent_review_handoff"))
+    assert handoff.get("due_at") == started+120,operator._payload(operator._last(board,repair,"operator_exception"))
+    operator.reconcile(board,settings=settings,now=started+119)
+    assert kb.get_task(board,repair).status == "review"
+    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_agent_review_handoff'",(repair,)).fetchone()[0] == 1
+    operator.reconcile(board,settings=settings,now=started+120)
+    assert kb.get_task(board,repair).status == "blocked"
+    assert kb.get_task(board,tid).status == "blocked"
+
+
+def test_repair_review_recovery_cannot_reclassify_a_genuine_harry_choice(board,monkeypatch):
+    tid=kb.create_task(board,title="Choose report audience",assignee="pilot",user_origin={"platform":"discord","chat_id":"c","message_id":"choice","user_id":"harry","text":"Prepare a report"})
+    assert kb.block_task(board,tid,reason="Harry must choose the recipient",kind="needs_input")
+    monkeypatch.setattr(operator,"policy",lambda conn:{"enabled":True})
+    accepted,reason=kb.request_review(board,tid,reviewer="reviewer",resume_agent_repair=True,with_reason=True)
+    assert not accepted and "operator repair" in reason
+    assert kb.get_task(board,tid).status == "blocked"
+    assert kb.get_task(board,tid).block_kind == "needs_input"
+
+
+def test_legacy_genuine_completion_gets_one_independent_result_review(board,monkeypatch):
+    tid=kb.create_task(board,title="legacy answer",assignee="pilot",user_origin={"platform":"discord","chat_id":"c","message_id":"legacy","user_id":"harry","text":"Explain my interface"})
+    assert kb.complete_task(board,tid,summary="Claimed done but no delivered answer")
+    assert kb.get_task(board,tid).result is None
+    settings={"enabled":True,"cohort_task_ids":[tid],"attempt_seconds":120}
+    monkeypatch.setattr(operator,"policy",lambda conn:settings)
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,tid).status == "review"
+    assert kb.get_task(board,tid).assignee == "reviewer"
+    operator.reconcile(board,settings=settings)
+    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_acceptance_recovery'",(tid,)).fetchone()[0] == 1
+    review=kb.claim_review_task(board,tid)
+    assert kb.complete_task(board,tid,summary="Substantive independently checked answer",expected_run_id=review.current_run_id,metadata={"acceptance_receipts":{"source_check":"reproduced original interface behaviour"}})
+    assert kb.get_task(board,tid).result == "Substantive independently checked answer"
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,tid).status == "done"
+
+
+def test_audited_agent_fault_is_exact_event_scoped_and_expires_without_harry_question(board,monkeypatch):
+    tid=kb.create_task(board,title="deploy completed work",assignee="pilot",user_origin={"platform":"discord","chat_id":"c","message_id":"deployment","user_id":"harry","text":"Fix the duplicate queue"})
+    assert kb.block_task(board,tid,reason="Reviewer/Harry must deploy",kind="needs_input")
+    blocked=operator._last(board,tid,"blocked")
+    settings={"enabled":True,"cohort_task_ids":[tid],"attempt_seconds":120,"agent_owned_faults":{tid:{"blocked_event_id":blocked["id"],"source":"confirmed operator audit","reason":"Deployment is already authorized; subjective confirmation remains unobserved."}}}
+    monkeypatch.setattr(operator,"policy",lambda conn:settings)
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,tid).status == "review"
+    due=operator._payload(operator._last(board,tid,"operator_acceptance_recovery"))["due_at"]
+    operator.reconcile(board,settings=settings,now=due)
+    assert kb.get_task(board,tid).status == "blocked"
+    assert kb.get_task(board,tid).block_kind != "needs_input"
+    assert operator._last(board,tid,"operator_repair_created")
+
+
+def test_stale_audit_cannot_override_a_new_human_only_choice(board,monkeypatch):
+    tid=kb.create_task(board,title="original",assignee="pilot",user_origin={"platform":"discord","chat_id":"c","message_id":"stale","user_id":"harry","text":"Prepare a report"})
+    assert kb.block_task(board,tid,reason="An old deployment request",kind="needs_input")
+    old=operator._last(board,tid,"blocked")
+    assert kb.unblock_task(board,tid)
+    assert kb.block_task(board,tid,reason="Harry must now choose the recipient",kind="needs_input")
+    before=kb.get_task(board,tid)
+    assert operator._last_hold(board,tid)["id"] > old["id"]
+    settings={"enabled":True,"cohort_task_ids":[tid],"agent_owned_faults":{tid:{"blocked_event_id":old["id"],"source":"audit","reason":"old agent deployment fault"}}}
+    monkeypatch.setattr(operator,"policy",lambda conn:settings)
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,tid).status == before.status
+    assert kb.get_task(board,tid).block_kind == "needs_input"
+    assert operator._last(board,tid,"operator_acceptance_recovery") is None
+
+
 def test_intake_recovery_reconciles_concurrent_foreground_stop_receipt(board,monkeypatch):
     import gateway.front_door_deadline as fd
     from hermes_constants import get_hermes_home
