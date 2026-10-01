@@ -111,8 +111,8 @@ def agent_answer_claim_failure(conn,task_id,text):
     return None
 
 
-def handle_worker_goal_failure(conn,task_id,reason,*,expected_run_id=None):
-    """Owned review rejection is rework, not a terminal implementation verdict."""
+def return_owned_review_failure(conn,task_id,reason,*,expected_run_id=None,source='goal_loop',kind=None):
+    """Return an owned candidate rejection; None means this is not that transition."""
     from hermes_cli import kanban_db as kb
     cfg=policy(conn);task=kb.get_task(conn,task_id)
     authority=repair_authority(conn,task_id) if task and task.created_by=='operator-repair' else None
@@ -123,9 +123,16 @@ def handle_worker_goal_failure(conn,task_id,reason,*,expected_run_id=None):
         ok,owner=kb.request_changes(conn,task_id,reason=reason,expected_run_id=expected_run_id)
         if ok:
             with kb.write_txn(conn):
-                kb._append_event(conn,task_id,'operator_failed_review_rework',{'owner':'agent','implementer':owner,'review_run_id':expected_run_id,'reason':reason,'scope':'Failed owned review returned through native rework; original deadlines and current phase limits remain'})
-            return True
-    return kb.block_task(conn,task_id,reason=reason,expected_run_id=expected_run_id)
+                kb._append_event(conn,task_id,'operator_failed_review_rework',{'owner':'agent','implementer':owner,'review_run_id':expected_run_id,'reason':reason,'source':source,'requested_kind':kind,'scope':'Failed owned review returned through native rework; original deadlines and current phase limits remain'})
+        return bool(ok)
+    return None
+
+
+def handle_worker_goal_failure(conn,task_id,reason,*,expected_run_id=None):
+    """Owned review rejection is rework, not a terminal implementation verdict."""
+    from hermes_cli import kanban_db as kb
+    returned=return_owned_review_failure(conn,task_id,reason,expected_run_id=expected_run_id)
+    return returned if returned is not None else kb.block_task(conn,task_id,reason=reason,expected_run_id=expected_run_id)
 
 
 def policy(conn=None) -> dict:

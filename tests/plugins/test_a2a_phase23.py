@@ -36,13 +36,13 @@ def _free_port() -> int:
     return port
 
 
-def _make_live_adapter(monkeypatch, reply_fn=None):
+def _make_live_adapter(monkeypatch, reply_fn=None, extra=None):
     from plugins.platforms.a2a.adapter import A2AAdapter
     from gateway.config import PlatformConfig
 
     port = _free_port()
     monkeypatch.setenv("A2A_PORT", str(port))
-    adapter = A2AAdapter(PlatformConfig(enabled=True))
+    adapter = A2AAdapter(PlatformConfig(enabled=True,extra=extra or {}))
 
     async def fake_handle_message(event):
         reply = "ECHO: " + event.text if reply_fn is None else reply_fn(event)
@@ -78,8 +78,15 @@ def _post_sse(url, body):
                         payloads.append(obj["result"])
                     else:
                         payloads.append(obj)
-            # SSE comment lines (": done") are ignored — not data frames.
+            # SSE comment lines (": done") are ignored - not data frames.
     return payloads, events
+
+
+def _post_sse_authenticated(url,body,token):
+    req=urllib.request.Request(url,data=json.dumps(body).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+token},method='POST')
+    with urllib.request.urlopen(req,timeout=15) as response:
+        raw=response.read().decode()
+    return [json.loads(line[6:]).get('result',{}) for line in raw.splitlines() if line.startswith('data: ')]
 
 
 def _post_json(url, body, headers=None):
@@ -155,7 +162,7 @@ class TestStreamResponseFormat:
 
     def test_sse_done_marker(self):
         """v1.0 signals stream completion by closing the stream.  The done
-        marker is an SSE comment (``: done``), not a parseable data frame —
+        marker is an SSE comment (``: done``), not a parseable data frame -
         emitting ``data: {}`` breaks JSON-RPC clients that try to parse it."""
         done = protocol.sse_done()
         assert ": done" in done

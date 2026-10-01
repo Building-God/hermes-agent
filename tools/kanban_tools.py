@@ -888,7 +888,10 @@ def _handle_block(args: dict, **kw) -> str:
                f"the completion judge will evaluate it.")
         ok = kb.block_task(conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id(tid))
         _check(ok, f"could not block {tid} (unknown id or not in running/ready)")
-        landed_kind = kb.get_task(conn, tid).block_kind
+        landed = kb.get_task(conn, tid)
+        if landed.status=='ready':
+            return _ok_landed(kb,conn,tid,'ready',note='Owned review failure returned to its implementer through native rework; original hold and deadlines remain.')
+        landed_kind = landed.block_kind
         extra: dict = {"block_kind": landed_kind}
         if kind == "dependency" and landed_kind != kind:
             # block_task re-kinds a dependency wait that no open parent can satisfy.

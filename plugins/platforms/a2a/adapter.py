@@ -36,9 +36,9 @@ _DEFAULT_PORT = 9900
 # seconds: orphan grace floor / ceiling / watchdog period. The ceiling keeps the sweep
 # meaningful when A2A_REPLY_TIMEOUT is absurd (1e18 would never fail an orphan).
 _MIN_ORPHAN_TIMEOUT, _MAX_ORPHAN_TIMEOUT, _WATCHDOG_INTERVAL = 300, 86400, 60
-_MAX_BODY = 1_048_576  # 1MB max request body — prevents DoS via memory exhaustion
+_MAX_BODY = 1_048_576  # 1MB max request body - prevents DoS via memory exhaustion
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
-_DEFAULT_DESCRIPTION = "Hermes Agent — a general-purpose agent reachable over A2A."
+_DEFAULT_DESCRIPTION = "Hermes Agent - a general-purpose agent reachable over A2A."
 
 _ok = protocol.jsonrpc_result
 _err = protocol.jsonrpc_error
@@ -213,7 +213,7 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         adapter = self.adapter
-        # Identity comes from the credential (or the socket in localhost-only mode) — never the body.
+        # Identity comes from the credential (or the socket in localhost-only mode) - never the body.
         identity = adapter._security_context.authenticate(self.headers.get("Authorization"), self._client_ip())
         if identity is None:
             return self._error(401, None, protocol.ERR_UNAUTHORIZED, "unauthorized")
@@ -265,7 +265,7 @@ class A2AAdapter(BasePlatformAdapter):
         extra = getattr(config, "extra", {}) or {}
         # Scope-aware: a secondary multiplex profile must not borrow the default profile's bridged
         # A2A_PORT (falls closed to the module default). advertised_toolsets is deliberately unscoped.
-        # (advertised_toolsets has the same env-leak shape but is left unscoped here — see the "Scope note"
+        # (advertised_toolsets has the same env-leak shape but is left unscoped here - see the "Scope note"
         # in this fix's PR description: open PR #98937 is actively rewriting this field's None-vs-empty-list
         # semantics.)
         self._security_context = security.A2ASecurityContext.capture()
@@ -276,6 +276,19 @@ class A2AAdapter(BasePlatformAdapter):
         configured_toolsets = list(extra.get("advertised_toolsets") or []) or _get_scoped_secret("A2A_ADVERTISED_TOOLSETS", "").split(",")
         self._advertised_toolsets = [t.strip() for t in configured_toolsets if str(t).strip()]
         self._active_profile = _active_profile_name()
+        # An explicitly configured interactive client is a transport identity,
+        # never proof of a particular human or a result receipt. Only named
+        # per-peer credentials qualify; body labels and shared-token IPs do not.
+        interactive=extra.get('interactive_peers')
+        if interactive is None and self._active_profile in ('','default'):
+            try:
+                from hermes_cli.config import load_config
+                interactive=((load_config() or {}).get('a2a') or {}).get('interactive_peers',[])
+            except Exception:
+                interactive=[]
+        named={name for _token,name in self._security_context.peer_tokens if not name.startswith('ip:')}
+        configured_interactive=interactive if isinstance(interactive,list) else []
+        self._interactive_peers=frozenset(str(name) for name in configured_interactive if str(name) in named)
         # Captured here (construction runs inside _profile_runtime_scope), not read at request time:
         # do_GET/do_POST run on ThreadingHTTPServer's per-connection OS threads, which never inherit
         # the profile scope contextvar (same class as A2A_PORT above).
@@ -292,7 +305,7 @@ class A2AAdapter(BasePlatformAdapter):
         self._profile_session_locks: Dict[tuple[str, str, str], threading.Lock] = {}
         self._profile_session_locks_guard = threading.Lock()
         # Pending reply futures: task_id -> (context_id, Future). _pending_order keeps per-context
-        # FIFO so adapter.send() — which only knows the context — resolves the oldest task.
+        # FIFO so adapter.send() - which only knows the context - resolves the oldest task.
         self._pending: Dict[str, tuple[str, Future]] = {}
         self._pending_order: Dict[str, deque[str]] = {}
         # Request ownership outlives reply Futures and also covers synchronous profile forwards.
@@ -319,7 +332,7 @@ class A2AAdapter(BasePlatformAdapter):
         try:
             self._httpd = ThreadingHTTPServer((self.host, self.port), A2ARequestHandler)
         except OSError as e:
-            logger.error("A2A: could not bind %s:%s — %s", self.host, self.port, e)
+            logger.error("A2A: could not bind %s:%s - %s", self.host, self.port, e)
             self._set_fatal_error("bind_failed", f"A2A bind failed: {e}", retryable=True)
             return False
         self._httpd.daemon_threads = True
@@ -532,7 +545,10 @@ class A2AAdapter(BasePlatformAdapter):
         text = protocol.extract_text(params)
         context_id = protocol.extract_context_id(params) or protocol.new_context_id()
         task_id = protocol.new_task_id()
-        turn = self._turns.track(context_id)
+        # Independent interactive turns must not exhaust an autonomous
+        # ping-pong budget. Rate limits, authentication and task deadlines still
+        # apply. Ordinary agents retain the existing context loop limit.
+        turn = 0 if peer in self._interactive_peers else self._turns.track(context_id)
         max_turns = protocol.max_pingpong_turns()
         rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
         if turn > max_turns:
@@ -541,7 +557,7 @@ class A2AAdapter(BasePlatformAdapter):
             return self._end_task(rec, protocol.STATE_REJECTED, f"Anti-loop protection: context {context_id} exceeded "
                                   f"{max_turns} turns. Start a new context or increase A2A_MAX_PINGPONG_TURNS.")
         if not text:
-            return self._end_task(rec, protocol.STATE_REJECTED, "Empty task — nothing to do.")
+            return self._end_task(rec, protocol.STATE_REJECTED, "Empty task - nothing to do.")
         framed = security.wrap_inbound(peer, text)
         security.audit("inbound", peer, task_id, text)
         protocol.persist_message(context_id, "user", text, task_id)
@@ -809,7 +825,7 @@ class A2AAdapter(BasePlatformAdapter):
         if not callback_url:
             return
         if not security.is_safe_callback_url(callback_url, localhost_mode=self._security_context.localhost_only()):
-            return fail("blocked — unsafe callback URL: %s", callback_url)
+            return fail("blocked - unsafe callback URL: %s", callback_url)
         payload = protocol.status_update(task_id, context_id, state, (reply or "")[:2000])
         headers = {"Content-Type": "application/json"}
         if signature := self._security_context.sign_push_payload(payload):
@@ -849,7 +865,7 @@ class A2AAdapter(BasePlatformAdapter):
         if task_id:
             # A streamed turn never calls send() with notify=True (the gateway suppresses the
             # normal final send once streaming delivered the body), so the SUCCESS default must
-            # not resolve with "" — that strands every A2A streaming reply as an empty completed
+            # not resolve with "" - that strands every A2A streaming reply as an empty completed
             # task (#116944). _streamed_final_response is the same stash _final_text_for_post_turn_hooks
             # reads for /goal and /loop.
             _streamed = getattr(event, "_streamed_final_response", "")

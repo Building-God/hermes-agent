@@ -1,5 +1,6 @@
 """Controlled failure drills using actual board APIs and isolated Hermes homes."""
 import json
+import asyncio
 import pytest
 from tools import kanban_tools as kanban_tools_surface
 from hermes_cli import kanban_acceptance_truth as truth
@@ -241,6 +242,50 @@ def test_implementation_goal_hands_off_before_independent_acceptance(board,monke
     goal=kb.task_goal_text(board,build)
     assert 'Independent acceptance happens after kanban_request_review' in goal
     assert 'Request review from a different installed profile' in kb.build_worker_context(board,repair)
+
+
+@pytest.mark.parametrize('kind',[None,'dependency','transient','capability'])
+def test_manual_owned_review_block_is_native_rework(board,monkeypatch,kind):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    settings['cohort_task_ids']=[tid]
+    assert kb.block_task(board,repair,reason='Candidate requires agent deployment; orchestrator decision',kind=kind,expected_run_id=review.current_run_id)
+    landed=kb.get_task(board,repair)
+    assert landed.status=='ready'
+    assert landed.assignee=='pilot'
+    assert operator._last(board,repair,'blocked') is None
+    event=operator._last(board,repair,'operator_failed_review_rework')
+    assert operator._payload(event)['source']=='manual_block'
+    assert kb.get_task(board,tid).status=='blocked'
+    assert kb.get_task(board,tid).block_kind=='dependency'
+
+
+def test_native_repair_context_does_not_inject_wrong_candidate_scope(board,monkeypatch):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch,request_text='Repair my real conversation and queue headers')
+    with kb.write_txn(board):
+        board.execute('UPDATE tasks SET title=?,body=? WHERE id=?',('Only check cycle flags','FORBIDDEN OLD SCOPE: headers are out of scope; ask Harry to deploy',repair))
+    text=kb.build_worker_context(board,repair)
+    assert 'Repair my real conversation and queue headers' in text
+    assert 'FORBIDDEN OLD SCOPE' not in text
+    assert 'Only check cycle flags' not in text.splitlines()[0]
+    assert 'Candidate description retained as history' in text
+
+
+@pytest.mark.parametrize('case',['stale','outside_cohort','human_choice'])
+def test_manual_review_rework_preserves_scope_and_run_ownership(board,monkeypatch,case):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    settings['cohort_task_ids']=[tid]
+    if case=='stale':
+        assert not kb.block_task(board,repair,reason='stale reviewer',expected_run_id=review.current_run_id+100)
+        assert kb.get_task(board,repair).current_run_id==review.current_run_id
+    elif case=='outside_cohort':
+        settings['cohort_task_ids']=[]
+        assert kb.block_task(board,repair,reason='legacy hold',expected_run_id=review.current_run_id)
+        assert kb.get_task(board,repair).status=='blocked'
+    else:
+        with pytest.raises(ValueError,match='cannot ask Harry'):
+            kb.block_task(board,repair,reason='choose for me',kind='needs_input',expected_run_id=review.current_run_id)
+        assert kb.get_task(board,repair).current_run_id==review.current_run_id
+    assert operator._last(board,repair,'operator_failed_review_rework') is None
 
 
 @pytest.mark.parametrize('case',['native','unknown_owner','wrong_repair','human_hold'])
@@ -881,7 +926,11 @@ def test_distinct_audited_fault_can_correct_tool_contract_with_finite_total_cap(
     settings.update(cohort_task_ids=[tid],max_audited_repair_faults=cap,acceptance_recheck_assignee='other')
     with kb.write_txn(board):
         first=kb._append_event(board,repair,'operator_authority_review_handoff',{'audit_event_id':1,'due_at':1,'owner':'agent'})
+    # Historical parked review predates rollout of the native manual-block
+    # rework guard; retain that legacy failure to exercise lifetime audit caps.
+    settings['cohort_task_ids']=[]
     assert kb.block_task(board,repair,kind='capability',reason='Goal judge failed to receive structured receipt metadata',expected_run_id=review.current_run_id)
+    settings['cohort_task_ids']=[tid]
     hold=operator._last_hold(board,repair)
     settings['audited_repair_faults']={repair:{'event_id':hold['id'],'source':'independent source/actual failure audit','reason':'Tool schema and handler accept metadata; corrected judge now receives its actual structured receipts'}}
     operator.reconcile(board,settings=settings)
@@ -1326,3 +1375,38 @@ def test_intake_recovery_reconciles_concurrent_foreground_stop_receipt(board,mon
     recovered=fd.recover_unowned_intake(get_hermes_home())
     assert kb.get_task(board,recovered[0]["card_id"]).status == "ready"
     assert fd.recover_unowned_intake(get_hermes_home()) == []
+
+
+from tests.plugins.test_a2a_phase23 import _make_live_adapter, _post_json, _send_body, _post_sse_authenticated
+
+class TestInteractiveOperatorIngress:
+    @pytest.mark.parametrize('stream',[False,True])
+    def test_authenticated_interactive_peer_outlives_agent_loop_limit(self,monkeypatch,stream):
+        monkeypatch.delenv('A2A_BEARER_TOKEN',raising=False)
+        monkeypatch.setenv('A2A_PEER_TOKENS','jarvis-interactive:fixture-interactive,worker:fixture-worker')
+        monkeypatch.setenv('A2A_MAX_PINGPONG_TURNS','2')
+        adapter,base=_make_live_adapter(monkeypatch,extra={'interactive_peers':['jarvis-interactive']})
+        async def run():
+            assert await adapter.connect()
+            try:
+                for i in range(6):
+                    body=_send_body('Controlled interactive fixture turn '+str(i),ctx='fixture-interactive-context')
+                    if stream:
+                        # Same authenticated peer through the SSE handler.
+                        body['method']='SendStreamingMessage'
+                    response=await asyncio.to_thread(_post_json,base+'/',body,{'Authorization':'Bearer fixture-interactive'}) if not stream else await asyncio.to_thread(_post_sse_authenticated,base+'/',body,'fixture-interactive')
+                    if stream:
+                        assert any(x.get('statusUpdate',{}).get('status',{}).get('state')=='TASK_STATE_COMPLETED' for x in response)
+                    else:
+                        assert response['result']['status']['state']=='TASK_STATE_COMPLETED'
+                states=[]
+                for i in range(3):
+                    body=_send_body('agent fixture',ctx='fixture-agent-context')
+                    body['params']['message']['metadata']={'interactive':True,'human':True,'peer':'jarvis-interactive'}
+                    response=await asyncio.to_thread(_post_json,base+'/',body,{'Authorization':'Bearer fixture-worker'})
+                    states.append(response['result']['status']['state'])
+                assert states==['TASK_STATE_COMPLETED','TASK_STATE_COMPLETED','TASK_STATE_REJECTED']
+            finally:
+                await adapter.disconnect()
+        asyncio.run(run())
+

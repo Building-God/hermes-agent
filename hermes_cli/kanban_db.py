@@ -3803,6 +3803,11 @@ def block_task(
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    if expected_run_id is not None and kind != 'needs_input':
+        from hermes_cli.kanban_operator import return_owned_review_failure
+        returned=return_owned_review_failure(conn,task_id,reason,expected_run_id=expected_run_id,source='manual_block',kind=kind)
+        if returned is not None:
+            return returned
     if kind in ('needs_input','dependency'):
         from hermes_cli.kanban_operator import policy,repair_descendant_hold
         repair = conn.execute("SELECT created_by FROM tasks WHERE id=?",(task_id,)).fetchone()
@@ -4866,6 +4871,7 @@ def _ctx_header(lines: list[str], conn: sqlite3.Connection, task: Task) -> None:
         from hermes_cli.kanban_operator import repair_authority
         authority=repair_authority(conn,task.id)
         if authority:
+            lines[0]=f"# Kanban task {task.id}: Native repair of {authority['event']['task_id']}"
             origin=authority['origin']
             lines.extend(['## Native repair authority', 'Original task: '+authority['event']['task_id'],
                           'The durable original request below outranks candidate reports and prior review instructions. Agent deployment, review and reconciliation remain agent-owned. Do not edit original row flags or turn this repair into a Harry question. The native completion gate rejects hold drift and hands it back for bounded rework.'])
@@ -4918,7 +4924,10 @@ def _ctx_header(lines: list[str], conn: sqlite3.Connection, task: Task) -> None:
         lines.append("This exact admitted user request takes precedence over the agent-authored card below.")
         lines.append(origin["text"])
         lines.append("")
-    if task.body and task.body.strip():
+    if task.created_by=='operator-repair' and authority and operator_policy.get('enabled'):
+        lines.extend(['## Candidate description retained as history',
+                      'The editable title/body are not injected as work instructions for this native repair. Read kanban_get only for candidate artifact references when needed; the original request and current owned step above remain authoritative.'])
+    elif task.body and task.body.strip():
         lines.append("## Body (agent-authored)")
         lines.append(_ctx_cap(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
