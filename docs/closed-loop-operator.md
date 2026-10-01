@@ -140,3 +140,10 @@ restart expired implementation; the original stays an agent-owned exception.
 - These gates prevent observed false claims and state escapes. They do not establish general semantic truth or capability parity; real outcome probes and same-thread readback are still mandatory.
 
 An exact historical repair fault may receive one bounded ownership correction review. Its generated native receipt is explicitly limited to authority; the independent reviewer still owes reproduced functional evidence. The audit must match the latest hold/rejection, preserve the original dependency fence, and cannot authorize another implementation run.
+
+
+R5 real-request counterexamples corrected in R6:
+
+- A formal original -> repair edge made an agent repair wait for the failed original, which was itself waiting for that repair. Reconciliation reverses only that exact edge when durable repair provenance, authenticated origin, original dependency hold, and absent claims agree. Other parents remain intact. A remaining cycle rolls back and retains the agent exception.
+- Historical terminal review after a rejected candidate needs genuinely new evidence. The handoff includes native invalidation/terminal event receipts, explicitly limited to failure provenance. It neither renews the phase nor proves the requested functional outcome.
+- Controlled drills include unrelated-parent preservation, transactional cycle rollback, unchanged evidence after rejection, and one bounded terminal handoff. No live R5 intervention occurred during the fixed trial while these inactive corrections were built.

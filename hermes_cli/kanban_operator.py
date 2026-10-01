@@ -196,6 +196,29 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
     runtime = max(60, int(cfg.get("attempt_seconds", 900)))
     deadline = max(runtime, int(cfg.get("request_seconds", 7200)))
     actions = []
+    # A repair cannot depend on the failed original that is waiting for it.
+    # Correct only the reverse edge identified by durable native repair origin.
+    for event in conn.execute("SELECT * FROM task_events WHERE kind='operator_repair_created'").fetchall():
+        original_id=event['task_id'];repair_id=_payload(event).get('repair_task_id')
+        if not repair_id:continue
+        original=kb.get_task(conn,original_id);repair=kb.get_task(conn,repair_id)
+        origin=conn.execute('SELECT 1 FROM task_user_origins WHERE task_id=?',(original_id,)).fetchone()
+        reverse=conn.execute('SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?',(original_id,repair_id)).fetchone()
+        if not origin or not reverse or not original or not repair or original.status!='blocked' or original.block_kind!='dependency' or original.claim_lock or repair.claim_lock:
+            continue
+        try:
+            with kb.write_txn(conn):
+                authority=repair_authority(conn,repair_id)
+                if not authority or authority['event']['id']!=event['id']:continue
+                conn.execute('DELETE FROM task_links WHERE parent_id=? AND child_id=?',(original_id,repair_id))
+                if kb._would_cycle(conn,repair_id,original_id):
+                    raise ValueError('Correct repair prerequisite still creates a cycle; retain original edge and agent exception')
+                conn.execute('INSERT OR IGNORE INTO task_links(parent_id,child_id) VALUES(?,?)',(repair_id,original_id))
+                kb._append_event(conn,original_id,'operator_repair_dependency_corrected',{'owner':'agent','repair_task_id':repair_id,'source_event_id':event['id'],'removed_edge':[original_id,repair_id],'added_edge':[repair_id,original_id]})
+            actions.append({'task_id':original_id,'repair_prerequisite_corrected':repair_id})
+        except Exception as error:
+            _exception(conn,original_id,'repair_prerequisite_correction_failed',error=str(error)[:300])
+
     # Archival is not acceptance. Recover the exact failed terminal transition
     # without erasing its evidence or replaying the original action.
     for tid in cfg.get('cohort_task_ids',[]):
@@ -222,7 +245,7 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
             continue
         try:
             reviewer=acceptance_owner(conn,cfg,task.assignee)
-            ok,reason=kb.request_review(conn,tid,reviewer=reviewer,summary='Correct the invalidated original result and verify existing objective effects. Archival cannot bypass acceptance/delivery. Do not replay actions or claim an AGENT answer was Harry confirmation. Keep subjective confirmation and human result receipt explicitly separate.',resume_failed_terminal=True,with_reason=True)
+            ok,reason=kb.request_review(conn,tid,reviewer=reviewer,summary='Correct the invalidated original result and verify existing objective effects. Archival cannot bypass acceptance/delivery. Do not replay actions or claim an AGENT answer was Harry confirmation. Keep subjective confirmation and human result receipt explicitly separate.',metadata={'acceptance_receipts':{'native_terminal_correction':{'terminal_event_id':terminal['id'],'source_completed_event_id':_payload(terminal)['source_completed_event_id'],'invalidated_event_id':_last(conn,tid,'operator_acceptance_invalidated')['id'],'scope':'Actual invalidation and terminal state; functional acceptance remains unproved'}}},resume_failed_terminal=True,with_reason=True)
             if not ok:raise ValueError(reason or 'terminal recovery review refused')
             with kb.write_txn(conn):
                 kb._append_event(conn,tid,'operator_terminal_review_handoff',{'owner':'agent','source_terminal_event_id':terminal['id'],'due_at':now+runtime,'reviewer':reviewer})
