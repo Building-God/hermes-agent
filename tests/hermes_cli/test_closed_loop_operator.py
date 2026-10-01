@@ -221,6 +221,28 @@ def test_safe_release_authority_reaches_worker_context_only_for_declared_cohort(
     assert 'Harry has authorized implementation, deployment and live reproduction' not in kb.task_goal_text(board,review)
 
 
+@pytest.mark.parametrize('completion',[False,True])
+def test_owned_reviewer_goal_does_not_require_review_of_review(board,monkeypatch,completion):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    goal=kb.task_goal_text(board,review,for_completion=completion)
+    assert 'Your owned step is independent review' in goal
+    assert 'Your own read-only probes and kanban_complete record independent acceptance' in goal
+    assert 'No prior review, deployment rights or Harry receipt is required' in goal
+    assert 'Independent native acceptance remains mandatory' not in goal
+    text=kb.build_worker_context(board,repair)
+    assert 'Request review from a different installed profile' not in text
+    assert 'Never ask the implementer to self-certify' in text
+
+
+def test_implementation_goal_hands_off_before_independent_acceptance(board,monkeypatch):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    assert kb.request_changes(board,repair,reason='actual failed probe',expected_run_id=review.current_run_id)
+    build=kb.claim_task(board,repair)
+    goal=kb.task_goal_text(board,build)
+    assert 'Independent acceptance happens after kanban_request_review' in goal
+    assert 'Request review from a different installed profile' in kb.build_worker_context(board,repair)
+
+
 @pytest.mark.parametrize('case',['native','unknown_owner','wrong_repair','human_hold'])
 def test_exact_audited_candidate_can_follow_historical_native_restoration_only(board,monkeypatch,case):
     tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
