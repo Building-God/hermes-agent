@@ -170,3 +170,13 @@ A blocked reviewer who calls recorded native ownership restoration a kernel SQL 
 Goal judges now receive structured acceptance receipts and the durable authenticated original repair authority. Old candidate task flags cannot replace the requested outcome, and owned goal failures never instruct Harry to solve deployment or tool metadata. This does not weaken native completion checks.
 
 Independently audited distinct new faults can receive correction only when the exact new fault follows the previous handoff, has not been audited before, and the lifetime ownership-correction count remains below max_audited_repair_faults (default 3). Each phase has its own fixed deadline; stale or repeated audits cannot renew it.
+
+The real R7 health chain had accepted native factual repair -> extra unclaimed internal sign-off -> original question. For the explicitly declared authenticated factual status mode only, its accepted repair can replace that extra machine-created sign-off edge with the mandatory owned original final review. The sign-off is not marked passed/completed; its history and all unrelated/Harry/claimed prerequisites remain intact. Original execution never becomes ready between edge correction and final review. Generic functional requests retain their verification dependencies.
+
+Goal judging of a declared factual status question uses the original recorded request and current native facts, not a candidate demand that everything be healthy. Completion recomputes the factual answer atomically. A truthful negative status satisfies the question; it does not certify unrelated functional repairs or infer human receipt.
+
+Exception reconciliation deduplicates identical cause payloads under its transaction while preserving changed causes, so a fixed evidence gate followed by a distinct dependency failure does not remain mislabeled as the old error. Malformed older event payloads are retained safely.
+
+The shared worker goal builder now inherits repair authority from the durable original request. Owned reviewers must reproduce the result or return concrete failed probes to the implementer; rejection is an agent step, not a Harry-only choice. Completion still requires independently accepted original outcome evidence.
+
+An explicitly audited terminal repair deadline is eligible only as the latest exact fault, with original authority, no claim, a new source event and remaining lifetime correction budget. A corrective reviewer differs from the preserved implementer; the previous reviewer may retry corrected native logic without inheriting implementation. Rework timers apply within their correction phase. An expired earlier timer cannot stop the new phase, and current phase/rework deadlines still prevent further execution.

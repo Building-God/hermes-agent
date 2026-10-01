@@ -70,7 +70,7 @@ def execution_claim_allowed(conn,tid,source_status):
             cycles=conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='changes_requested' AND id>?",(tid,phase['id'])).fetchone()[0]
             due=_data(phase).get('due_at',0)
             rework=_last(conn,tid,'operator_rework_due')
-            if rework:due=min(due,_data(rework).get('due_at',due))
+            if rework and rework['id']>phase['id']:due=min(due,_data(rework).get('due_at',due))
             return bool(contract and not failure and time.time()<due and cycles<int(policy(conn).get('max_review_cycles',3)))
     if source_status=='review':
         resume=conn.execute("SELECT id FROM task_events WHERE task_id=? AND kind IN ('operator_acceptance_recovery','operator_agent_review_handoff') ORDER BY id DESC LIMIT 1",(tid,)).fetchone()

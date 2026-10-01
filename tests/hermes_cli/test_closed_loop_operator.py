@@ -147,6 +147,8 @@ def test_audited_repair_authority_fault_has_fixed_review_not_execution_replay(bo
     monkeypatch.setattr(operator,'policy',lambda conn:settings)
     with kb.write_txn(board):
         kb._append_event(board,repair,'operator_repair_stopped',{'due_at':1,'owner':'agent'})
+        stopped=operator._last(board,repair,'operator_repair_stopped')['id']
+    settings['audited_repair_faults'][repair]['event_id']=stopped
     operator.reconcile(board,settings=settings)
     assert kb.get_task(board,repair).status=='review'
     handoff=operator._last(board,repair,'operator_authority_review_handoff')
@@ -156,6 +158,55 @@ def test_audited_repair_authority_fault_has_fixed_review_not_execution_replay(bo
     assert operator._last(board,repair,'operator_authority_review_handoff')['id']==handoff['id']
     assert kb.get_task(board,tid).status=='blocked'
     assert kb.get_task(board,tid).block_kind=='dependency'
+
+
+@pytest.mark.parametrize('stale',[False,True])
+def test_audited_terminal_repair_fault_requires_latest_exact_event(board,monkeypatch,stale):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    assert kb.block_task(board,repair,kind='capability',reason='Worker judged stale candidate rather than authenticated outcome',expected_run_id=review.current_run_id)
+    hold=operator._last_hold(board,repair)
+    with kb.write_txn(board):
+        kb._append_event(board,repair,'operator_repair_stopped',{'owner':'agent','due_at':1})
+        stopped=operator._last(board,repair,'operator_repair_stopped')['id']
+    settings.update(cohort_task_ids=[tid],audited_repair_faults={repair:{'event_id':hold['id'] if stale else stopped,'source':'controlled exact worker goal audit','reason':'Shared worker goal now follows immutable original request'}})
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,repair).status==('blocked' if stale else 'review'),operator._payload(operator._last(board,repair,'operator_exception'))
+    operator.reconcile(board,settings=settings)
+    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_authority_review_handoff'",(repair,)).fetchone()[0]==(0 if stale else 1)
+    assert kb.get_task(board,tid).status=='blocked'
+
+
+def test_new_audited_phase_rework_ignores_old_due_but_keeps_new_deadline(board,monkeypatch):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    assert kb.block_task(board,repair,kind='capability',reason='Stale worker goal caused timeout',expected_run_id=review.current_run_id)
+    with kb.write_txn(board):
+        kb._append_event(board,repair,'operator_rework_due',{'due_at':1,'owner':'agent'})
+        kb._append_event(board,repair,'operator_repair_stopped',{'due_at':1,'owner':'agent'})
+        stopped=operator._last(board,repair,'operator_repair_stopped')['id']
+    settings.update(cohort_task_ids=[tid],audited_repair_faults={repair:{'event_id':stopped,'source':'exact independently reproduced worker fault','reason':'Corrected goal contract'}})
+    operator.reconcile(board,settings=settings)
+    worker=kb.claim_review_task(board,repair)
+    assert worker,operator._payload(operator._last(board,repair,'operator_exception'))
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,repair).status=='running'
+    ok,owner=kb.request_changes(board,repair,reason='Functional probe fails with concrete reproduction',expected_run_id=worker.current_run_id)
+    assert ok and owner=='pilot'
+    assert kb.claim_task(board,repair)
+    phase=operator._last(board,repair,'operator_agent_review_handoff')
+    monkeypatch.setattr(truth.time,'time',lambda:operator._payload(phase)['due_at']+1)
+    assert not truth.execution_claim_allowed(board,repair,'ready')
+    assert kb.get_task(board,tid).status=='blocked'
+    assert kb.claim_task(board,tid) is None
+
+
+def test_worker_goal_repairs_follow_authentic_request_and_owned_review_step(board,monkeypatch):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch,request_text='Report what is currently broken')
+    settings.update(cohort_task_ids=[tid],state_report_task_ids=[tid])
+    goal=kb.task_goal_text(board,review)
+    assert 'Report what is currently broken' in goal
+    assert 'truthful negative status satisfies' in goal
+    assert 'kanban_request_changes' in goal
+    assert 'kanban_request_changes' not in kb.task_goal_text(board,review,for_completion=True)
 
 
 def test_stale_repair_audit_does_not_override_a_later_fault(board,monkeypatch):
@@ -521,8 +572,8 @@ def test_reviewed_repair_resumes_exact_original_task(board,monkeypatch):
     assert kb.get_task(board, tid).status == "ready"
 
 
-def _owned_repair_candidate(board,monkeypatch):
-    tid=kb.create_task(board,title='failed genuine work',assignee='pilot',user_origin={'platform':'discord','chat_id':'channel','message_id':'message','user_id':'harry','text':entry()['message']})
+def _owned_repair_candidate(board,monkeypatch,request_text=None):
+    tid=kb.create_task(board,title='failed genuine work',assignee='pilot',user_origin={'platform':'discord','chat_id':'channel','message_id':'message','user_id':'harry','text':request_text or entry()['message']})
     kb.claim_task(board,tid)
     dispatch._record_task_failure(board,tid,'controlled crash',outcome='crashed',failure_limit=1,release_claim=True,end_run=True)
     settings={'enabled':True,'attempt_seconds':120}
@@ -776,6 +827,71 @@ def test_distinct_audited_fault_can_correct_tool_contract_with_finite_total_cap(
     assert phases==cap
     operator.reconcile(board,settings=settings)
     assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_authority_review_handoff'",(repair,)).fetchone()[0]==phases
+
+
+@pytest.mark.parametrize('case',['factual','functional','harry_prerequisite','claimed','unrelated_parent'])
+def test_factual_repair_final_review_supersedes_only_its_extra_internal_signoff(board,monkeypatch,case):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch,request_text=('What is actually running and is anything broken?' if case!='functional' else 'Repair the functional router'))
+    settings.update(cohort_task_ids=[tid])
+    if case!='functional':settings['state_report_task_ids']=[tid]
+    child=kb.create_task(board,title='Independent verification sign-off: audit factual status',created_by='pilot',assignee='pilot',parents=[repair],user_origin=({'platform':'discord','chat_id':'c','message_id':'separate-choice','user_id':'harry','text':'My separate prerequisite'} if case=='harry_prerequisite' else None))
+    kb.link_tasks(board,child,tid)
+    unrelated=None
+    if case=='unrelated_parent':
+        unrelated=kb.create_task(board,title='Independent external prerequisite',assignee='pilot',user_origin={'platform':'discord','chat_id':'c','message_id':'unrelated-choice','user_id':'harry','text':'Separate prerequisite'})
+        kb.link_tasks(board,unrelated,tid)
+    assert kb.complete_task(board,repair,result='Status facts independently reproduced',expected_run_id=review.current_run_id,metadata={'acceptance_receipts':{'probe':'actual status read'}})
+    if case=='claimed':assert kb.claim_task(board,child)
+    due=operator._payload(operator._last(board,tid,'operator_deadline'))['due_at']
+    actions=operator.reconcile(board,settings=settings,now=due+1)
+    child_edge=board.execute('SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?',(child,tid)).fetchone()
+    assert bool(child_edge)==(case in ('functional','harry_prerequisite','claimed')),{'actions':actions,'exception':operator._payload(operator._last(board,tid,'operator_exception')),'repair_status':kb.get_task(board,repair).status,'receipt_keys':list(operator._payload(operator._last(board,repair,'completed')).get('acceptance_receipts',{})),'implementer':operator._payload(operator._last(board,repair,'review_requested')).get('implementer'),'child_created_by':kb.get_task(board,child).created_by}
+    assert kb.get_task(board,child).status not in ('done','archived')
+    assert operator._last(board,child,'completed') is None
+    assert board.execute('SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?',(repair,child)).fetchone()
+    if case=='factual':
+        assert kb.get_task(board,tid).status=='review',operator._payload(operator._last(board,tid,'operator_exception'))
+        worker=kb.claim_review_task(board,tid)
+        assert worker and kb.complete_task(board,tid,result='System healthy',expected_run_id=worker.current_run_id)
+        assert 'System healthy' not in kb.get_task(board,tid).result
+    else:
+        assert kb.get_task(board,tid).status=='blocked'
+        assert kb.claim_task(board,tid) is None
+    if unrelated:assert board.execute('SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?',(unrelated,tid)).fetchone()
+
+
+def test_factual_original_goal_judge_sees_native_current_facts_not_candidate_health(board,monkeypatch):
+    tools=kanban_tools_surface
+    tid=kb.create_task(board,title='Stale positive health criteria',body='Everything must be healthy',assignee='pilot',goal_mode=True,user_origin={'platform':'discord','chat_id':'c','message_id':'status-goal','user_id':'harry','text':'What is actually running and is anything broken?'})
+    settings={'enabled':True,'cohort_task_ids':[tid],'state_report_task_ids':[tid]}
+    monkeypatch.setattr(operator,'policy',lambda conn:settings)
+    monkeypatch.setattr(tools,'_goal_judge_available',lambda:True)
+    captured={}
+    def judge(**kwargs):captured.update(kwargs);return 'done','truthful status',None,None,False
+    monkeypatch.setattr(tools,'judge_goal',judge)
+    tools._goal_gate('kanban_complete',kb.get_task(board,tid),tid,'System healthy',conn=board)
+    assert 'What is actually running' in captured['goal']
+    assert 'truthful negative status satisfies' in captured['goal']
+    assert 'Stale positive health criteria' not in captured['goal']
+    assert 'System healthy' not in captured['last_response']
+    assert 'Native live-state facts' in captured['last_response']
+
+
+def test_exception_records_changed_cause_but_not_identical_retries(board):
+    tid=kb.create_task(board,title='Observed handoff failure')
+    operator._exception(board,tid,'handoff_failed',error='unchanged evidence')
+    first=operator._last(board,tid,'operator_exception')
+    operator._exception(board,tid,'handoff_failed',error='unchanged evidence')
+    assert operator._last(board,tid,'operator_exception')['id']==first['id']
+    operator._exception(board,tid,'handoff_failed',error='separate prerequisite unresolved')
+    second=operator._last(board,tid,'operator_exception')
+    assert second['id']>first['id']
+    assert operator._payload(second)['error']=='separate prerequisite unresolved'
+    operator._exception(board,tid,'handoff_failed',error='separate prerequisite unresolved')
+    assert operator._last(board,tid,'operator_exception')['id']==second['id']
+    with kb.write_txn(board):board.execute('UPDATE task_events SET payload=? WHERE id=?',('legacy malformed evidence',first['id']))
+    operator._exception(board,tid,'handoff_failed',error='separate prerequisite unresolved')
+    assert operator._last(board,tid,'operator_exception')['id']==second['id']
 
 
 def test_unverified_repair_cannot_open_original_acceptance_phase(board,monkeypatch):
