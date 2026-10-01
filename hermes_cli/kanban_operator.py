@@ -337,6 +337,35 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
                 kb._append_event(conn,tid,'operator_acceptance_recovery',{'owner':'agent','source_terminal_event_id':terminal['id'],'due_at':now+runtime,'reviewer':reviewer,'acceptance':'unproved'})
             actions.append({'task_id':tid,'terminal_acceptance_recovered':True})
         except Exception as error:_exception(conn,tid,'terminal_acceptance_recovery_failed',error=str(error)[:300])
+    # One independently audited framework correction may resume an invalidated
+    # original after its prior acceptance phase stopped. This never renews the
+    # original deadline or silently repeats an old correction. The existing DB
+    # guard rechecks exact hold identity, immutable origin and independent owner.
+    for tid in cfg.get('cohort_task_ids',[]):
+        audit=(cfg.get('agent_owned_faults') or {}).get(tid,{})
+        task=kb.get_task(conn,tid);hold=_last_hold(conn,tid)
+        invalid=_last(conn,tid,'operator_acceptance_invalidated')
+        stop=_last(conn,tid,'operator_request_stopped')
+        if (not audit.get('retry_acceptance') or not audit.get('source') or not audit.get('reason')
+            or not task or task.status!='blocked' or task.block_kind!='capability' or task.claim_lock
+            or task.result or not hold or audit.get('blocked_event_id')!=hold['id'] or not invalid
+            or hold['id']<=invalid['id'] or not stop or stop['id']<=invalid['id']
+            or audit.get('deadline_stop_event_id')!=stop['id'] or _payload(stop).get('owner')!='agent'
+            or _last(conn,tid,'operator_audited_acceptance_recovery')):
+            continue
+        try:
+            reviewer=acceptance_owner(conn,cfg,task.assignee)
+            with kb.write_txn(conn):
+                ok,reason=kb.request_review(conn,tid,reviewer=reviewer,
+                    summary='Independently audited framework failure corrected. Reproduce the immutable original outcome; reject missing effects for native rework. Inspect existing effects; do not replay already-completed external actions or infer Harry confirmation. The original deadline remains breached, this correction is finite, and human receipt remains unobserved.',
+                    metadata={'acceptance_receipts':{'native_framework_correction':{'source_fault_event_id':stop['id'],'held_event_id':hold['id'],'source':audit['source'],'reason':audit['reason'],'scope':'Transition authority only; functional outcome still unproved'}}},
+                    resume_audited_origin=True,with_reason=True)
+                if not ok:raise ValueError(reason or 'audited acceptance recovery refused')
+                phase={'owner':'agent','source_fault_event_id':stop['id'],'held_event_id':hold['id'],'due_at':now+runtime,'reviewer':reviewer,'acceptance':'unproved','lifetime_limit':1}
+                kb._append_event(conn,tid,'operator_audited_acceptance_recovery',phase)
+                kb._append_event(conn,tid,'operator_acceptance_recovery',phase)
+            actions.append({'task_id':tid,'audited_acceptance_recovered':True})
+        except Exception as error:_exception(conn,tid,'audited_acceptance_recovery_failed',error=str(error)[:300])
     try:
         from hermes_cli.kanban_release_entrypoint import reconcile_entrypoint
         release_action=reconcile_entrypoint(cfg.get('release_entrypoint'),now=now)
