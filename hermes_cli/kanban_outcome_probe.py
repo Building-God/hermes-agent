@@ -45,9 +45,11 @@ async def run():
             headers['Authorization'] = 'Bearer ' + probe_token
             return headers
         async def post(self, url, **kwargs):
+            assert str(url).rstrip('/') == endpoint.rstrip('/'), 'Probe must reach the configured primary endpoint'
             kwargs['headers'] = self.probe_headers(kwargs.get('headers'))
             return await super().post(url, **kwargs)
         def stream(self, method, url, **kwargs):
+            assert str(url).rstrip('/') == endpoint.rstrip('/'), 'Probe must stream from the configured primary endpoint'
             kwargs['headers'] = self.probe_headers(kwargs.get('headers'))
             return super().stream(method, url, **kwargs)
     prompts = [

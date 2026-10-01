@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "authority": "Harry explicit2026-10-01 closed-loop build request, declared independently authenticated original cohort only",
+  "scope": "Sealed defaults close the serving-before-policy race; native current effects required at completion, no worker receipt substitution",
+  "checks": {
+    "t_5cb8e6be": {
+      "client_path": "C:\\Users\\User\\DiscordBots\\Jarvis\\hermes_router.py",
+      "client_sha256": "cae99f71cec794a5f78318df7c224e09749f272febff5f1d932e534328aee1a2",
+      "python": "C:/Python314/python.exe",
+      "kind": "conversation"
+    },
+    "t_2932862d": {
+      "client_path": "C:\\Users\\User\\DiscordBots\\Jarvis\\hermes_router.py",
+      "client_sha256": "cae99f71cec794a5f78318df7c224e09749f272febff5f1d932e534328aee1a2",
+      "python": "C:/Python314/python.exe",
+      "kind": "dashboard",
+      "health_url": "http://127.0.0.1:7888/api/health"
+    },
+    "t_bbaf4f71": {
+      "kind": "queue",
+      "url": "http://127.0.0.1:7888/api/questions",
+      "preserve_pending_choice_tasks": [
+        "t_ff65b842",
+        "t_3bfc4e75"
+      ]
+    }
+  }
+}

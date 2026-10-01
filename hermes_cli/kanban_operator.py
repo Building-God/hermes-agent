@@ -51,6 +51,10 @@ def verified_repair_for_original(conn,original_id):
     return {'repair_task_id':repair_id,'review_run_id':completed['run_id']}
 
 
+def audited_original_stop_event(conn,original_id):
+    return conn.execute("SELECT id,kind,payload FROM task_events WHERE task_id=? AND kind IN ('operator_request_stopped','operator_acceptance_stopped') ORDER BY id DESC LIMIT 1",(original_id,)).fetchone()
+
+
 def audited_repair_fault_event(conn,repair_id,event_id=None):
     """One typed failure vocabulary for audit intake and atomic handoff."""
     sql="SELECT * FROM task_events WHERE task_id=? AND kind IN ('blocked','block_loop_detected','dependency_wait','changes_requested','operator_repair_stopped','protocol_violation','gave_up')"
@@ -354,11 +358,17 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
         audit=(cfg.get('agent_owned_faults') or {}).get(tid,{})
         task=kb.get_task(conn,tid);hold=_last_hold(conn,tid)
         invalid=_last(conn,tid,'operator_acceptance_invalidated')
-        stop=_last(conn,tid,'operator_request_stopped')
+        anchor=invalid
+        if not anchor:
+            previous_phase=_last(conn,tid,'operator_acceptance_recovery')
+            if (previous_phase and audit.get('acceptance_phase_event_id')==previous_phase['id']
+                and _payload(previous_phase).get('owner')=='agent'):
+                anchor=previous_phase
+        stop=audited_original_stop_event(conn,tid)
         if (not audit.get('retry_acceptance') or not audit.get('source') or not audit.get('reason')
             or not task or task.status!='blocked' or task.block_kind!='capability' or task.claim_lock
-            or task.result or not hold or audit.get('blocked_event_id')!=hold['id'] or not invalid
-            or not stop or stop['id']<=invalid['id']
+            or task.result or not hold or audit.get('blocked_event_id')!=hold['id'] or not anchor
+            or not stop or stop['id']<=anchor['id']
             or audit.get('deadline_stop_event_id')!=stop['id'] or _payload(stop).get('owner')!='agent'
             or _last(conn,tid,'operator_audited_acceptance_recovery')):
             continue
@@ -392,7 +402,8 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
             continue
         from hermes_cli.kanban_acceptance_truth import completion_failure
         failure=completion_failure(conn,tid,str(task.result or '')+' '+str(_payload(completed).get('summary','')),cfg)
-        outcome=(cfg.get('outcome_checks') or {}).get(tid)
+        from hermes_cli.kanban_outcomes import declared_check
+        outcome=declared_check(cfg,tid)
         if outcome and not failure:
             native=conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='operator_outcome_verified' AND id<? ORDER BY id DESC LIMIT 1",(tid,completed['run_id'],completed['id'])).fetchone()
             native_data=json.loads(native['payload'] or '{}') if native else {}
