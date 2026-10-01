@@ -3226,6 +3226,18 @@ def complete_task(
         receipts = metadata.get("acceptance_receipts") if isinstance(metadata,dict) else None
         if not isinstance(receipts,(dict,list)) or not receipts:
             raise ValueError('Independent acceptance evidence required: include actual reproduction/probe/source receipts in metadata.acceptance_receipts; a reassuring summary is insufficient. Tool argument shape: {"metadata":{"acceptance_receipts":{"probe":{"command":"actual command executed","observed":"actual output","source":"source or serving identity"}}}}. Use an object or non-empty list inside metadata.acceptance_receipts, not a string or top-level acceptance_receipts. This example is a format, never evidence to copy; supply your actual observations.')
+        from hermes_cli.kanban_outcomes import verify_outcome
+        outcome = verify_outcome(conn, task_id, run_id, policy(conn))
+        if outcome is not None:
+            with write_txn(conn):
+                _append_event(conn, task_id, 'operator_outcome_verified' if outcome['passed'] else 'operator_outcome_failed', outcome, run_id=run_id)
+            if not outcome['passed']:
+                reason = 'Native original-outcome check failed: ' + '; '.join(outcome.get('failures') or ['Actual outcome unproved'])
+                accepted, detail = request_changes(conn, task_id, reason=reason, expected_run_id=run_id)
+                if not accepted:
+                    raise ValueError(reason + ' Native rework refused: ' + str(detail))
+                return False
+            metadata = {**metadata, 'acceptance_receipts': {'worker_observations': receipts, 'native_original_outcome': outcome}}
         from hermes_cli.kanban_operator import repair_contract
         from hermes_cli.kanban_acceptance_truth import completion_failure,health_snapshot
         claim_failure=completion_failure(conn,task_id,str(result or '')+' '+str(summary or ''),policy(conn))

@@ -358,7 +358,7 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
         if (not audit.get('retry_acceptance') or not audit.get('source') or not audit.get('reason')
             or not task or task.status!='blocked' or task.block_kind!='capability' or task.claim_lock
             or task.result or not hold or audit.get('blocked_event_id')!=hold['id'] or not invalid
-            or hold['id']<=invalid['id'] or not stop or stop['id']<=invalid['id']
+            or not stop or stop['id']<=invalid['id']
             or audit.get('deadline_stop_event_id')!=stop['id'] or _payload(stop).get('owner')!='agent'
             or _last(conn,tid,'operator_audited_acceptance_recovery')):
             continue
@@ -387,10 +387,17 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
     for tid in cfg.get('cohort_task_ids',[]):
         task=kb.get_task(conn,tid)
         completed=_last(conn,tid,'completed')
-        if not task or task.status!='done' or task.claim_lock or not completed or _last(conn,tid,'operator_acceptance_invalidated'):
+        invalid=_last(conn,tid,'operator_acceptance_invalidated')
+        if not task or task.status!='done' or task.claim_lock or not completed or (invalid and _payload(invalid).get('source_completed_event_id')==completed['id']):
             continue
         from hermes_cli.kanban_acceptance_truth import completion_failure
         failure=completion_failure(conn,tid,str(task.result or '')+' '+str(_payload(completed).get('summary','')),cfg)
+        outcome=(cfg.get('outcome_checks') or {}).get(tid)
+        if outcome and not failure:
+            native=conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='operator_outcome_verified' AND id<? ORDER BY id DESC LIMIT 1",(tid,completed['run_id'],completed['id'])).fetchone()
+            native_data=json.loads(native['payload'] or '{}') if native else {}
+            if not native_data.get('passed') or native_data.get('original_task_id')!=tid or native_data.get('kind')!=outcome['kind']:
+                failure='The declared original functional outcome has no native current-effects verification in its owned review run. Existing cycle, task-state or worker receipts cannot certify conversation or queue success. Reproduce the actual outcome; native completion will check it and return missing effects to the implementer.'
         declared=(cfg.get('agent_owned_faults') or {}).get(tid,{})
         if not failure and declared.get('completed_event_id')==completed['id'] and declared.get('source') and declared.get('reason'):
             failure='Audit-proved invalid completion: '+str(declared['reason'])
