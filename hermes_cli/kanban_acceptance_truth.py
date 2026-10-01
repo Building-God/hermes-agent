@@ -90,3 +90,33 @@ def require_archive_acceptance(conn,tid):
             if p.get('event_id')==complete['id'] and p.get('platform')==origin['platform'] and p.get('chat_id')==origin['chat_id']:delivered=True
     if not accepted or not delivered:
         raise ValueError('Archival cannot bypass original acceptance and same-thread delivery. Retain the owned review or agent exception; correct and deliver the substantive result. Human result receipt is separate and never fabricated.')
+
+
+def native_state_report(conn,tid,cfg):
+    """Answer declared status requests with independent native reads, not shell claims."""
+    if tid not in cfg.get('state_report_task_ids',[]) or tid not in cfg.get('cohort_task_ids',[]):return None
+    if not conn.execute('SELECT 1 FROM task_user_origins WHERE task_id=?',(tid,)).fetchone():return None
+    facts=health_snapshot(conn,cfg,current_task=tid)
+    lines=['Live evidence for the recent requests I audited:']
+    for name in ('discord','api_server','whatsapp'):
+        lines.append('- '+name+': '+str(facts['platforms'].get(name,'unproved'))+'.')
+    for item in facts['requests']:
+        origin=conn.execute('SELECT text FROM task_user_origins WHERE task_id=?',(item['task_id'],)).fetchone()
+        label=' '.join((origin['text'] if origin else item['task_id']).split())[:120]
+        evidence=('agent-owned failure remains unresolved' if item['unresolved_agent_fault'] else 'recorded state; functional outcome still needs its own evidence')
+        lines.append('- '+label+' ['+item['task_id']+']: '+item['status']+', owner '+str(item['owner'])+'; '+evidence+'.')
+    choices=[item['task_id'] for item in facts['requests'] if item['status']=='blocked' and conn.execute('SELECT block_kind FROM tasks WHERE id=?',(item['task_id'],)).fetchone()['block_kind']=='needs_input']
+    lines.append('Waiting for Harry in this audited scope: '+(', '.join(choices) if choices else 'no recorded human-only choice; agent deployment and review remain agent-owned')+'.')
+    lines.append('Older cards outside this audit remain unverified. Gateway connection and board activity do not establish capability parity. Human result receipt is separate and is not inferred from sending this answer.')
+    return '\n'.join(lines),facts
+
+
+def repair_review_failure(conn,tid,reason):
+    """Reject the observed reviewer instruction that contradicts native ownership."""
+    from hermes_cli.kanban_operator import policy,repair_authority
+    if not policy(conn).get('enabled') or not repair_authority(conn,tid):return None
+    text=str(reason or '')
+    if re.search(r'needs_input',text,re.I) and re.search(r'block_kind|sql\s+update|update\s+tasks|still.{0,30}dependency',text,re.I):
+        if re.search(r'(?:do not|must not|remove|reject|wrong|incorrect).{0,50}needs_input',text,re.I):return None
+        return 'Review contradicts native repair authority: the original must retain its agent-owned dependency hold until independently accepted. Changing block_kind to needs_input is not the requested functional repair. Use native Kanban reads and actual outcome probes; do not demand SQL ownership mutation or Harry deployment.'
+    return None
