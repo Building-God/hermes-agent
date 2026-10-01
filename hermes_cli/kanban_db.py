@@ -4026,7 +4026,7 @@ def request_review(
             from hermes_cli.kanban_operator import repair_descendant_hold
             repair_block=_last_hold(conn,task_id)
             circular_hold=(trow['block_kind'] in (None,'dependency') and repair_block and repair_descendant_hold(conn,task_id,_json_dict(repair_block['payload']).get('reason')))
-            from hermes_cli.kanban_operator import repair_authority,repair_contract
+            from hermes_cli.kanban_operator import repair_authority,repair_contract,audited_repair_attempt_allowed
             audit=(policy(conn).get('audited_repair_faults') or {}).get(task_id,{})
             authority=repair_authority(conn,task_id)
             audit_event=conn.execute("SELECT id FROM task_events WHERE task_id=? AND id=? AND kind IN ('blocked','changes_requested')",(task_id,audit.get('event_id'))).fetchone()
@@ -4034,7 +4034,7 @@ def request_review(
             audited_repair_hold=(resume_audited_repair and authority and authority['event']['task_id'] in policy(conn).get('cohort_task_ids',[])
                                 and audit_event and audit_event['id']==max((repair_block['id'] if repair_block else 0),(_last(conn,task_id,'changes_requested')['id'] if _last(conn,task_id,'changes_requested') else 0))
                                 and audit.get('source') and audit.get('reason') and not native_failure
-                                and not _last(conn,task_id,'operator_authority_review_handoff')
+                                and audited_repair_attempt_allowed(conn,task_id,audit)
                                 and trow['status'] in ('blocked','todo') and trow['claim_lock'] is None)
             repair_handoff = (resume_agent_repair and policy(conn).get("enabled",False) and
                               trow["created_by"]=="operator-repair" and trow["status"]=="blocked" and

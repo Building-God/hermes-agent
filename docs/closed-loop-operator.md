@@ -162,3 +162,11 @@ Corrective repair review preserves the original implementation owner rather than
 An invalidated authenticated request that lost its notification subscription regains the original platform/chat/thread/user and reply-to message from durable origin/transport evidence. Restoration starts both text and artifact cursors at current history, so the old false result and stale notices do not replay. The event records route restoration, never successful delivery or human receipt. Missing non-Discord route proof stays an agent exception.
 
 When an acceptance invalidation supersedes the last completion, reconciliation withdraws that stale canonical result atomically. Its exact previous text, hash, completion ID and invalidation ID remain in a durable event. A later valid completion is never cleared by a stale invalidation.
+
+Accepted repairs now carry their new completion event, owned review provenance, native original contract and actual acceptance receipts into the original final review. This changes evidence after a prior rejection without replaying original actions or renewing its execution deadline.
+
+A blocked reviewer who calls recorded native ownership restoration a kernel SQL rollback is returned to the original implementer once, only when that causal guard event belongs to this review attempt and the original still has its unclaimed agent-owned hold. An explicit finite correction phase preserves all old run/stop/failure records. Its source is native fact correction, not an inferred reviewer or Harry verdict. Missing guard provenance, genuine unrelated prerequisites or later ownership changes refuse recovery. Further failures cannot renew it.
+
+Goal judges now receive structured acceptance receipts and the durable authenticated original repair authority. Old candidate task flags cannot replace the requested outcome, and owned goal failures never instruct Harry to solve deployment or tool metadata. This does not weaken native completion checks.
+
+Independently audited distinct new faults can receive correction only when the exact new fault follows the previous handoff, has not been audited before, and the lifetime ownership-correction count remains below max_audited_repair_faults (default 3). Each phase has its own fixed deadline; stale or repeated audits cannot renew it.

@@ -1,6 +1,7 @@
 """Controlled failure drills using actual board APIs and isolated Hermes homes."""
 import json
 import pytest
+from tools import kanban_tools as kanban_tools_surface
 from hermes_cli import kanban_acceptance_truth as truth
 
 from hermes_cli import kanban_db as kb
@@ -688,6 +689,93 @@ def test_verified_late_repair_hands_original_to_acceptance_without_replaying_wor
     operator.reconcile(board,settings=settings,now=due+3)
     assert kb.get_task(board,tid).status=='blocked'
     assert kb.get_task(board,tid).block_kind!='needs_input'
+
+
+def test_verified_repair_is_new_evidence_after_original_review_rejection(board,monkeypatch):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    prior=operator.candidate_fingerprint(board,tid,None)
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'review_requested',{'implementer':'pilot','reviewer':'reviewer','candidate_sha256':prior})
+        kb._append_event(board,tid,'changes_requested',{'reason':'Actual probe unavailable; changed evidence required'})
+    assert kb.complete_task(board,repair,result='Independent probe now reproduced',expected_run_id=review.current_run_id,metadata={'acceptance_receipts':{'probe':'actual new reproduction'}})
+    completed=operator._last(board,repair,'completed')
+    due=operator._payload(operator._last(board,tid,'operator_deadline'))['due_at']
+    operator.reconcile(board,settings=settings,now=due+1)
+    assert kb.get_task(board,tid).status=='review',operator._payload(operator._last(board,tid,'operator_exception'))
+    evidence=operator._payload(operator._last(board,tid,'review_requested'))['acceptance_receipts']['native_verified_repair']
+    assert evidence['completed_event_id']==completed['id']
+    assert evidence['repair_task_id']==repair
+    assert evidence['acceptance_receipts']['probe']=='actual new reproduction'
+    operator.reconcile(board,settings=settings,now=due+2)
+    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_repair_verified'",(tid,)).fetchone()[0]==1
+
+
+@pytest.mark.parametrize('native_guard',[True,False])
+def test_false_kernel_review_block_reworks_once_only_with_exact_native_guard(board,monkeypatch,native_guard):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    if native_guard:
+        with kb.write_txn(board):
+            board.execute("UPDATE tasks SET block_kind='needs_input' WHERE id=?",(tid,))
+        operator.reconcile(board,settings=settings)
+        assert kb.get_task(board,tid).block_kind=='dependency'
+    assert kb.block_task(board,repair,kind='dependency',reason='Kernel transaction isolation fault: SQL modifications automatically roll back',expected_run_id=review.current_run_id)
+    operator.reconcile(board,settings=settings)
+    if not native_guard:
+        assert kb.get_task(board,repair).status=='blocked'
+        assert operator._last(board,repair,'operator_invalid_review_rework') is None
+        return
+    assert kb.get_task(board,repair).status=='ready'
+    assert kb.get_task(board,repair).assignee=='pilot'
+    phase=operator._payload(operator._last(board,repair,'operator_invalid_review_rework'))
+    assert phase['native_guard_event_id']==operator._last(board,tid,'operator_repair_hold_reconciled')['id']
+    worker=kb.claim_task(board,repair)
+    assert worker is not None
+    assert kb.block_task(board,repair,kind='capability',reason='Recovery failed',expected_run_id=worker.current_run_id)
+    operator.reconcile(board,settings=settings,now=phase['due_at']+1)
+    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_invalid_review_rework'",(repair,)).fetchone()[0]==1
+    assert kb.get_task(board,repair).status=='blocked'
+    assert kb.claim_task(board,repair) is None
+
+
+def test_goal_judge_receives_original_repair_authority_and_structured_receipts(board,monkeypatch):
+    tools=kanban_tools_surface
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    task=kb.get_task(board,repair)
+    from dataclasses import replace
+    task=replace(task,goal_mode=True,body='Stale reviewer says change block_kind to needs_input')
+    captured={}
+    def judge(**kwargs):
+        captured.update(kwargs)
+        return 'done','actual receipt accepted',None,None,False
+    monkeypatch.setattr(tools,'_goal_judge_available',lambda:True)
+    monkeypatch.setattr(tools,'judge_goal',judge)
+    tools._goal_gate('kanban_complete',task,repair,'Probe reproduced',conn=board,metadata={'acceptance_receipts':{'probe':'actual source receipt'}})
+    assert operator.repair_authority(board,repair)['origin']['text'] in captured['goal']
+    assert 'Stale reviewer' not in captured['goal']
+    assert 'actual source receipt' in captured['last_response']
+    def blocked(**kwargs):return 'blocked','tool metadata misunderstood',None,None,False
+    monkeypatch.setattr(tools,'judge_goal',blocked)
+    with pytest.raises(tools._Reject,match='Do not hand deployment'):
+        tools._goal_gate('kanban_complete',task,repair,'Candidate',conn=board)
+
+
+@pytest.mark.parametrize('cap',[1,2])
+def test_distinct_audited_fault_can_correct_tool_contract_with_finite_total_cap(board,monkeypatch,cap):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    monkeypatch.setattr(dispatch,'_profile_exists_fn',lambda:lambda name:name in {'pilot','reviewer','other'})
+    monkeypatch.setattr('hermes_cli.profiles.profile_exists',lambda name:name in {'pilot','reviewer','other'})
+    settings.update(cohort_task_ids=[tid],max_audited_repair_faults=cap,acceptance_recheck_assignee='other')
+    with kb.write_txn(board):
+        first=kb._append_event(board,repair,'operator_authority_review_handoff',{'audit_event_id':1,'due_at':1,'owner':'agent'})
+    assert kb.block_task(board,repair,kind='capability',reason='Goal judge failed to receive structured receipt metadata',expected_run_id=review.current_run_id)
+    hold=operator._last_hold(board,repair)
+    settings['audited_repair_faults']={repair:{'event_id':hold['id'],'source':'independent source/actual failure audit','reason':'Tool schema and handler accept metadata; corrected judge now receives its actual structured receipts'}}
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,repair).status==('review' if cap==2 else 'blocked'),operator._payload(operator._last(board,repair,'operator_exception'))
+    phases=board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_authority_review_handoff'",(repair,)).fetchone()[0]
+    assert phases==cap
+    operator.reconcile(board,settings=settings)
+    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_authority_review_handoff'",(repair,)).fetchone()[0]==phases
 
 
 def test_unverified_repair_cannot_open_original_acceptance_phase(board,monkeypatch):
