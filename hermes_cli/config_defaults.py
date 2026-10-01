@@ -212,6 +212,13 @@ DEFAULT_CONFIG = {
         # "Still working" status interval (seconds); 0 = off. Lower = faster feedback, more noise;
         # 180 catches spinning weak-model runs before users /restart.
         "gateway_notify_interval": 180,
+        # Wall-clock front-door turn deadline (seconds); 0 = off (opt-in). Independent of
+        # activity: an agent that keeps making slow provider/tool calls stays "active" and would
+        # otherwise outlive any sane bound. On expiry the gateway emits a truthful bounded
+        # acknowledgement and journals the request durably (front_door_deadline_journal.jsonl)
+        # instead of silently spinning. Distinct from gateway_timeout (inactivity-only). 0 =
+        # disabled so existing installs are unchanged until an operator sets a measured value.
+        "gateway_turn_deadline": 0,
         # Session stall watchdog (seconds): RECOVERY notifier for an in-process AIAgent with an
         # adapter-queued follow-up while its activity clock is stale — NOT a general stall detector
         # (ignores startup restore, build sentinels, leases, debounce, other processes; scan cadence

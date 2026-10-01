@@ -3479,6 +3479,76 @@ class GatewayTurnMixin:
         except Exception as _warn_err:
             logger.debug("Inactivity warning send error: %s", _warn_err)
 
+    async def _run_agent_front_door_deadline_result(
+        self, worker: "GatewayRunner._RunAgentWorker", turn_ctx: TurnContext, deadline_secs: float,
+    ) -> dict:
+        """Synthetic result for a wall-clock front-door deadline: journal the request durably,
+        emit a truthful bounded acknowledgement, and interrupt the still-running agent.
+
+        Idempotent across gateway restart: the journal key derives from the ORIGINAL user message
+        timestamp (``persist_user_timestamp``) when one was persisted, and falls back to a stable
+        content hash of the message when it was not - so a restarted, auto-resumed turn that hits
+        the deadline again is recognised and returns a short status reference instead of
+        re-answering or asking the user to resend."""
+        from gateway.run import (
+            _INTERRUPT_REASON_TIMEOUT, _INTERRUPT_TOOL_REASON_TIMEOUT, _hermes_home,
+            request_hard_interrupt, _abandon_timed_out_gateway_turn,
+        )
+        from gateway.front_door_deadline import (
+            build_bounded_ack, build_resume_reference, is_journaled, journal_request, make_request_entry,
+        )
+        agent_holder = turn_ctx.agent_holder
+        source = turn_ctx.source
+        # Original inbound timestamp when available, so the idempotency key is stable across a
+        # restart that auto-resumes the same interrupted turn. When it was not persisted, the key
+        # falls back to a stable content hash (NOT the wall clock) so the resumed turn still dedupes.
+        request_ts = turn_ctx.persist_user_timestamp or 0.0
+        entry = make_request_entry(
+            platform=str(getattr(source, "platform", "discord")),
+            conversation_id=str(getattr(source, "chat_id", "") or ""),
+            session_key=turn_ctx.session_key,
+            user=str(getattr(source, "user_name", None) or getattr(source, "user_id", None) or ""),
+            message=turn_ctx.message or "",
+            request_ts=request_ts,
+            deadline_seconds=deadline_secs,
+            ack_ts=time.time(),
+        )
+        already_acked = is_journaled(_hermes_home, entry["idempotency_key"])
+        if not already_acked:
+            try:
+                journal_request(_hermes_home, entry)
+            except Exception as _jerr:
+                logger.debug("front-door deadline journal failed: %s", _jerr)
+        # Abandon the still-running turn (frees the executor thread-pool worker) and interrupt
+        # the agent so it stops making provider calls (mirrors the inactivity-timeout reaper).
+        threading.Thread(
+            target=_abandon_timed_out_gateway_turn,
+            kwargs={"agent_holder": agent_holder, **self._reaper_kwargs(worker)},
+            name=f"gateway-turn-reaper-{worker.task_id[:12]}", daemon=True,
+        ).start()
+        _timed_out_agent = agent_holder[0]
+        if _timed_out_agent:
+            request_hard_interrupt(
+                _timed_out_agent, _INTERRUPT_REASON_TIMEOUT, tool_reason=_INTERRUPT_TOOL_REASON_TIMEOUT,
+            )
+        logger.warning(
+            "front-door deadline hit: platform=%s chat=%s session=%s deadline=%.0fs already_acked=%s tracking=%s",
+            entry["platform"], entry["conversation_id"], turn_ctx.session_key,
+            deadline_secs, already_acked, entry["tracking_id"],
+        )
+        ack_text = build_resume_reference(entry) if already_acked else build_bounded_ack(entry)
+        return {
+            "final_response": ack_text,
+            "messages": turn_ctx.result_holder[0].get("messages", []) if turn_ctx.result_holder[0] else [],
+            "api_calls": self._agent_activity_summary(_timed_out_agent).get("api_call_count", 0),
+            "tools": turn_ctx.tools_holder[0] or [],
+            "history_offset": 0,
+            "failed": True,
+            "front_door_deadline": True,
+            "already_acked": already_acked,
+            "tracking_id": entry["tracking_id"],
+        }
+
     def _run_agent_timeout_result(self, worker, turn_ctx: TurnContext) -> dict:
         """Synthetic failed run dict for an inactivity timeout, with the activity-tracker diagnostic;
         interrupts the agent if it is still running so the thread pool worker is freed."""
@@ -3533,18 +3603,37 @@ class GatewayTurnMixin:
         self, worker: "GatewayRunner._RunAgentWorker", turn_ctx: TurnContext,
         _interrupt_detected: "asyncio.Event", interrupt_monitor: "asyncio.Task",
     ) -> Any:
-        """Poll the executor future (inactivity timeout + backup interrupt checks); return its result,
-        or a synthetic failed run dict on inactivity timeout. Polls even with an unlimited timeout
-        so the backup interrupt check runs if monitor_for_interrupt() silently died."""
+        """Poll the executor future (wall-clock front-door deadline + inactivity timeout + backup
+        interrupt checks); return its result, or a synthetic failed run dict on deadline or inactivity
+        timeout. Polls even with an unlimited timeout so the backup interrupt check runs if
+        monitor_for_interrupt() silently died.
+
+        The wall-clock deadline is independent of activity: an agent that keeps making slow
+        provider/tool calls stays "active" and would otherwise outlive any sane bound (observed
+        20+ minute silent turns). ``agent.gateway_turn_deadline`` (0 = disabled) bounds that."""
         from gateway.run import _abandon_timed_out_gateway_turn
+        from gateway.front_door_deadline import resolve_front_door_deadline
         agent_holder = turn_ctx.agent_holder
         _warning_fired = False
+        _deadline_secs = 0.0
+        # Scheduled heartbeats and muted diagnostic wakes are proactive, not replies to a real
+        # inbound question; never ack or bound those with the front-door deadline.
+        # agent.gateway_turn_deadline reaches us via the env bridge (HERMES_AGENT_TURN_DEADLINE);
+        # read the bridged value directly, exactly as gateway_timeout / gateway_notify_interval do.
+        if not (turn_ctx.scheduled_heartbeat or turn_ctx.mute_notification_reply):
+            _deadline_secs = resolve_front_door_deadline(
+                None,
+                env_value=os.environ.get("HERMES_AGENT_TURN_DEADLINE"),
+            )
+        _wall_start = time.monotonic()
         while True:
             done, _ = await asyncio.wait({worker.executor_task}, timeout=5.0)
             if done:
-                # Prefer the real result even if the watchdog fired in the same window (the run already
+                # Prefer the real result even if a watchdog fired in the same window (the run already
                 # persisted its reply).
                 return worker.executor_task.result()
+            if _deadline_secs > 0 and (time.monotonic() - _wall_start) >= _deadline_secs:
+                return await self._run_agent_front_door_deadline_result(worker, turn_ctx, _deadline_secs)
             if worker.agent_timeout is not None:
                 if worker.timeout_fired.is_set():
                     break
