@@ -221,6 +221,33 @@ def test_safe_release_authority_reaches_worker_context_only_for_declared_cohort(
     assert 'Harry has authorized implementation, deployment and live reproduction' not in kb.task_goal_text(board,review)
 
 
+@pytest.mark.parametrize('case',['native','unknown_owner','wrong_repair','human_hold'])
+def test_exact_audited_candidate_can_follow_historical_native_restoration_only(board,monkeypatch,case):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    assert kb.block_task(board,repair,kind='capability',reason='Exact source defect independently reproduced',expected_run_id=review.current_run_id)
+    fault=operator._last_hold(board,repair)
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'operator_repair_hold_reconciled',{'owner':'agent' if case!='unknown_owner' else 'unknown','repair_task_id':repair if case!='wrong_repair' else 't_other','previous_status':'blocked','previous_block_kind':'capability'})
+        if case=='human_hold':
+            board.execute("UPDATE tasks SET block_kind='needs_input' WHERE id=?",(tid,))
+            kb._append_event(board,tid,'blocked',{'kind':'needs_input','reason':'Which mutually exclusive recipient do you choose?','source_status':'ready'})
+    assert operator.repair_contract(board,repair)[1]
+    drift=operator._last(board,tid,'operator_repair_hold_reconciled')
+    settings.update(cohort_task_ids=[tid],audited_repair_faults={repair:{'event_id':fault['id'],'source':'Controlled independent exact source audit','reason':'Corrected source; old native restoration retained as history'}})
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,repair).status==('review' if case=='native' else 'blocked')
+    assert operator._last(board,tid,'operator_repair_hold_reconciled')['id']==drift['id']
+    if case=='native':
+        assert operator.repair_contract(board,repair)[1] is None
+        assert kb.claim_review_task(board,repair)
+        with kb.write_txn(board):kb._append_event(board,tid,'operator_repair_hold_reconciled',{'owner':'agent','repair_task_id':repair,'previous_block_kind':'needs_input'})
+        assert operator.repair_contract(board,repair)[1]
+    if case=='human_hold':
+        operator.reconcile(board,settings=settings)
+        assert kb.get_task(board,tid).block_kind=='needs_input'
+        assert kb.get_task(board,repair).status=='blocked'
+
+
 def test_stale_repair_audit_does_not_override_a_later_fault(board,monkeypatch):
     tid,repair,info,settings=historical_repair_review_hold(board)
     hold=operator._last_hold(board,repair)
