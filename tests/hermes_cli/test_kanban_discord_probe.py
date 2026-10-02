@@ -7,7 +7,8 @@ import yaml
 from hermes_cli import kanban_discord_probe as probe
 
 
-def test_native_client_uses_configured_key_and_serving_home_not_worker_profile(tmp_path, monkeypatch):
+@pytest.mark.parametrize("network_fails", [False, True])
+def test_native_client_uses_configured_key_and_serving_home_not_worker_profile(tmp_path, monkeypatch, network_fails):
     home = tmp_path / "home"
     root = home / "releases/sealed-candidate"
     script = root / "hermes_cli/kanban_discord_probe.py"
@@ -32,16 +33,24 @@ def test_native_client_uses_configured_key_and_serving_home_not_worker_profile(t
                     "controlled_reproduction": True, "network_delivery": False, "chat_id": "fixture-control",
                     "response": reference + ": live outcome not proved; no receipt yet"} for _ in range(6)]}
         assert headers["Authorization"] == "Bot discord-test"
+        if network_fails:
+            raise OSError("controlled network failure")
         if url.endswith("users/@me"):
             return {"id": "fixture-bot"}
         return {"author": {"id": "fixture-human", "bot": False}, "channel_id": "fixture-channel", "content": "fixture request"}
     monkeypatch.setattr(probe, "read_json", read)
     report = probe.run({"discord_probe_url": "http://127.0.0.1:8642/api/operator/verify-discord", "discord_origin": origin})
-    assert report["passed"] is True
-    assert report["origin_network_readback"]["author_is_bot"] is False
-    assert report["independent_process_readback"]["root"] == str(root)
+    if network_fails:
+        assert report["passed"] is False
+        assert len(report["requests"]) == 6
+        assert "controlled network failure" in report["failures"][-1]
+        assert "origin_network_readback" not in report
+    else:
+        assert report["passed"] is True
+        assert report["origin_network_readback"]["author_is_bot"] is False
+        assert report["independent_process_readback"]["root"] == str(root)
     assert report["human_receipt"] is False
-    assert len(seen) == 3
+    assert len(seen) == (2 if network_fails else 3)
 
 
 def test_http_refusal_preserves_native_agent_failure_evidence(monkeypatch):
@@ -53,3 +62,13 @@ def test_http_refusal_preserves_native_agent_failure_evidence(monkeypatch):
         raise HTTPError("http://127.0.0.1:8642/api/operator/verify-discord", 422, "failed", {}, BytesIO(json.dumps(body).encode()))
     monkeypatch.setattr(probe, "urlopen", refused)
     assert probe.read_json("http://127.0.0.1:8642/api/operator/verify-discord", {}, payload={"nonce": "a" * 32}) == body
+
+
+def test_discord_readback_sends_explicit_bot_user_agent(monkeypatch):
+    from io import BytesIO
+    def opened(request, **kwargs):
+        assert request.get_header("User-agent").startswith("DiscordBot (")
+        assert request.get_header("Authorization") == "Bot fixture-test"
+        return BytesIO(b'{"id":"fixture-bot"}')
+    monkeypatch.setattr(probe, "urlopen", opened)
+    assert probe.read_json("https://discord.com/api/v10/users/@me", {"Authorization": "Bot fixture-test"}) == {"id": "fixture-bot"}
