@@ -236,6 +236,30 @@ def build_resume_reference(entry: Dict[str, Any]) -> str:
     return build_bounded_ack(entry)
 
 
+_RESUME_SYSTEM_NOTE_PREFIX = "[System note:"
+
+
+def strip_resume_system_note(message: Any) -> str:
+    """Return the real user text with any leading ``[System note: ...]`` wrapper removed.
+
+    The resume path prepends a bracketed system note (``gateway.run.build_resume_recovery_note``)
+    to the turn message before entering the agent and appends the real user text after the
+    closing ``]`` when there is any. A journaled deadline receipt must never card the system's
+    own restoration notice, so this strips the wrapper and returns only the text the user
+    actually typed. Returns ``""`` when the message is only a system note (auto-resume with no
+    new user text), so the caller skips continuation instead of carding the notice.
+    """
+    if not isinstance(message, str):
+        return ""
+    text = message.lstrip()
+    while text.startswith(_RESUME_SYSTEM_NOTE_PREFIX):
+        close = text.find("]")
+        if close == -1:
+            break
+        text = text[close + 1:].lstrip()
+    return text.strip()
+
+
 def ensure_continuation(entry: Dict[str, Any], *, board: Optional[str] = None, home: Any = None,
                         assignee: Optional[str] = None, notifier_profile: Optional[str] = None) -> str:
     """A deadline receipt is not execution. Atomically persist an owned task and
@@ -249,8 +273,12 @@ def ensure_continuation(entry: Dict[str, Any], *, board: Optional[str] = None, h
     user_id = entry.get("user_id", "")
     chat_id = entry.get("conversation_id", "")
     message_id = entry.get("message_id") or entry["idempotency_key"]
-    message = entry.get("message", "")
-    if not all((platform, user_id, chat_id, message)):
+    message = strip_resume_system_note(entry.get("message", ""))
+    if not message:
+        # Only the injected restoration note was journaled (auto-resume with no new user text).
+        # There is nothing to continue: never card the system's own notice.
+        return ""
+    if not all((platform, user_id, chat_id)):
         raise ValueError("continuation requires authenticated origin and return route")
     body = (
         "## Harry's request\n" + message + "\n\n## Task\n"
@@ -312,6 +340,8 @@ def recover_unowned_intake(home, *, board=None):
             continue
         if not all(row.get(field) for field in ("platform", "user_id", "conversation_id", "message")):
             continue  # No authenticated authority: never fabricate a task origin.
+        if not strip_resume_system_note(row.get("message", "")):
+            continue  # Only the injected restoration note: nothing to continue.
         try:
             ensure_continuation(row, home=home, board=board)
         except Exception as error:
