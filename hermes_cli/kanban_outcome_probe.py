@@ -10,8 +10,11 @@ ROOT = Path('C:/Users/User/DiscordBots/Jarvis')
 HOME = Path('C:/Users/User/AppData/Local/hermes')
 CONFIG = json.loads(sys.stdin.read())
 OUTPUT = None
-sys.path.insert(0, str(ROOT))
-import hermes_router
+import importlib.util
+client_path=Path(CONFIG['client_path'])
+spec=importlib.util.spec_from_file_location('primary_interface_client',client_path)
+hermes_router=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hermes_router)
 
 
 async def run():
@@ -35,7 +38,7 @@ async def run():
     records = []
     receipt = {'started_at': time.time(), 'revision': started['code_sha'], 'gateway_pid': started['pid'],
                'context_id': context, 'actor': peer, 'genuine_harry_request': False,
-               'human_receipt': 'not inferred', 'scope': 'Six controlled reasoning/memory turns through the real primary interface client and real serving default agent. HTTP and streaming; no requested tools, files or task mutations.',
+               'human_receipt': 'not inferred', 'scope': 'Six controlled reasoning/memory turns through the actual declared primary HTTP consumer and real serving default agent; no requested tools, files or task mutations.',
                'router_sha256': hashlib.sha256(Path(hermes_router.__file__).read_bytes()).hexdigest(),
                'requests': records, 'passed': False}
     class ProbeClient(httpx.AsyncClient):
@@ -64,10 +67,21 @@ async def run():
         for index, prompt in enumerate(prompts):
             assert time.time() < expires, 'Controlled capability expired'
             before = time.time()
-            response = await hermes_router.send_to_hermes(prompt, context_id=context, env_path=ROOT / '.env',
-                timeout_s=75, client_factory=lambda **kwargs: ProbeClient(**kwargs), stream=index == 5)
+            if CONFIG.get('primary_http_url'):
+                url=CONFIG['primary_http_url']
+                assert urlparse(url).hostname in ('localhost','127.0.0.1','::1')
+                async with httpx.AsyncClient(timeout=75) as client:
+                    actual=await client.post(url,json={'text':prompt,'surface':'dash','context_id':context},
+                        headers={'X-Jarvis-Verification-Token':probe_token})
+                    actual.raise_for_status()
+                    body=actual.json()
+                    assert body.get('backend')=='hermes' and body.get('actor')==peer, 'Actual HTTP consumer lost backend or verification provenance'
+                    response=body['reply']
+            else:
+                response = await hermes_router.send_to_hermes(prompt, context_id=context, env_path=client_path.parent / '.env',
+                    timeout_s=75, client_factory=lambda **kwargs: ProbeClient(**kwargs), stream=index == 5)
             assert response and 'anti-loop protection' not in response.lower()
-            records.append({'turn': index + 1, 'transport': 'stream' if index == 5 else 'http',
+            records.append({'turn': index + 1, 'transport': 'primary-http' if CONFIG.get('primary_http_url') else ('stream' if index == 5 else 'http'),
                             'request': prompt, 'response': response[:3000], 'elapsed_seconds': time.time() - before})
 
         assert all(code in records[index]['response'] for index in (0, 2, 5)), 'Context/reference was lost'

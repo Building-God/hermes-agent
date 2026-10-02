@@ -33,6 +33,43 @@ def entry():
                 message_id="message", message="Produce the weekly briefing", idempotency_key="discord:channel:message")
 
 
+@pytest.mark.parametrize('kind', ['conversation','dashboard','queue'])
+def test_original_technical_outcome_cannot_assign_agent_testing_to_harry(board,monkeypatch,kind):
+    tid=ensure_continuation(entry())
+    cfg={'enabled':True,'cohort_task_ids':[tid],'outcome_checks':{tid:{'kind':kind}}}
+    monkeypatch.setattr(operator,'policy',lambda conn:cfg)
+    with pytest.raises(ValueError,match='agent-owned'):
+        kb.block_task(board,tid,kind='needs_input',reason='Harry tests or releases this fix')
+    assert kb.get_task(board,tid).status!='blocked'
+    outside=kb.create_task(board,title='Physical device choice',assignee='pilot')
+    assert kb.block_task(board,outside,kind='needs_input',reason='Which microphone should be connected?')
+    assert kb.get_task(board,outside).block_kind=='needs_input'
+
+
+@pytest.mark.parametrize('mode',['exact','stale','unbound','duplicate'])
+def test_exact_original_agent_hold_handoff_is_owned_finite_and_singleton(board,monkeypatch,mode):
+    tid=ensure_continuation(entry())
+    assert kb.block_task(board,tid,kind='needs_input',reason='Harry deploys and verifies')
+    hold=operator._last(board,tid,'blocked')
+    cfg={'enabled':True,'cohort_task_ids':[tid],'attempt_seconds':60,'request_seconds':120,
+         'outcome_checks':{tid:{'kind':'conversation'}},'review_assignee':'reviewer',
+         'agent_owned_faults':{tid:{'blocked_event_id':hold['id']+(mode=='stale'),'source':'actual bounded audit','reason':'Testing is agent owned'}}}
+    if mode=='unbound':cfg['cohort_task_ids']=[]
+    if mode=='duplicate':
+        with kb.write_txn(board):kb._append_event(board,tid,'operator_original_agent_review_handoff',{'source_event_id':hold['id']})
+    monkeypatch.setattr(operator,'policy',lambda conn:cfg)
+    operator.reconcile(board,now=1000)
+    if mode=='exact':
+        task=kb.get_task(board,tid);assert task.status=='review' and task.assignee=='reviewer'
+        phase=operator._last(board,tid,'operator_original_agent_review_handoff')
+        assert json.loads(phase['payload'])['due_at']==1060
+        assert operator._last(board,tid,'blocked')['id']==hold['id']
+        assert kb.claim_review_task(board,tid,claimer='reviewer').id==tid
+        operator.reconcile(board,now=1001)
+        assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_original_agent_review_handoff'",(tid,)).fetchone()[0]==1
+    else:assert kb.get_task(board,tid).status=='blocked'
+
+
 def accepted_origin(board, monkeypatch, text="Independently verified result"):
     tid=kb.create_task(board,title="real outcome",assignee="pilot",user_origin={"platform":"discord","chat_id":"c","message_id":"audit","user_id":"harry","text":"Explain the result"})
     settings={"enabled":True,"cohort_task_ids":[tid],"acceptance_recheck_assignee":"pilot"}

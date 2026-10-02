@@ -4,15 +4,17 @@
   "scope": "Sealed defaults close the serving-before-policy race; native current effects required at completion, no worker receipt substitution",
   "checks": {
     "t_5cb8e6be": {
-      "client_path": "C:\\Users\\User\\DiscordBots\\Jarvis\\hermes_router.py",
-      "client_sha256": "cae99f71cec794a5f78318df7c224e09749f272febff5f1d932e534328aee1a2",
-      "kind": "conversation"
+      "client_path": "C:/Users/User/DiscordBots/Jarvis/hermes_dash_client.py",
+      "client_sha256": "2d4b24b6d77b42cb4ce309334b515aa46d06e5283c029767493fc484fe42447b",
+      "kind": "conversation",
+      "primary_http_url": "http://127.0.0.1:7888/api/chat"
     },
     "t_2932862d": {
-      "client_path": "C:\\Users\\User\\DiscordBots\\Jarvis\\hermes_router.py",
-      "client_sha256": "cae99f71cec794a5f78318df7c224e09749f272febff5f1d932e534328aee1a2",
+      "client_path": "C:/Users/User/DiscordBots/Jarvis/hermes_dash_client.py",
+      "client_sha256": "2d4b24b6d77b42cb4ce309334b515aa46d06e5283c029767493fc484fe42447b",
       "kind": "dashboard",
-      "health_url": "http://127.0.0.1:7888/api/health"
+      "health_url": "http://127.0.0.1:7888/api/health",
+      "primary_http_url": "http://127.0.0.1:7888/api/chat"
     },
     "t_bbaf4f71": {
       "kind": "queue",

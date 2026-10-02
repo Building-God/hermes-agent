@@ -73,3 +73,33 @@ def test_release_entry_fault_cannot_abort_native_task_reconciliation(tmp_path,mo
         assert all(a.get('exception')!='reconciliation_failed' for a in actions)
     finally:
         conn.close()
+
+
+import hashlib
+import json
+from pathlib import Path
+from types import SimpleNamespace
+import pytest
+from hermes_cli import kanban_release_redirect as redirect
+
+
+@pytest.mark.parametrize('mode',['selected','same','corrupt','absent'])
+def test_editable_startup_cannot_escape_selected_release(tmp_path,monkeypatch,mode):
+    home=tmp_path/'home';(home/'runtime').mkdir(parents=True)
+    target=tmp_path/'release';runtime=target/'venv'/('Scripts/python.exe' if redirect.os.name=='nt' else 'bin/python')
+    runtime.parent.mkdir(parents=True);runtime.write_bytes(b'python')
+    launcher=home/'controller.py';launcher.write_bytes(b'controller')
+    if mode!='absent':
+        (home/'runtime/active-release.json').write_text(json.dumps({'root':str(target),'launcher':str(launcher),'launcher_sha256':hashlib.sha256(b'controller').hexdigest()}))
+    if mode=='corrupt':launcher.write_bytes(b'changed')
+    calls=[]
+    def run(argv,**kwargs):calls.append((argv,kwargs));return SimpleNamespace(returncode=17)
+    monkeypatch.setattr(redirect.subprocess,'run',run)
+    current=target if mode=='same' else tmp_path/'unfinished-source'
+    if mode=='corrupt':
+        with pytest.raises(ValueError,match='verification'):redirect.redirect_selected_gateway(home,current)
+    else:
+        result=redirect.redirect_selected_gateway(home,current)
+        assert result==(17 if mode=='selected' else None)
+    assert len(calls)==(1 if mode=='selected' else 0)
+    if calls:assert calls[0][0]==[str(runtime),str(launcher)] and calls[0][1]['cwd']==target
