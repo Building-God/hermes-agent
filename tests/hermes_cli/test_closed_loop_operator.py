@@ -828,6 +828,67 @@ def _owned_repair_candidate(board,monkeypatch,request_text=None):
     return tid,repair,kb.claim_review_task(board,repair),settings
 
 
+def _crash_again(board, tid):
+    worker=kb.claim_task(board,tid)
+    assert worker
+    dispatch._record_task_failure(board,tid,'distinct next execution failure',outcome='crashed',failure_limit=1,release_claim=True,end_run=True)
+    return operator.original_fault(board,tid)['id']
+
+
+def test_new_failure_after_verified_repair_gets_new_singleton_and_fixed_deadline(board,monkeypatch):
+    tid,first,review,settings=_owned_repair_candidate(board,monkeypatch)
+    assert kb.complete_task(board,first,result='independently reproduced first repair',expected_run_id=review.current_run_id,metadata={'acceptance_receipts':{'probe':'first'}})
+    operator.reconcile(board,settings=settings)
+    fault=_crash_again(board,tid)
+    operator.reconcile(board,settings=settings)
+    second=operator._payload(operator._last(board,tid,'operator_repair_created'))
+    assert second['repair_task_id']!=first and second['fault_event_id']==fault
+    assert kb.get_task(board,tid).status=='blocked'
+    operator.reconcile(board,settings=settings,now=second['due_at']-1)
+    assert operator._payload(operator._last(board,tid,'operator_repair_created'))==second
+    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_repair_created'",(tid,)).fetchone()[0]==2
+    operator.reconcile(board,settings=settings,now=second['due_at'])
+    assert kb.get_task(board,second['repair_task_id']).block_kind=='capability'
+    assert kb.get_task(board,tid).status=='blocked'
+
+
+def test_completed_old_repair_cannot_accept_newer_failure_even_when_budget_exhausted(board,monkeypatch):
+    tid,first,review,settings=_owned_repair_candidate(board,monkeypatch)
+    settings['max_original_repairs']=1
+    assert kb.complete_task(board,first,result='first proof',expected_run_id=review.current_run_id,metadata={'acceptance_receipts':{'probe':'first'}})
+    operator.reconcile(board,settings=settings)
+    fault=_crash_again(board,tid)
+    operator.reconcile(board,settings=settings)
+    assert operator.verified_repair_for_original(board,tid) is None
+    assert kb.get_task(board,tid).status=='blocked'
+    exception=operator._payload(operator._last(board,tid,'operator_exception'))
+    assert exception['reason']=='repair_budget_exhausted' and exception['fault_event_id']==fault
+    operator.reconcile(board,settings=settings)
+    assert board.execute("SELECT COUNT(*) FROM tasks WHERE created_by='operator-repair'").fetchone()[0]==1
+
+
+def test_latest_sticky_auth_fault_outranks_older_repairable_dependency(board):
+    tid=kb.create_task(board,title='auth is not a repair permission',assignee='pilot')
+    assert kb.block_task(board,tid,reason='dependency failed',kind='dependency')
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'operator_dependency_fault',{'error':'old dependency'})
+        kb._append_event(board,tid,'gave_up',{'error':'new authentication fence','sticky':True})
+    operator.reconcile(board,settings={'enabled':True})
+    assert operator._last(board,tid,'operator_repair_created') is None
+
+
+def test_old_active_repair_is_fenced_before_new_fault_dispatch(board,monkeypatch):
+    tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'gave_up',{'error':'newer original fault'})
+    monkeypatch.setattr(kb,'_fence_running_release',lambda *args,**kwargs:(False,{'identity_unverified':True}))
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,repair).current_run_id==review.current_run_id
+    assert operator.repair_contract(board,repair)[0] is None
+    assert operator._last(board,tid,'operator_repair_created')
+    assert board.execute("SELECT COUNT(*) FROM tasks WHERE created_by='operator-repair'").fetchone()[0]==1
+
+
 def test_repair_wrong_ownership_rejects_native_completion_and_reworks(board,monkeypatch):
     tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch)
     with kb.write_txn(board):
@@ -1642,6 +1703,9 @@ def test_dead_owned_review_protocol_failure_returns_native_rework(board,monkeypa
 def test_audited_original_correction_is_exact_finite_and_preserves_deadline(board,monkeypatch,mode):
     tid,repair,review,settings=_owned_repair_candidate(board,monkeypatch,request_text='Fix the actual fixture queue outcome')
     settings['cohort_task_ids']=[tid]
+    # Exhaust ordinary fault-specific repair before exercising the separately
+    # audited framework correction. Otherwise the new repair owns the hold.
+    settings['max_original_repairs']=1
     assert kb.complete_task(board,repair,result='Controlled independent repair probe',expected_run_id=review.current_run_id,metadata={'acceptance_receipts':{'probe':'controlled receipt'}})
     due=operator._payload(operator._last(board,tid,'operator_deadline'))['due_at']
     monkeypatch.setattr(kb.time,'time',lambda:due+1)
