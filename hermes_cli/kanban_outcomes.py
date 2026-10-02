@@ -93,7 +93,7 @@ def check_conversation(config, *, dashboard=False):
     if config.get('required_transport')=='discord-front-door' and not config.get('discord_probe_url'):
         return {'passed':False,'actor':'operator-verification','requests':[],
                 'failures':['The original request concerns Discord chat. A dashboard HTTP probe cannot certify that route; native Discord front-door verification remains agent-owned.']}
-    script = Path(__file__).with_name('kanban_outcome_probe.py')
+    script = Path(__file__).with_name('kanban_discord_probe.py' if config.get('required_transport')=='discord-front-door' else 'kanban_outcome_probe.py')
     runtime = Path(__file__).resolve().parents[1] / 'venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
     if not runtime.is_file():
         raise ValueError('Prepared native verifier runtime is missing; agent-owned safe-release repair required')
@@ -104,6 +104,12 @@ def check_conversation(config, *, dashboard=False):
                             input=json.dumps(config), text=True, capture_output=True,
                             timeout=150, check=False, env=child_env)
     if result.returncode:
+        try:
+            failed = json.loads(result.stdout.strip())
+            if failed.get('passed') is False and failed.get('actor') == 'operator-verification':
+                return failed
+        except (ValueError, TypeError, AttributeError):
+            pass
         detail = next((line for line in reversed(result.stderr.splitlines()) if 'Error:' in line), 'child process failed')[:240]
         raise ValueError('Native conversation probe failed to execute in the prepared runtime: ' + detail)
     report = json.loads(result.stdout.strip())

@@ -209,7 +209,7 @@ def listen_address(extra: Dict[str, Any]) -> tuple[str, int]:
     """Host/port the adapter binds: config.yaml ``platforms.api_server`` wins over the env fallbacks.
 
     Shared with the CLI restart path, which must wait on the SAME address the replacement will
-    bind — an env-only reading missed every config.yaml port (#91547).
+    bind - an env-only reading missed every config.yaml port (#91547).
     """
     host = extra.get("host", os.getenv("API_SERVER_HOST", DEFAULT_HOST))
     raw_port = extra.get("port")
@@ -217,7 +217,7 @@ def listen_address(extra: Dict[str, Any]) -> tuple[str, int]:
         raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
     return host, _coerce_port(raw_port, DEFAULT_PORT)
 MAX_STORED_RESPONSES = 100
-MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
+MAX_REQUEST_BYTES = 10_000_000  # 10 MB - accommodates long agent conversations with tool calls
 # Send a comment before remote API clients' common 20-second idle deadline.
 # This constant is shared by OpenAI chat/Responses and native session SSE.
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 10.0
@@ -584,7 +584,7 @@ def _reap_disconnected_agent_processes(
     a newer run's process on a shared task_id.
 
     Mirrors the gateway-turn cleanup in ``gateway/run.py`` (#76115) for this API-server surface, which runs
-    its own agent lifecycle via ``_run_agent`` and never passes through ``TurnRunner`` — so it needs its own
+    its own agent lifecycle via ``_run_agent`` and never passes through ``TurnRunner`` - so it needs its own
     trigger for the same baseline-diff reap.
     """
     process_task_id = getattr(agent, "_gateway_turn_process_task_id", "")
@@ -596,7 +596,7 @@ def _reap_disconnected_agent_processes(
     if epoch is not None:
         def _epoch_still_current(_task_id=process_task_id, _epoch=epoch):
             # Skip only when a NEWER run claimed this task_id. A missing entry means
-            # our own clear pruned it — no newer claimant, so the reap must proceed.
+            # our own clear pruned it - no newer claimant, so the reap must proceed.
             with _TURN_PROCESS_EPOCH_LOCK:
                 current = _TURN_PROCESS_EPOCHS.get(_task_id)
             return current is None or current == _epoch
@@ -616,7 +616,7 @@ _TURN_PROCESS_EPOCH_COUNTER = itertools.count(1)
 
 
 def _publish_turn_process_ownership(agent: Any, task_id: str) -> None:
-    """Snapshot the process baseline and claim the task_id's epoch — the single place every
+    """Snapshot the process baseline and claim the task_id's epoch - the single place every
     API-server agent lifecycle records turn ownership (marker names cannot drift)."""
     from tools.process_registry import process_registry
     with _TURN_PROCESS_EPOCH_LOCK:
@@ -873,7 +873,7 @@ _MEDIA_DATA_URL_MAX_BYTES = 5 * 1024 * 1024  # skip images larger than 5MB
 def _resolve_media_to_data_urls(text: str) -> str:
     """Replace ``MEDIA:<path>`` tags with inline base64 data URLs (remote frontends can't read
     server paths); non-image/unreadable paths stay untouched. Security: the shared
-    ``MEDIA_TAG_CLEANUP_RE`` anchor + ``validate_media_delivery_path`` denylist — a bare-token
+    ``MEDIA_TAG_CLEANUP_RE`` anchor + ``validate_media_delivery_path`` denylist - a bare-token
     match would let a traversal path in the reply exfiltrate any readable image."""
     if not text or "MEDIA:" not in text:
         return text
@@ -1089,7 +1089,7 @@ class _ProviderAuthResolutionError(RuntimeError):
 
     def user_text(self) -> str:
         """Raw-surface failure line. A quota/429 cap with valid credentials must not be labelled an
-        authentication failure — the cause chain (RuntimeError -> AuthError) tells them apart (#89401)."""
+        authentication failure - the cause chain (RuntimeError -> AuthError) tells them apart (#89401)."""
         from hermes_cli.auth import is_rate_limited_auth_error
 
         cause = self.__cause__
@@ -1158,7 +1158,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     # ``/p/<profile>/v1/...`` on the shared listener (``_make_profile_prefix_middleware``).
     serves_profile_prefix: bool = True
     # Same statelessness applies to the startup auto-resume prompt: no client is waiting to answer "session
-    # restored — what next?", so a resumed turn should complete the interrupted work rather than acknowledge
+    # restored - what next?", so a resumed turn should complete the interrupted work rather than acknowledge
     # (#57056).
     interactive_resume: bool = False
     # Opt-in cap (chars) on tool outputs / tool-call arguments in the stored /v1/responses
@@ -1184,8 +1184,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # hardcode "gpt-4o" etc., hence off by default).
         # Off by default: generic OpenAI clients routinely hardcode model names ("gpt-4o", ...), and
         # existing deployments rely on those falling back to the gateway default rather than switching the
-        # executing model. Requests that send an explicit ``provider`` — and the Hermes-native session-chat
-        # and /v1/runs endpoints — are always honored regardless of this flag. (Idea credit: PR #22825 by
+        # executing model. Requests that send an explicit ``provider`` - and the Hermes-native session-chat
+        # and /v1/runs endpoints - are always honored regardless of this flag. (Idea credit: PR #22825 by
         # @mssteuer.)
         self._direct_model_requests: bool = _coerce_request_bool(
             extra.get("direct_model_requests"), default=False)
@@ -1433,7 +1433,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
             # Compare as bytes: compare_digest raises TypeError on non-ASCII str, and the
-            # token is raw client input — a stray byte must 401, not 500.
+            # token is raw client input - a stray byte must 401, not 500.
             if hmac.compare_digest(token.encode(), expected_key.encode()):
                 return None
         logger.warning("API server rejected invalid API key: %s", self._request_audit_log_suffix(request))
@@ -1501,6 +1501,37 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 code="platform_event_dispatch_failed")
         return web.json_response(result if isinstance(result, dict) else {})
 
+    async def _handle_operator_discord_verification(self, request: "web.Request") -> "web.Response":
+        from gateway.operator_discord_verifier import authorized, reproduce
+        from hermes_cli.config import get_hermes_home
+        home = get_hermes_home()
+        if not authorized(request.headers.get("X-Hermes-Operator-Token", ""), home):
+            return _error_response("Invalid operator verification capability", 403, code="operator_verification_denied")
+        if _api_request_profile.get() is not None:
+            return _error_response("Verification requires the primary transport", 400, code="operator_verification_scope")
+        adapter = self._get_platform_callback_adapter(request, "discord")
+        runner = self.gateway_runner or request.app.get("gateway_runner")
+        if adapter is None or runner is None:
+            return _error_response("Discord transport is unavailable", 503, code="platform_unavailable")
+        if getattr(self, "_operator_discord_verification_busy", False):
+            return _error_response("Operator verification is already running", 409, code="operator_verification_busy")
+        owns_busy = False
+        try:
+            payload = await request.json()
+            if not isinstance(payload, dict) or set(payload) != {"nonce"}:
+                raise ValueError("Only a verification nonce is accepted")
+            if getattr(self, "_operator_discord_verification_busy", False):
+                return _error_response("Operator verification is already running", 409, code="operator_verification_busy")
+            self._operator_discord_verification_busy = True
+            owns_busy = True
+            return web.json_response(await reproduce(runner, adapter, payload["nonce"], home))
+        except (ValueError, TypeError, TimeoutError) as error:
+            return web.json_response({"passed": False, "actor": "operator-verification", "requests": [],
+                "failures": [str(error)[:240]], "human_receipt": False}, status=422)
+        finally:
+            if owns_busy:
+                self._operator_discord_verification_busy = False
+
     # -- Multi-profile multiplexing (/p/<profile>/...) --------------------------------
 
     def _resolve_request_profile(self, request: "web.Request"):
@@ -1526,7 +1557,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         multiplexing active enters the DEFAULT profile's scope (an unscoped run would raise
         UnscopedSecretError on its first credential read); single-profile gateways no-op.
 
-        Single-profile gateways keep the no-op — ``get_secret`` falls through to ``os.environ`` there,
+        Single-profile gateways keep the no-op - ``get_secret`` falls through to ``os.environ`` there,
         unchanged. See #61276.
         """
         if not profile:
@@ -1609,6 +1640,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # Platform event ingress: authenticated by the target adapter's own verifier,
             # NOT API_SERVER_KEY (external platforms hold no API server key).
             ("POST", "/api/platforms/{platform}/events", self._handle_platform_event_callback),
+            ("POST", "/api/operator/verify-discord", self._handle_operator_discord_verification),
             ("GET", "/api/jobs", self._handle_list_jobs),
             ("POST", "/api/jobs", self._handle_create_job),
             ("GET", "/api/jobs/{job_id}", self._handle_get_job),
@@ -1992,7 +2024,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return "hermes_browser" if text == "browser" else text
 
     def _session_model_override_for(self, session_key: Optional[str]) -> Optional[Dict[str, Any]]:
-        """The gateway's per-session ``/model`` override for *session_key*, if any — a
+        """The gateway's per-session ``/model`` override for *session_key*, if any - a
         user-issued ``/model`` always wins over static route config."""
         if not session_key:
             return None
@@ -2078,7 +2110,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 model = get_default_model_for_provider(runtime_kwargs["provider"])
                 if model:
                     logger.info(
-                        "No model configured — defaulting to %s for provider %s",
+                        "No model configured - defaulting to %s for provider %s",
                         model, runtime_kwargs["provider"])
         # Keyed by gateway_session_key only (session_id is per-request -> unbounded growth).
         _resolved_key = gateway_session_key or ""
@@ -2087,7 +2119,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                           or self._last_resolved_model.get("*"))
             if _recovered and _recovered != self._model_name:
                 logger.warning(
-                    "Empty model resolved for session=%s — recovering "
+                    "Empty model resolved for session=%s - recovering "
                     "last-known-good model %s (config read likely returned "
                     "empty; see #35314)",
                     _resolved_key, _recovered)
@@ -2141,7 +2173,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     "api_server request selection skipped: session-persisted model wins for %s",
                     session_key or "")
         else:
-            # The request's ``model`` selected the route, so its value is the ALIAS — never a
+            # The request's ``model`` selected the route, so its value is the ALIAS - never a
             # model name; a route with no ``model`` key keeps the global default.
             effective_model = (route_model or model) if route is not None else (request_model or model)
             effective_provider = request_provider or route_provider or current_provider
@@ -2253,12 +2285,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     # -- HTTP handlers ----------------------------------------------------------------
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
-        """GET /health — simple health check."""
+        """GET /health - simple health check."""
         return web.json_response({"status": "ok", "platform": "hermes-agent", "version": _hermes_version()})
 
     @_require_auth
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
-        """GET /health/detailed — gateway state, platforms, PID for dashboard probing (Bearer auth)."""
+        """GET /health/detailed - gateway state, platforms, PID for dashboard probing (Bearer auth)."""
         from gateway.status import (
             derive_gateway_busy, derive_gateway_drainable, normalize_updated_at, parse_active_agents,
             read_runtime_status)
@@ -2287,7 +2319,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_require_auth
     async def _handle_models(self, request: "web.Request") -> "web.Response":
-        """GET /v1/models — hermes-agent plus configured model_routes aliases (alias + resolved
+        """GET /v1/models - hermes-agent plus configured model_routes aliases (alias + resolved
         model only, never credentials). Under /p/<profile>/ the primary id follows that profile."""
         now = int(time.time())
         # The middleware already entered the profile scope, so get_active_profile_name() resolves.
@@ -2304,7 +2336,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_require_auth
     async def _handle_model_options(self, request: "web.Request") -> "web.Response":
-        """GET /api/model/options — the dashboard/TUI model-picker inventory, so external clients
+        """GET /api/model/options - the dashboard/TUI model-picker inventory, so external clients
         can sync to the configured provider catalog instead of scraping /v1/models."""
         refresh = _coerce_request_bool(request.query.get("refresh"), default=False)
         try:
@@ -2322,7 +2354,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_require_auth
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
-        """GET /v1/capabilities — the stable, machine-readable API surface for external UIs."""
+        """GET /v1/capabilities - the stable, machine-readable API surface for external UIs."""
         return web.json_response({
             "object": "hermes.api_server.capabilities", "platform": "hermes-agent",
             "model": self._model_name,
@@ -2364,7 +2396,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     # -- Browser-extension control (authenticated local/VPS API) ----------------------
 
     async def _handle_browser_control_register(self, request: "web.Request") -> "web.Response":
-        """POST /v1/browser-control/register — mint a short-lived single-use controller ticket.
+        """POST /v1/browser-control/register - mint a short-lived single-use controller ticket.
 
         Identity is NOT taken from the body: the principal is a server-derived digest of the
         authenticated key/profile and capabilities are filtered to the allowlist (a spoofed
@@ -2443,7 +2475,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             status=201)
 
     async def _handle_browser_control_ws(self, request: "web.Request") -> "web.WebSocketResponse":
-        """GET /v1/browser-control/ws — controller WebSocket (one-shot ticket).
+        """GET /v1/browser-control/ws - controller WebSocket (one-shot ticket).
 
         The ticket rides in ``Sec-WebSocket-Protocol`` (never the query string: targets land in
         access logs) and is exchanged once for the registration scope; bad/consumed/expired
@@ -2569,7 +2601,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
         The store root lives under the profile's data directory
         (``<HERMES_HOME>/plugin-data/.../artifacts``-style controlled root), so artifacts never escape the
-        profile boundary. Stores are cached BY RESOLVED PROFILE — on a multiplex listener, profile A
+        profile boundary. Stores are cached BY RESOLVED PROFILE - on a multiplex listener, profile A
         touching the artifact route first must never pin profile B to A's physical root (same frozen-handle
         class as the per-profile session-storage fix in #88734). The root itself is created on first use;
         TTL cleanup runs on every store/load/prune.
@@ -2640,7 +2672,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return (profile, principal), None
 
     async def _handle_artifact_upload(self, request: "web.Request") -> "web.Response":
-        """POST /v1/artifacts/upload — one-shot bounded raw upload; ``Content-Type`` must be an
+        """POST /v1/artifacts/upload - one-shot bounded raw upload; ``Content-Type`` must be an
         allowed MIME type, ``X-Artifact-Filename`` is display-only. Returns a provenance receipt
         (never a filesystem path). Ladder: 404 disabled, 403 no API key, 401 bad Bearer, 429
         rate limited, 413 too large, 415 MIME rejected, 400 missing filename/scope, 201."""
@@ -2679,7 +2711,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             receipt.to_dict(download_path=f"/v1/artifacts/download/{receipt.artifact_id}"), status=201)
 
     async def _handle_artifact_download(self, request: "web.Request") -> "web.Response":
-        """GET /v1/artifacts/download/{artifact_id} — one-shot download (a second one 404s) with
+        """GET /v1/artifacts/download/{artifact_id} - one-shot download (a second one 404s) with
         ``X-Artifact-Sha256``. Ladder: 404 disabled/unknown, 403 no API key, 401 bad Bearer, 429
         rate limited, 410 expired, 400 invalid id/scope mismatch, 200."""
         if not self._browser_control_enabled():
@@ -2705,7 +2737,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_require_auth
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
-        """GET /v1/skills — deterministic JSON listing of installed skills (name, description,
+        """GET /v1/skills - deterministic JSON listing of installed skills (name, description,
         category), the same set ``/skills list`` shows."""
         try:
             from tools.skills_tool import _find_all_skills, _sort_skills
@@ -2721,7 +2753,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_require_auth
     async def _handle_toolsets(self, request: "web.Request") -> "web.Response":
-        """GET /v1/toolsets — each toolset the api_server agent exposes: enabled/configured state
+        """GET /v1/toolsets - each toolset the api_server agent exposes: enabled/configured state
         plus the concrete tool names it expands to."""
         try:
             from hermes_cli.config import load_config
@@ -2827,7 +2859,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_require_auth
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
-        """GET /api/sessions — list persisted Hermes sessions."""
+        """GET /api/sessions - list persisted Hermes sessions."""
         db = await self._ensure_session_db_async()
         if db is None:
             return self._session_db_unavailable()
@@ -2859,7 +2891,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             try:
                 # Recoverable-archive resurrection (#92687): a canonical Bot Chat archived by the ws-orphan
                 # reaper / older agent cleanup is invisible to list_sessions_rich (include_archived=False),
-                # which would fail `hermes peer dm` resolution and mint transient sessions — same accident
+                # which would fail `hermes peer dm` resolution and mint transient sessions - same accident
                 # the tui_gateway lookups heal.
                 from tools.bot_mode_probe import BOT_CHAT_TITLE
 
@@ -2906,7 +2938,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if lock_error is not None:
             return lock_error
         requested = runtime_request.get("requested") or {}
-        # The normalized requested["model"] (prefix split, virtual alias nulled) — the raw body
+        # The normalized requested["model"] (prefix split, virtual alias nulled) - the raw body
         # would persist "hermes-agent" and later send it to the provider literally.
         model_name = self._clean_runtime_id(requested.get("model")) or None
         model_config = None
@@ -2958,7 +2990,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_require_auth
     async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
-        """PATCH /api/sessions/{session_id} — update client-safe session metadata."""
+        """PATCH /api/sessions/{session_id} - update client-safe session metadata."""
         session_id = request.match_info["session_id"]
         session, err = await self._get_existing_session_or_404(session_id)
         if err:
@@ -3042,7 +3074,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_require_auth
     async def _handle_fork_session(self, request: "web.Request") -> "web.Response":
-        """POST /api/sessions/{session_id}/fork — branch via current SessionDB primitives."""
+        """POST /api/sessions/{session_id}/fork - branch via current SessionDB primitives."""
         source_id = request.match_info["session_id"]
         source, err = await self._get_existing_session_or_404(source_id)
         if err:
@@ -3084,7 +3116,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     async def _prepare_session_chat(self, request: "web.Request") -> tuple:
         """Shared prelude for /api/sessions/{id}/chat[/stream]: header/body validation, then
-        runtime selection — a Browser model lock (body ``require_model_lock`` or a confirmed
+        runtime selection - a Browser model lock (body ``require_model_lock`` or a confirmed
         persisted lock) wins; else the session-persisted model routes via model_routes when an
         alias or threads through as ``session_model`` when raw, then body values.
         Returns ``(ctx, None)`` or ``(None, error)``; ``ctx["run_kwargs"]`` feeds ``_run_agent``."""
@@ -3144,8 +3176,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             requested_runtime=runtime_request.get("requested") or {},
             route_source=runtime_request.get("route_source") or "global",
             confirmed_runtime_lock=lock_active, turn_author=turn_author,
-            # #98619: the client addresses this session by construction — the id is in the
-            # request path (/api/sessions/{session_id}/chat) — so a wake self-post lands where
+            # #98619: the client addresses this session by construction - the id is in the
+            # request path (/api/sessions/{session_id}/chat) - so a wake self-post lands where
             # the client will read it. The audited native-session opt-in.
             session_history_delivery="1", **agent_overrides)
         return {
@@ -3166,7 +3198,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         runtime = self._result_runtime(result, usage)
         return self._sanitize_runtime_metadata(
             # Same shared ladder /api/status uses. Before this was unified, the two endpoints disagreed on
-            # the same page load — the sidebar strip read "running" (it probed GATEWAY_HEALTH_URL and scoped
+            # the same page load - the sidebar strip read "running" (it probed GATEWAY_HEALTH_URL and scoped
             # to the requested profile) while the Channels page rendered "The gateway is not running" (it
             # did neither). Cross-container, profile-scoped, and launch-service-managed deployments each hit
             # that split. profile_home is passed when the request was scoped to a named profile:
@@ -3197,7 +3229,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """Admit a turn aimed at the canonical Bot Chat to the Desktop session that holds it live.
 
         ``(profile home, mailbox record)`` when a live owner took it; None when this process should
-        run the turn itself — the session is not the canonical Bot Chat's own lineage, or nobody
+        run the turn itself - the session is not the canonical Bot Chat's own lineage, or nobody
         holds that chat. Both peer transports (``/api/sessions/{id}/chat`` for ``peer dm``,
         ``/v1/runs`` for ``peer run``) go through here, so the two lanes cannot drift.
         """
@@ -3309,12 +3341,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: "web.Request") -> "web.Response":
-        """POST /api/sessions/{session_id}/chat — one synchronous agent turn (plus the delivery lanes'
+        """POST /api/sessions/{session_id}/chat - one synchronous agent turn (plus the delivery lanes'
         one bounded re-run of a transient failure; ``hermes peer dm`` is the client)."""
         from tools.bot_failure_reasons import RETRY_NONE, result_retry_action
         # This turn runs through _run_agent, so it already COUNTS toward the cap (#7483).
         # Spending the budget without checking it refused every other caller while never
-        # refusing this route — and a fleet's cross-machine DMs all arrive here.
+        # refusing this route - and a fleet's cross-machine DMs all arrive here.
         limited = self._concurrency_limited_response()
         if limited is not None:
             return limited
@@ -3328,7 +3360,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session_id = ctx["session_id"]
         history = await self._conversation_history_for_session(session_id)
         result, usage = await self._run_agent(conversation_history=history, **ctx["run_kwargs"])
-        # One policy-gated re-run of a transiently failed turn — the peer-DM transport's half of the
+        # One policy-gated re-run of a transiently failed turn - the peer-DM transport's half of the
         # retry the local (``tools.bot_mode_dm``) and relayed (``tui_gateway.methods_bot_relay``)
         # delivery lanes already apply (#93091 item 5, #115325). Same policy, same gate: transient
         # classes (429 / 5xx) re-run the SAME session once, a context overflow lets the re-run's
@@ -3354,7 +3386,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_admit_api_agent_request
     async def _handle_session_chat_stream(self, request: "web.Request") -> "web.StreamResponse":
-        """POST /api/sessions/{session_id}/chat/stream — SSE wrapper over _run_agent."""
+        """POST /api/sessions/{session_id}/chat/stream - SSE wrapper over _run_agent."""
         limited = self._concurrency_limited_response()
         if limited is not None:
             return limited
@@ -3393,7 +3425,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
         def _commentary(text: str, *, already_streamed: bool = False) -> None:
             # Mid-turn assistant commentary (Codex ``phase="commentary"``, text beside tool calls)
-            # as its own typed event — never folded into ``assistant.completed`` (#67580).
+            # as its own typed event - never folded into ``assistant.completed`` (#67580).
             if isinstance(text, str) and text.strip():
                 events.enqueue("assistant.commentary", {
                     "message_id": message_id, "text": text, "already_streamed": bool(already_streamed)})
@@ -3495,7 +3527,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_require_auth
     async def _handle_session_model_lock(self, request: "web.Request") -> "web.Response":
-        """POST /api/sessions/{session_id}/model — backend-ack a Browser model lock."""
+        """POST /api/sessions/{session_id}/model - backend-ack a Browser model lock."""
         session_id = request.match_info["session_id"]
         _, err = await self._get_existing_session_or_404(session_id)
         if err:
@@ -3527,7 +3559,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     # -- Cron jobs API ----------------------------------------------------------------
 
     _JOB_ID_RE = re.compile(r"[a-f0-9]{12}")
-    # Update whitelist — prevents clients injecting arbitrary keys.
+    # Update whitelist - prevents clients injecting arbitrary keys.
     _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
@@ -3585,7 +3617,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return err if err else self._job_response(fn, job_id, notify=notify)
 
     async def _handle_list_jobs(self, request: "web.Request") -> "web.Response":
-        """GET /api/jobs — list all cron jobs."""
+        """GET /api/jobs - list all cron jobs."""
         _, err = self._cron_request_guard(request)
         if err:
             return err
@@ -3596,7 +3628,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return self._cron_error_response(e)
 
     async def _handle_create_job(self, request: "web.Request") -> "web.Response":
-        """POST /api/jobs — create a new cron job."""
+        """POST /api/jobs - create a new cron job."""
         _, err = self._cron_request_guard(request)
         if err:
             return err
@@ -3638,11 +3670,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return self._cron_error_response(e)
 
     async def _handle_get_job(self, request: "web.Request") -> "web.Response":
-        """GET /api/jobs/{job_id} — get a single cron job."""
+        """GET /api/jobs/{job_id} - get a single cron job."""
         return await self._job_lookup_or_mutate(request, _cron_get, notify=False)
 
     async def _handle_update_job(self, request: "web.Request") -> "web.Response":
-        """PATCH /api/jobs/{job_id} — update a cron job."""
+        """PATCH /api/jobs/{job_id} - update a cron job."""
         job_id, err = self._cron_request_guard(request, need_job_id=True)
         if err:
             return err
@@ -3663,7 +3695,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return self._job_response(lambda jid: _cron_update(jid, sanitized), job_id, notify=True)
 
     async def _handle_delete_job(self, request: "web.Request") -> "web.Response":
-        """DELETE /api/jobs/{job_id} — delete a cron job."""
+        """DELETE /api/jobs/{job_id} - delete a cron job."""
         job_id, err = self._cron_request_guard(request, need_job_id=True)
         if err:
             return err
@@ -3676,20 +3708,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return self._cron_error_response(e)
 
     async def _handle_pause_job(self, request: "web.Request") -> "web.Response":
-        """POST /api/jobs/{job_id}/pause — pause a cron job."""
+        """POST /api/jobs/{job_id}/pause - pause a cron job."""
         return await self._job_lookup_or_mutate(request, _cron_pause, notify=True)
 
     async def _handle_resume_job(self, request: "web.Request") -> "web.Response":
-        """POST /api/jobs/{job_id}/resume — resume a paused cron job."""
+        """POST /api/jobs/{job_id}/resume - resume a paused cron job."""
         return await self._job_lookup_or_mutate(request, _cron_resume, notify=True)
 
     async def _handle_run_job(self, request: "web.Request") -> "web.Response":
-        """POST /api/jobs/{job_id}/run — trigger immediate execution."""
+        """POST /api/jobs/{job_id}/run - trigger immediate execution."""
         job_id, err = self._cron_request_guard(request, need_job_id=True, check_draining=True)
         if err:
             return err
         # Optional transient per-run context (standalone `hermes cron run` /
-        # cronjob(action='run', prompt=...)) — same cap + scan as a stored prompt.
+        # cronjob(action='run', prompt=...)) - same cap + scan as a stored prompt.
         extra_prompt = body = None
         with suppress(Exception):
             body = await request.json()
@@ -3705,7 +3737,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             lambda jid: _cron_trigger(jid, extra_prompt=extra_prompt), job_id, notify=False)
 
     async def _handle_cron_fire(self, request: "web.Request") -> "web.Response":
-        """POST /api/cron/fire — Chronos fire webhook (NAS -> agent), authenticated by a
+        """POST /api/cron/fire - Chronos fire webhook (NAS -> agent), authenticated by a
         NAS-minted JWT via the pluggable verifier, NOT API_SERVER_KEY. 202 + background run so
         a long turn never trips NAS's timeout; the store CAS claim guards double-fire on retry."""
         from hermes_cli.config import cfg_get, load_config
@@ -3742,7 +3774,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # Placed after JWT verify (don't leak pause state to unauth callers)
             # and after the drain check (drain is transient shutdown, ESTOP is
             # operator override). 503 + Retry-After reschedules the job via NAS
-            # retry or the misfire backstop rather than silently dropping it —
+            # retry or the misfire backstop rather than silently dropping it -
             # matches _CRON_FIRE_RETRY_AFTER_SECONDS in web_routers/cron.py.
             with suppress(ImportError):
                 from agent.estop import check_paused as _estop_check_paused
@@ -3978,14 +4010,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     effective_task_id = session_id or str(uuid.uuid4())
                     # Process baseline for disconnect reaping (this surface bypasses TurnRunner)
                     # + shutdown-interrupt registration, once for every caller.
-                    # Baseline for selective background-process reaping on SSE client disconnect — mirrors
+                    # Baseline for selective background-process reaping on SSE client disconnect - mirrors
                     # gateway/run.py's gateway-turn cleanup (#76115); this API-server surface runs its own
                     # agent lifecycle and doesn't go through TurnRunner, so it needs its own baseline.
-                    # /v1/runs runs its own agent lifecycle (no TurnRunner, no _run_agent) — record turn
+                    # /v1/runs runs its own agent lifecycle (no TurnRunner, no _run_agent) - record turn
                     # process ownership so stop/cancel can reap only the background processes this run
                     # created (#76115).
                     _publish_turn_process_ownership(agent, effective_task_id)
-                    # Registering here, once, covers every _run_agent() caller — the same reason the
+                    # Registering here, once, covers every _run_agent() caller - the same reason the
                     # _ProviderAuthResolutionError handler below lives here rather than in each route. Only
                     # two callers pass ``agent_ref``, and only /v1/runs has a run_id, so neither is a usable
                     # hook for the rest. See #63529.
@@ -4036,7 +4068,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         self._shutdown_interruptible_agents.pop(id(agent), None)
                         # Bind the declared key to the row the turn actually ended on
                         # (agent.session_id carries a mid-turn rotation). Opt-in per route.
-                        # Record the declared conversation on the row the turn actually ended on —
+                        # Record the declared conversation on the row the turn actually ended on -
                         # ``agent.session_id`` already carries a mid-turn compression rotation (#16938), so
                         # the next reply resolves the live transcript rather than its retired parent.
                         # Opt-in: only the routes that resolve their session id from the declared key
@@ -4143,7 +4175,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.error(
                 "[%s] Refusing to start: API_SERVER_KEY is a "
                 "placeholder or too short (<16 chars). This endpoint "
-                "dispatches terminal-capable agent work — a guessable "
+                "dispatches terminal-capable agent work - a guessable "
                 "key is remote code execution. Generate a strong secret "
                 "(e.g. `openssl rand -hex 32`) and set API_SERVER_KEY "
                 "before starting the API server on %s.",
@@ -4162,17 +4194,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             # Config error, not transient: a bare ``return False`` would make the reconnect watcher
             # re-instantiate the adapter (+ sqlite connection) until EMFILE.
             self._set_fatal_error(
-                # A rejected API_SERVER_KEY is a configuration error, not a transient blip — the key will
+                # A rejected API_SERVER_KEY is a configuration error, not a transient blip - the key will
                 # not become valid on its own. A bare ``return False`` makes the reconnect watcher in
                 # gateway.run treat it as retryable and loop forever at the backoff cap, re-instantiating
                 # the adapter (and its ResponseStore sqlite connection) every retry (#38803: ~501 leaked
                 # connections / 1002 fds over 2.5 days until EMFILE took the whole gateway down).
-                # Non-retryable drops it from the reconnect queue — same treatment as the port-conflict
+                # Non-retryable drops it from the reconnect queue - same treatment as the port-conflict
                 # guard (api_server_port_in_use). The guard already logged the specific rejection reason
                 # just above.
                 "api_server_key_invalid",
                 "API_SERVER_KEY was rejected by the startup guard (missing, "
-                "placeholder/too short, or strength unverifiable — see the "
+                "placeholder/too short, or strength unverifiable - see the "
                 "error logged above). Generate a strong secret (e.g. "
                 "`openssl rand -hex 32`), set API_SERVER_KEY, then "
                 "`/platform resume api_server`.",
@@ -4219,7 +4251,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             self._wire_plugin_handlers(self._app)
             self._runner = web.AppRunner(self._app)
             await self._runner.setup()
-            # Bind directly instead of probing 127.0.0.1 first — the old single-family pre-probe raced the
+            # Bind directly instead of probing 127.0.0.1 first - the old single-family pre-probe raced the
             # real bind and reported a TIME_WAIT socket as "in use" (#10297), failing gateway restarts for
             # up to ~60s. Platform-dependent SO_REUSEADDR and the macOS TIME_WAIT rebind live in
             # start_tcp_site; the loop below covers a predecessor still holding the port for a moment.
@@ -4244,7 +4276,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 if getattr(exc, "errno", None) == errno.EADDRINUSE:
                     # Config error: non-retryable, or the reconnect watcher leaks fds forever.
                     self._set_fatal_error(
-                        # A port conflict is a configuration error, not a transient blip — another process
+                        # A port conflict is a configuration error, not a transient blip - another process
                         # holds the port for its lifetime. A bare ``return False`` makes the reconnect
                         # watcher in gateway.run treat it as retryable and loop forever at the backoff cap
                         # (observed: 1568+ retries over 5 days across multi-profile setups all defaulting to
@@ -4276,7 +4308,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         connection (the reconnect loop builds a fresh adapter per retry; leaked fds hit EMFILE).
 
         Without this, every adapter instance leaks 2 file descriptors (the database file and its WAL
-        sidecar) — the reconnect loop in ``gateway.run`` constructs a fresh adapter on every retry, so 2
+        sidecar) - the reconnect loop in ``gateway.run`` constructs a fresh adapter on every retry, so 2
         fds/retry × 300s backoff cap ≈ 12 fds/hour, which exhausts the default 2560 fd limit after ~12h of
         failed reconnects and turns the whole gateway into a zombie (OSError: [Errno 24] Too many open
         files, #37011).
@@ -4303,7 +4335,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None) -> SendResult:
-        """Not used — the HTTP request/response cycle handles delivery directly."""
+        """Not used - the HTTP request/response cycle handles delivery directly."""
         return SendResult(success=False, error="API server uses HTTP request/response, not send()")
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
