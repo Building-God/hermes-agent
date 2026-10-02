@@ -69,14 +69,18 @@ def check_queue(config):
 
 def check_conversation(config, *, dashboard=False):
     script = Path(__file__).with_name('kanban_outcome_probe.py')
+    runtime = Path(__file__).resolve().parents[1] / 'venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
+    if not runtime.is_file():
+        raise ValueError('Prepared native verifier runtime is missing; agent-owned safe-release repair required')
     child_env = dict(os.environ)
     child_env.pop('HERMES_A2A_URL', None)
     child_env.pop('HERMES_A2A_TOKEN', None)
-    result = subprocess.run([config['python'], '-I', str(script)],
+    result = subprocess.run([str(runtime), '-I', str(script)],
                             input=json.dumps(config), text=True, capture_output=True,
                             timeout=150, check=False, env=child_env)
     if result.returncode:
-        raise ValueError('Native conversation probe failed to execute; agent repair required')
+        detail = next((line for line in reversed(result.stderr.splitlines()) if 'Error:' in line), 'child process failed')[:240]
+        raise ValueError('Native conversation probe failed to execute in the prepared runtime: ' + detail)
     report = json.loads(result.stdout.strip())
     if report.get('passed') is not True or report.get('actor') != 'operator-verification':
         return {**report, 'passed': False,

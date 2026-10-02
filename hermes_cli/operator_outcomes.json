@@ -6,13 +6,11 @@
     "t_5cb8e6be": {
       "client_path": "C:\\Users\\User\\DiscordBots\\Jarvis\\hermes_router.py",
       "client_sha256": "cae99f71cec794a5f78318df7c224e09749f272febff5f1d932e534328aee1a2",
-      "python": "C:/Python314/python.exe",
       "kind": "conversation"
     },
     "t_2932862d": {
       "client_path": "C:\\Users\\User\\DiscordBots\\Jarvis\\hermes_router.py",
       "client_sha256": "cae99f71cec794a5f78318df7c224e09749f272febff5f1d932e534328aee1a2",
-      "python": "C:/Python314/python.exe",
       "kind": "dashboard",
       "health_url": "http://127.0.0.1:7888/api/health"
     },
