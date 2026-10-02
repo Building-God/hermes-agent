@@ -81,6 +81,34 @@ def accepted_origin(board, monkeypatch, text="Independently verified result"):
     return tid,settings
 
 
+@pytest.mark.parametrize('mode',['stale_client','stale_contract','current_legacy','current_bound'])
+def test_actual_owned_acceptance_rechecks_changed_interface_contract(board,monkeypatch,mode):
+    from hermes_cli import kanban_outcomes as outcomes
+    tid=kb.create_task(board,title='Actual owned acceptance',assignee='pilot',user_origin={'platform':'discord','chat_id':'c','message_id':'binding','user_id':'harry','text':'Fix primary chat'})
+    cfg={'enabled':True,'cohort_task_ids':[tid],'acceptance_recheck_assignee':'pilot'}
+    monkeypatch.setattr(operator,'policy',lambda conn:cfg)
+    build=kb.claim_task(board,tid)
+    assert kb.request_review(board,tid,reviewer='reviewer',expected_run_id=build.current_run_id)
+    review=kb.claim_review_task(board,tid)
+    declared={'kind':'dashboard','client_sha256':'current','primary_http_url':'http://127.0.0.1:7888/api/chat'}
+    report={'kind':'dashboard','passed':True,'original_task_id':tid,'actor':'operator-verification','router_sha256':'old' if mode=='stale_client' else 'current','requests':[{'transport':'primary-http'}]*6}
+    if mode in ('stale_contract','current_bound'):
+        import hashlib
+        contract={**declared,'client_sha256':'old'} if mode=='stale_contract' else declared
+        report['outcome_check_sha256']=hashlib.sha256(json.dumps(contract,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+    with kb.write_txn(board):kb._append_event(board,tid,'operator_outcome_verified',report,run_id=review.current_run_id)
+    assert kb.complete_task(board,tid,result='Controlled native old result',expected_run_id=review.current_run_id,metadata={'acceptance_receipts':{'probe':'fixture effects'}})
+    old=operator._last(board,tid,'completed');cfg['outcome_checks']={tid:declared}
+    operator.reconcile(board,settings=cfg)
+    if mode.startswith('stale'):
+        assert kb.get_task(board,tid).status=='review'
+        correction=operator._last(board,tid,'operator_acceptance_invalidated')
+        assert operator._payload(correction)['source_completed_event_id']==old['id']
+        operator.reconcile(board,settings=cfg)
+        assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_acceptance_invalidated'",(tid,)).fetchone()[0]==1
+    else:assert kb.get_task(board,tid).status=='done'
+
+
 def test_global_health_claim_requires_request_outcomes_not_board_counts(board,monkeypatch):
     other=kb.create_task(board,title="failed request",assignee="pilot")
     assert kb.block_task(board,other,kind="capability",reason="agent-owned repair pending")
