@@ -1746,3 +1746,19 @@ def test_queue_cannot_pass_by_erasing_unresolved_harry_only_choice(monkeypatch,q
     from hermes_cli import kanban_outcomes as outcomes
     monkeypatch.setattr(outcomes,'_local_json',lambda url:{'questions':questions})
     assert outcomes.check_queue({'url':'http://127.0.0.1:7888/api/questions','preserve_pending_choice_tasks':['protected-choice']})['passed']==passed
+
+
+def test_native_probe_uses_its_prepared_runtime_not_user_site_interpreter(monkeypatch):
+    from pathlib import Path
+    from hermes_cli import kanban_outcomes as outcomes
+    from types import SimpleNamespace
+    seen=[]
+    def execute(args,**kwargs):
+        seen.append((args,kwargs))
+        return SimpleNamespace(returncode=0,stdout=json.dumps({'passed':True,'actor':'operator-verification'}))
+    monkeypatch.setattr(outcomes.subprocess,'run',execute)
+    result=outcomes.check_conversation({'python':'C:/Python314/python.exe','client_sha256':'fixture'})
+    assert result['passed']
+    expected=Path(outcomes.__file__).resolve().parents[1]/'venv'/('Scripts/python.exe' if outcomes.os.name=='nt' else 'bin/python')
+    assert seen[0][0][0]==str(expected)
+    assert seen[0][0][1]=='-I' and seen[0][1]['timeout']==150
