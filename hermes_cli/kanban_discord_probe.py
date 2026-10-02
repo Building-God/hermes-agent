@@ -15,6 +15,7 @@ import psutil
 
 
 def read_json(url, headers, *, payload=None, timeout=12):
+    headers = {"User-Agent": "DiscordBot (https://github.com/Building-God/hermes-agent, 1.0)", **headers}
     request = Request(url, headers=headers, data=None if payload is None else json.dumps(payload).encode())
     try:
         with urlopen(request, timeout=timeout) as response:
@@ -63,17 +64,21 @@ def run(config):
     assert any(word in records[4]["response"].lower() for word in ("receipt", "accept", "not", "no")), "Delivery and receipt reasoning collapsed"
     origin = config["discord_origin"]
     token = values["DISCORD_BOT_TOKEN"]
-    bot = read_json("https://discord.com/api/v10/users/@me", {"Authorization": "Bot " + token})
-    message = read_json("https://discord.com/api/v10/channels/" + origin["channel_id"] + "/messages/" + origin["message_id"],
-                        {"Authorization": "Bot " + token})
-    assert message["author"]["id"] == origin["author_id"] and message["author"].get("bot", False) is False
-    assert message["channel_id"] == origin["channel_id"]
-    after = json.loads((home / "gateway_state.json").read_text(encoding="utf-8"))
-    assert (before["pid"], before["code_sha"]) == (after["pid"], after["code_sha"])
-    assert report["pid"] == before["pid"] and report["revision"] == before["code_sha"]
-    report.update(origin_network_readback={**origin, "author_is_bot": False, "transport_bot_id": bot["id"],
-                  "content_sha256": hashlib.sha256(message["content"].encode()).hexdigest(), "checked_at": time.time()},
-                  independent_process_readback={"pid": process.pid, "root": str(root), "started_at": process.create_time()})
+    try:
+        bot = read_json("https://discord.com/api/v10/users/@me", {"Authorization": "Bot " + token})
+        message = read_json("https://discord.com/api/v10/channels/" + origin["channel_id"] + "/messages/" + origin["message_id"],
+                            {"Authorization": "Bot " + token})
+        assert message["author"]["id"] == origin["author_id"] and message["author"].get("bot", False) is False
+        assert message["channel_id"] == origin["channel_id"]
+        after = json.loads((home / "gateway_state.json").read_text(encoding="utf-8"))
+        assert (before["pid"], before["code_sha"]) == (after["pid"], after["code_sha"])
+        assert report["pid"] == before["pid"] and report["revision"] == before["code_sha"]
+        report.update(origin_network_readback={**origin, "author_is_bot": False, "transport_bot_id": bot["id"],
+                      "content_sha256": hashlib.sha256(message["content"].encode()).hexdigest(), "checked_at": time.time()},
+                      independent_process_readback={"pid": process.pid, "root": str(root), "started_at": process.create_time()})
+    except Exception as error:
+        report.update(passed=False, human_receipt=False,
+                      failures=[*report.get("failures", []), "Independent Discord network/process readback failed: " + type(error).__name__ + ": " + str(error)[:200]])
     return report
 
 
