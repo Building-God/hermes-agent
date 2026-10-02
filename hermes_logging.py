@@ -20,14 +20,19 @@ from typing import Optional, Sequence
 
 # Windows-ONLY swap (#44873): stdlib ``RotatingFileHandler.doRollover()`` calls
 # ``os.rename()``, which fails with ``PermissionError [WinError 32]`` whenever
-# another process holds an append handle on ``agent.log`` — essentially always
-# in Hermes (TUI, gateway, hy_memory, MCP servers, CLI commands all log) —
+# another process holds an append handle on ``agent.log`` - essentially always
+# in Hermes (TUI, gateway, hy_memory, MCP servers, CLI commands all log) -
 # pinning the file at the size threshold and spamming stderr on every emit.
 # ``concurrent-log-handler`` serializes rollover with a cross-process lock.
 # POSIX keeps stdlib: renames of open files work, and managed mode (NixOS)
 # relies on stdlib's exact ``_open()``/``doRollover()`` lifecycle for the
 # 0660 chmod and eager file creation; CLH opens lazily and rotates differently.
 if sys.platform == "win32":
+    # Load the native locking dependencies before the first QueueListener.
+    # Missing runtime bindings must fail startup, not strand its writer thread.
+    import pywintypes  # noqa: F401,E402
+    import win32con  # noqa: F401,E402
+    import win32file  # noqa: F401,E402
     from concurrent_log_handler import (  # noqa: E402
         ConcurrentRotatingFileHandler as RotatingFileHandler,
     )
@@ -218,8 +223,8 @@ def setup_logging(
     global _logging_initialized
     home = hermes_home or get_hermes_home()
     log_dir = mkdir_under_hermes_home(home / "logs")
-    # A second Hermes home in a process that already logs for another one — a dashboard or
-    # ``hermes serve`` backend building agents for several profiles, a multiplexed gateway —
+    # A second Hermes home in a process that already logs for another one - a dashboard or
+    # ``hermes serve`` backend building agents for several profiles, a multiplexed gateway -
     # gets routed by record home. Stacking another file handler here would hand it EVERY
     # profile's records (the handlers carry no home filter), and a duplicate writer on top of
     # an existing router.
@@ -235,7 +240,7 @@ def setup_logging(
 
     root = logging.getLogger()
 
-    # (filename, level, max_bytes, backup_count, component) — a component gates
+    # (filename, level, max_bytes, backup_count, component) - a component gates
     # the file on ``mode`` and restricts it to that component's logger prefixes.
     handler_specs = (
         ("agent.log", level, max_bytes, backups, None),
@@ -285,7 +290,7 @@ def setup_verbose_logging() -> None:
 
 
 def _quietly(fn) -> None:
-    """Call *fn* (a ``close``/``stop`` bound method) swallowing errors — teardown must never raise."""
+    """Call *fn* (a ``close``/``stop`` bound method) swallowing errors - teardown must never raise."""
     try:
         fn()
     except Exception:
@@ -351,7 +356,7 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
             self._reopen_stream()  # rotated/unlinked underneath us: recreate at the path
             return
         except OSError:
-            return  # transient — try again on the next emit
+            return  # transient - try again on the next emit
 
         if self._stat_dev is None or self._stat_ino is None:
             self._record_stream_stat(st)
@@ -364,7 +369,7 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
             self._reopen_if_externally_rotated()
         super().emit(record)
         # A record actually reached the file: only now has the destination recovered. Resetting
-        # in _open() is wrong — open() succeeds on a device whose write/flush still raise EIO,
+        # in _open() is wrong - open() succeeds on a device whose write/flush still raise EIO,
         # which re-armed the report and printed the path once per record.
         if self.stream is not None:
             self._unavailable_reported = False
@@ -565,7 +570,7 @@ def flush_log_queue() -> None:
     """Block until all queued records have been written, then resume.
 
     Stops the listener (which processes every pending record before joining) and
-    restarts it. ``stop()`` joins the worker thread — do NOT call this on a hard-exit
+    restarts it. ``stop()`` joins the worker thread - do NOT call this on a hard-exit
     path where the listener may be wedged on the rotation lock; use
     ``drain_log_queue()`` there, which bounds the wait.
     """
@@ -579,8 +584,8 @@ def flush_log_queue() -> None:
 def drain_log_queue(timeout: float = 1.0) -> None:
     """Best-effort, time-bounded drain for hard-exit paths (no restart).
 
-    If the listener's worker is wedged on the cross-process rotation lock — the very
-    failure async logging exists to survive — an unbounded join would re-freeze shutdown.
+    If the listener's worker is wedged on the cross-process rotation lock - the very
+    failure async logging exists to survive - an unbounded join would re-freeze shutdown.
     """
     listener = _queue_listener
     if listener is None:
@@ -692,7 +697,7 @@ def _add_rotating_handler(
     """Register a queued ``RotatingFileHandler`` for *path*; idempotent per resolved path."""
     resolved = path.resolve()
     for existing in _queued_file_handlers:
-        # Already attached directly, or already covered by the profile router — for its default
+        # Already attached directly, or already covered by the profile router - for its default
         # home or any profile home it routes (a bare handler beside it would take every record).
         if getattr(existing, "_hermes_routed_log_path", None) == resolved or (
             isinstance(existing, RotatingFileHandler)
@@ -708,8 +713,8 @@ def _add_rotating_handler(
     )
     if log_filter is not None:
         handler.addFilter(log_filter)
-    # Routing already on (a second home adopted earlier): a component log added now —
-    # ``mode="gateway"`` after the fact — must route too, or it takes every home's records.
+    # Routing already on (a second home adopted earlier): a component log added now -
+    # ``mode="gateway"`` after the fact - must route too, or it takes every home's records.
     routers = [h for h in _queued_file_handlers if isinstance(h, _ProfileRoutingFileHandler)]
     if routers:
         homes: set[Path] = set()

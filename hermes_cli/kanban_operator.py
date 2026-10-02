@@ -535,25 +535,7 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
             actions.append({"task_id":tid,"acceptance_recovery":reviewer})
         except Exception as error:
             _exception(conn,tid,"acceptance_recovery_failed",error=str(error)[:300])
-    for event in conn.execute("SELECT e.* FROM task_events e JOIN tasks t ON t.id=e.task_id WHERE e.kind='operator_acceptance_recovery' AND t.status IN ('review','running') AND e.id=(SELECT MAX(latest.id) FROM task_events latest WHERE latest.task_id=e.task_id AND latest.kind='operator_acceptance_recovery')").fetchall():
-        info=dict(_payload(event));tid=event["task_id"]
-        rework=_last(conn,tid,'operator_rework_due')
-        if rework and rework['id']>event['id']:
-            info['due_at']=max(info['due_at'],_payload(rework).get('due_at',0))
-        if now < info["due_at"]:
-            continue
-        _exception(conn,tid,"acceptance_review_deadline_exceeded",due_at=info["due_at"])
-        task=kb.get_task(conn,tid)
-        if task.status=='running':
-            stopped=kb.block_task(conn,tid,reason="Agent-owned acceptance review deadline exhausted.",kind='capability')
-        else:
-            with kb.write_txn(conn):
-                stopped=conn.execute("UPDATE tasks SET status='blocked',block_kind='capability' WHERE id=? AND status='review' AND claim_lock IS NULL",(tid,)).rowcount > 0
-        if stopped:
-            with kb.write_txn(conn):
-                kb._append_event(conn,tid,'operator_acceptance_stopped',{'owner':'agent','due_at':info['due_at']})
-                kb._append_event(conn,tid,"gave_up",{"owner":"agent","error":"Acceptance review deadline exhausted","source_event_id":event["id"]})
-            actions.append({"task_id":tid,"acceptance_review_stopped":True})
+    actions.extend(enforce_acceptance_deadlines(conn, now=now))
     # The live pilot mislabeled reviewer approval as Harry input. Repairs are
     # provably agent-owned: hand existing candidate evidence to a real reviewer,
     # never approve it or restart implementation merely to escape the hold.
@@ -926,6 +908,39 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
                 with kb.write_txn(conn):
                     kb._append_event(conn,repair.id,"operator_repair_stopped",{"owner":"agent","due_at":phase_due,"original_task_id":tid})
                 actions.append({"task_id":tid,"repair_stopped":repair.id})
+    return actions
+
+
+def enforce_acceptance_deadlines(conn, *, now=None):
+    """Stop expired native reviews without running dispatch or outcome probes.
+
+    Called by the existing delivery pass as well as normal reconciliation.
+    No phase renewal, new scheduler, or acceptance inference.
+    """
+    from hermes_cli import kanban_db as kb
+    if not policy(conn).get("enabled"):
+        return []
+    now = int(time.time()) if now is None else int(now)
+    actions = []
+    for event in conn.execute("SELECT e.* FROM task_events e JOIN tasks t ON t.id=e.task_id WHERE e.kind='operator_acceptance_recovery' AND t.status IN ('review','running') AND e.id=(SELECT MAX(latest.id) FROM task_events latest WHERE latest.task_id=e.task_id AND latest.kind='operator_acceptance_recovery')").fetchall():
+        info=dict(_payload(event));tid=event["task_id"]
+        rework=_last(conn,tid,'operator_rework_due')
+        if rework and rework['id']>event['id']:
+            info['due_at']=max(info['due_at'],_payload(rework).get('due_at',0))
+        if now < info["due_at"]:
+            continue
+        task=kb.get_task(conn,tid)
+        if task.status=='running':
+            stopped=kb.block_task(conn,tid,reason="Agent-owned acceptance review deadline exhausted.",kind='capability')
+        else:
+            with kb.write_txn(conn):
+                stopped=conn.execute("UPDATE tasks SET status='blocked',block_kind='capability' WHERE id=? AND status='review' AND claim_lock IS NULL",(tid,)).rowcount > 0
+        if stopped:
+            _exception(conn,tid,"acceptance_review_deadline_exceeded",due_at=info["due_at"])
+            with kb.write_txn(conn):
+                kb._append_event(conn,tid,'operator_acceptance_stopped',{'owner':'agent','due_at':info['due_at']})
+                kb._append_event(conn,tid,"gave_up",{"owner":"agent","error":"Acceptance review deadline exhausted","source_event_id":event["id"]})
+            actions.append({"task_id":tid,"acceptance_review_stopped":True})
     return actions
 
 

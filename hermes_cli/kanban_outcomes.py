@@ -17,12 +17,13 @@ def declared_check(config, original):
     if original not in config.get('cohort_task_ids', []):
         return None
     explicit = (config.get('outcome_checks') or {}).get(original)
-    if explicit:
-        return explicit
     manifest = Path(__file__).with_name('operator_outcomes.json')
     if not manifest.is_file():
-        return None
-    return json.loads(manifest.read_text(encoding='utf8'))['checks'].get(original)
+        return explicit
+    sealed = json.loads(manifest.read_text(encoding='utf8'))['checks'].get(original)
+    if explicit:
+        return {**explicit, **({'required_transport':sealed['required_transport']} if sealed and sealed.get('required_transport') else {})}
+    return sealed
 
 
 def outcome_signature(declared):
@@ -32,6 +33,9 @@ def outcome_signature(declared):
 def receipt_matches_declaration(report, declared):
     """Old successes cannot certify a changed interface or outcome contract."""
     if not report.get('passed') or report.get('kind')!=declared['kind']:return False
+    required=declared.get('required_transport')
+    if required and (not report.get('requests') or any(r.get('transport')!=required for r in report['requests'])):
+        return False
     signature=report.get('outcome_check_sha256')
     if signature:return signature==outcome_signature(declared)
     # Compatibility is limited to an actual R17 primary HTTP drill against
@@ -86,6 +90,9 @@ def check_queue(config):
 
 
 def check_conversation(config, *, dashboard=False):
+    if config.get('required_transport')=='discord-front-door' and not config.get('discord_probe_url'):
+        return {'passed':False,'actor':'operator-verification','requests':[],
+                'failures':['The original request concerns Discord chat. A dashboard HTTP probe cannot certify that route; native Discord front-door verification remains agent-owned.']}
     script = Path(__file__).with_name('kanban_outcome_probe.py')
     runtime = Path(__file__).resolve().parents[1] / 'venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
     if not runtime.is_file():
@@ -100,6 +107,9 @@ def check_conversation(config, *, dashboard=False):
         detail = next((line for line in reversed(result.stderr.splitlines()) if 'Error:' in line), 'child process failed')[:240]
         raise ValueError('Native conversation probe failed to execute in the prepared runtime: ' + detail)
     report = json.loads(result.stdout.strip())
+    required=config.get('required_transport')
+    if required and (not report.get('requests') or any(r.get('transport')!=required for r in report['requests'])):
+        return {**report,'passed':False,'failures':['Native probe did not reproduce the declared original transport: '+required]}
     if report.get('passed') is not True or report.get('actor') != 'operator-verification':
         return {**report, 'passed': False,
                 'failures': ['Current primary client conversation/context probe failed']}

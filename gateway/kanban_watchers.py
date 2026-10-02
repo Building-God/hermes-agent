@@ -113,9 +113,9 @@ class GatewayKanbanWatchersMixin:
                     _gc_next_at = time.monotonic() + _GC_INTERVAL_SECONDS
                     _retention = _gc_retention_days()
 
-                deliveries = await asyncio.to_thread(
-                    _notifier_collect, self, _kb,
-                    notifier_profile=notifier_profile, gc_due=_gc_due, gc_retention_days=_retention,
+                deliveries = await _to_thread_process_service(
+                    lambda: _notifier_collect(self, _kb,
+                        notifier_profile=notifier_profile, gc_due=_gc_due, gc_retention_days=_retention),
                 )
                 for d in deliveries:
                     await _KanbanNotification(

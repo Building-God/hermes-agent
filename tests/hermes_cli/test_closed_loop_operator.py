@@ -33,6 +33,67 @@ def entry():
                 message_id="message", message="Produce the weekly briefing", idempotency_key="discord:channel:message")
 
 
+def test_discord_front_door_request_cannot_be_certified_by_dashboard_proxy():
+    from hermes_cli import kanban_outcomes as outcomes
+    declared={'kind':'conversation','required_transport':'discord-front-door','primary_http_url':'http://127.0.0.1:7888/api/chat'}
+    report={'passed':True,'kind':'conversation','actor':'operator-verification','requests':[{'transport':'primary-http'}]*6,'outcome_check_sha256':outcomes.outcome_signature(declared)}
+    assert not outcomes.receipt_matches_declaration(report,declared)
+    probe=outcomes.check_conversation(declared)
+    assert not probe['passed'] and 'Discord' in probe['failures'][0]
+    old_policy={'cohort_task_ids':['t_5cb8e6be'],'outcome_checks':{'t_5cb8e6be':{'kind':'conversation','primary_http_url':'http://127.0.0.1:7888/api/chat'}}}
+    assert outcomes.declared_check(old_policy,'t_5cb8e6be')['required_transport']=='discord-front-door'
+
+
+@pytest.mark.windows_only
+def test_windows_logger_dependencies_loaded_before_writer_thread():
+    import subprocess,sys
+    code="import hermes_logging,sys; assert all(n in sys.modules for n in ('pywintypes','win32con','win32file')); print('Windows lock loader ready before logging')"
+    result=subprocess.run([sys.executable,'-I','-c',code],capture_output=True,text=True,timeout=30,creationflags=subprocess.CREATE_NO_WINDOW)
+    assert result.returncode==0,result.stderr
+
+
+@pytest.mark.parametrize('claimed', [False, True])
+def test_native_delivery_pass_stops_expired_review_without_dispatch(board,monkeypatch,claimed):
+    import time
+    from types import SimpleNamespace
+    from gateway import kanban_watchers_notifier as notifier
+    tid=ensure_continuation(entry())
+    worker=kb.claim_task(board,tid)
+    assert kb.request_review(board,tid,reviewer='reviewer',expected_run_id=worker.current_run_id)
+    if claimed:assert kb.claim_review_task(board,tid,claimer='reviewer')
+    due=int(time.time())-1
+    with kb.write_txn(board):kb._append_event(board,tid,'operator_acceptance_recovery',{'owner':'agent','due_at':due})
+    monkeypatch.setattr(operator,'policy',lambda conn:{'enabled':True})
+    monkeypatch.setattr(operator,'reconcile',lambda *a,**k:pytest.fail('Dispatch must not run during delivery'))
+    monkeypatch.setattr(notifier,'_list_boards',lambda kb:[{'slug':kb.DEFAULT_BOARD}])
+    runner=SimpleNamespace(adapters={'discord':object()},_profile_adapters={},config=None,_owns_kanban_dispatcher_lock=lambda:True)
+    for _ in range(2):
+        notifier._notifier_collect(runner,kb,notifier_profile='pilot',gc_due=False,gc_retention_days=30)
+    assert kb.get_task(board,tid).status=='blocked'
+    stopped=operator._last(board,tid,'operator_acceptance_stopped')
+    assert json.loads(stopped['payload'])['due_at']==due
+    assert board.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='operator_acceptance_stopped'",(tid,)).fetchone()[0]==1
+
+
+@pytest.mark.parametrize('scope',['latest','count','global'])
+def test_operator_event_reads_seek_by_kind_without_scanning_or_sorting(board,scope):
+    tid=kb.create_task(board,title='Controlled large history',assignee='pilot')
+    with kb.write_txn(board):
+        board.executemany('INSERT INTO task_events(task_id,kind,payload,created_at) VALUES(?,?,?,?)',[(tid,'heartbeat','{}',i) for i in range(20000)])
+        kb._append_event(board,tid,'operator_repair_created',{'repair_task_id':'controlled'})
+        kb._append_event(board,tid,'changes_requested',{'reason':'controlled failure'})
+    if scope=='latest':
+        sql='SELECT * FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1';args=(tid,'result_receipt');index='idx_events_task_kind_id'
+    elif scope=='count':
+        sql="SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='changes_requested'";args=(tid,);index='idx_events_task_kind_id'
+    else:
+        sql="SELECT * FROM task_events WHERE kind='operator_repair_created' AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.repair_task_id') END=? ORDER BY id DESC LIMIT 1";args=('controlled',);index='idx_events_kind_id'
+    plan=' '.join(str(row[3]) for row in board.execute('EXPLAIN QUERY PLAN '+sql,args))
+    assert 'SEARCH' in plan and index in plan and 'TEMP B-TREE' not in plan
+    result=board.execute(sql,args).fetchall()
+    assert (not result) if scope=='latest' else bool(result)
+
+
 @pytest.mark.parametrize('kind', ['conversation','dashboard','queue'])
 def test_original_technical_outcome_cannot_assign_agent_testing_to_harry(board,monkeypatch,kind):
     tid=ensure_continuation(entry())
