@@ -251,6 +251,31 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
     runtime = max(60, int(cfg.get("attempt_seconds", 900)))
     deadline = max(runtime, int(cfg.get("request_seconds", 7200)))
     actions = []
+    # The former execution fence admitted only operator-repair ready work.
+    # An original whose finite correction was never claimed gets one native
+    # correction of that distinct gate defect, not another implementation retry.
+    for tid in cfg.get('cohort_task_ids', []):
+        task=kb.get_task(conn,tid);phase=_last(conn,tid,'operator_acceptance_recovery')
+        recovered=_last(conn,tid,'operator_rework_clock_recovered')
+        changes=_last(conn,tid,'changes_requested');stop=audited_original_stop_event(conn,tid)
+        origin=conn.execute('SELECT 1 FROM task_user_origins WHERE task_id=?',(tid,)).fetchone()
+        if (not origin or not task or task.status!='blocked' or task.block_kind!='capability' or task.claim_lock
+            or task.result or not phase or not recovered or not changes or not stop
+            or stop['kind']!='operator_request_stopped' or _payload(stop).get('owner')!='agent'
+            or not (changes['id']<recovered['id']<phase['id']<stop['id'])
+            or _payload(recovered).get('source_changes_event_id')!=changes['id']
+            or _last(conn,tid,'operator_execution_gate_recovered')
+            or conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='claimed' AND id>?",(tid,recovered['id'])).fetchone()
+            or conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='changes_requested'",(tid,)).fetchone()[0]>=int(cfg.get('max_review_cycles',3))):
+            continue
+        with kb.write_txn(conn):
+            changed=conn.execute("UPDATE tasks SET status='ready',block_kind=NULL WHERE id=? AND status='blocked' AND block_kind='capability' AND claim_lock IS NULL",(tid,)).rowcount
+            if not changed:continue
+            payload={'owner':'agent','source_stop_event_id':stop['id'],'source_clock_recovery_event_id':recovered['id'],'source_changes_event_id':changes['id'],'due_at':now+runtime,'lifetime_limit':1,'reason':'Original correction was never claimed because execution fence admitted only repair tasks; original deadline and attempt history retained'}
+            kb._append_event(conn,tid,'operator_execution_gate_recovered',payload)
+            kb._append_event(conn,tid,'operator_acceptance_recovery',payload)
+            kb._append_event(conn,tid,'operator_rework_due',payload)
+        actions.append({'task_id':tid,'execution_gate_recovered':True})
     # Correct the exact native timer defect once: an original-deadline stop
     # clipped a later reviewer-created rework budget. Preserve both old clocks.
     for tid in cfg.get('cohort_task_ids', []):

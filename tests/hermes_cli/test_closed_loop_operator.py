@@ -1848,3 +1848,91 @@ def test_original_clock_does_not_cut_off_active_implementer_rework(board,monkeyp
     assert kb.get_task(board,tid).status=='running'
     assert operator._last(board,tid,'operator_acceptance_stopped') is None
     assert operator._last(board,tid,'operator_request_stopped') is None
+
+
+def _native_original_rework(board,monkeypatch,origin=True):
+    monkeypatch.setattr(kb.time,'time',lambda:150)
+    user_origin={'platform':'discord','chat_id':'c','message_id':'claim-fence','user_id':'harry','text':'Repair the actual fixture outcome'} if origin else None
+    tid=kb.create_task(board,title='original fixture outcome',assignee='pilot',user_origin=user_origin)
+    settings={'enabled':True,'cohort_task_ids':[tid],'attempt_seconds':60,'rework_seconds':60,'request_seconds':120,'max_review_cycles':3}
+    monkeypatch.setattr(operator,'policy',lambda conn:settings)
+    worker=kb.claim_task(board,tid)
+    assert worker
+    assert kb.request_review(board,tid,reviewer='reviewer',expected_run_id=worker.current_run_id,metadata={'acceptance_receipts':{'fixture':'candidate requires actual review'}})
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'operator_deadline',{'due_at':1})
+        kb._append_event(board,tid,'operator_request_stopped',{'owner':'agent','due_at':1})
+        kb._append_event(board,tid,'operator_acceptance_recovery',{'owner':'agent','due_at':200})
+    review=kb.claim_review_task(board,tid)
+    assert review
+    assert kb.request_changes(board,tid,reason='Actual fixture effect remains missing',expected_run_id=review.current_run_id)[0]
+    return tid,settings
+
+
+@pytest.mark.parametrize('mode',['allowed','clock','expired','outside','stale','cycles','human','no_origin'])
+def test_original_native_rework_can_actually_claim_with_lifetime_and_scope_fences(board,monkeypatch,mode):
+    tid,settings=_native_original_rework(board,monkeypatch,origin=mode!='no_origin')
+    if mode=='clock':
+        monkeypatch.setattr(kb.time,'time',lambda:201)
+        with kb.write_txn(board):
+            board.execute("UPDATE tasks SET status='blocked',block_kind='capability' WHERE id=?",(tid,))
+            kb._append_event(board,tid,'operator_request_stopped',{'owner':'agent','due_at':1})
+        operator.reconcile(board,settings=settings,now=201)
+        assert operator._last(board,tid,'operator_rework_clock_recovered')
+    if mode=='expired':monkeypatch.setattr(kb.time,'time',lambda:211)
+    if mode=='outside':settings['cohort_task_ids']=[]
+    with kb.write_txn(board):
+        if mode=='stale':kb._append_event(board,tid,'operator_request_stopped',{'owner':'agent','due_at':1})
+        if mode=='cycles':
+            for _ in range(2):kb._append_event(board,tid,'changes_requested',{'reason':'Independent fixture rejection'})
+        if mode=='human':board.execute("UPDATE tasks SET status='blocked',block_kind='needs_input' WHERE id=?",(tid,))
+    claim=kb.claim_task(board,tid)
+    assert bool(claim)==(mode in ('allowed','clock'))
+    if claim:
+        event=board.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed'",(tid,claim.current_run_id)).fetchone()
+        assert json.loads(event['payload']).get('source_status') is None
+        assert claim.assignee=='pilot'
+        assert operator._payload(operator._last(board,tid,'operator_deadline'))['due_at']==1
+
+
+@pytest.mark.parametrize('mode',['exact','attempted','outside','human','exhausted','already','atomic'])
+def test_unclaimed_original_gate_defect_recovers_once_without_giving_used_attempts_back(board,monkeypatch,mode):
+    tid,settings=_native_original_rework(board,monkeypatch)
+    monkeypatch.setattr(kb.time,'time',lambda:201)
+    with kb.write_txn(board):
+        board.execute("UPDATE tasks SET status='blocked',block_kind='capability' WHERE id=?",(tid,))
+        kb._append_event(board,tid,'operator_request_stopped',{'owner':'agent','due_at':1})
+    operator.reconcile(board,settings=settings,now=201)
+    assert operator._last(board,tid,'operator_rework_clock_recovered')
+    if mode=='attempted':assert kb.claim_task(board,tid)
+    monkeypatch.setattr(kb.time,'time',lambda:262)
+    with kb.write_txn(board):
+        # Fixture recreates the old native no-claim stop; no live worker exists.
+        board.execute("UPDATE tasks SET status='blocked',block_kind=?,claim_lock=NULL,current_run_id=NULL WHERE id=?",('needs_input' if mode=='human' else 'capability',tid))
+        kb._append_event(board,tid,'operator_request_stopped',{'owner':'agent','due_at':1})
+        if mode=='exhausted':
+            for _ in range(2):kb._append_event(board,tid,'changes_requested',{'reason':'Independent rejection exhausts lifetime budget'})
+        if mode=='already':kb._append_event(board,tid,'operator_execution_gate_recovered',{'owner':'agent','lifetime_limit':1})
+    if mode=='outside':settings['cohort_task_ids']=[]
+    if mode=='atomic':
+        native_append=kb._append_event
+        def fail(conn,task_id,kind,*args,**kwargs):
+            if kind=='operator_execution_gate_recovered':raise RuntimeError('controlled ledger write failure')
+            return native_append(conn,task_id,kind,*args,**kwargs)
+        monkeypatch.setattr(kb,'_append_event',fail)
+        result=operator.reconcile(board,settings=settings,now=262)
+        assert any(item.get('exception')=='reconciliation_failed' for item in result)
+        assert kb.get_task(board,tid).status=='blocked'
+        assert operator._last(board,tid,'operator_execution_gate_recovered') is None
+        return
+    operator.reconcile(board,settings=settings,now=262)
+    recovered=operator._last(board,tid,'operator_execution_gate_recovered')
+    if mode!='exact':
+        assert not recovered or mode=='already'
+        return
+    assert recovered and operator._payload(recovered)['due_at']==322
+    assert kb.get_task(board,tid).status=='ready'
+    assert operator._payload(operator._last(board,tid,'operator_deadline'))['due_at']==1
+    operator.reconcile(board,settings=settings,now=263)
+    assert operator._last(board,tid,'operator_execution_gate_recovered')['id']==recovered['id']
+    assert kb.claim_task(board,tid)

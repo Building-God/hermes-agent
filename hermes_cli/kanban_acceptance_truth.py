@@ -62,6 +62,20 @@ def execution_claim_allowed(conn,tid,source_status):
     if not stop:return True
     if source_status=='ready':
         task=conn.execute('SELECT created_by FROM tasks WHERE id=?',(tid,)).fetchone()
+        cfg=policy(conn)
+        origin=conn.execute('SELECT 1 FROM task_user_origins WHERE task_id=?',(tid,)).fetchone()
+        original_phase=_last(conn,tid,'operator_acceptance_recovery')
+        original_changes=_last(conn,tid,'changes_requested')
+        original_rework=_last(conn,tid,'operator_rework_due')
+        if (origin and tid in cfg.get('cohort_task_ids',[]) and task and task['created_by']!='operator-repair'
+            and original_phase and original_phase['id']>stop['id'] and original_changes and original_rework
+            and original_rework['id']>original_phase['id'] and _data(original_rework).get('owner')=='agent'):
+            native_recovery=conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind IN ('operator_rework_clock_recovered','operator_execution_gate_recovered') ORDER BY id DESC LIMIT 1",(tid,)).fetchone()
+            changed_after_phase=original_changes['id']>original_phase['id']
+            recovered_changes=bool(native_recovery and native_recovery['id']>stop['id'] and _data(native_recovery).get('source_changes_event_id')==original_changes['id'])
+            cycles=conn.execute("SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='changes_requested'",(tid,)).fetchone()[0]
+            due=max(_data(original_phase).get('due_at',0),_data(original_rework).get('due_at',0))
+            return bool((changed_after_phase or recovered_changes) and time.time()<due and cycles<int(cfg.get('max_review_cycles',3)))
         phase=_last(conn,tid,'operator_agent_review_handoff')
         changes=_last(conn,tid,'changes_requested')
         if task and task['created_by']=='operator-repair' and phase and phase['id']>stop['id'] and changes and changes['id']>phase['id']:
