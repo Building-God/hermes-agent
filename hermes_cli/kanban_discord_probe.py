@@ -7,6 +7,7 @@ import sys
 import time
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 import uuid
 
 from dotenv import dotenv_values
@@ -15,8 +16,18 @@ import psutil
 
 def read_json(url, headers, *, payload=None, timeout=12):
     request = Request(url, headers=headers, data=None if payload is None else json.dumps(payload).encode())
-    with urlopen(request, timeout=timeout) as response:
-        return json.load(response)
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return json.load(response)
+    except HTTPError as error:
+        if payload is not None:
+            body = json.load(error)
+            if body.get("passed") is False and body.get("actor") == "operator-verification":
+                return body
+            return {"passed": False, "actor": "operator-verification", "requests": [],
+                    "failures": ["Native verifier HTTP " + str(error.code) + ": " + str(body.get("error", {}).get("message", "request refused"))],
+                    "human_receipt": False}
+        raise
 
 
 def run(config):
@@ -38,6 +49,8 @@ def run(config):
     report = read_json(url, {"Content-Type": "application/json", "Authorization": "Bearer " + api_key,
                             "X-Hermes-Operator-Token": peers["operator-verification"]},
                        payload={"nonce": nonce}, timeout=150)
+    if report.get("passed") is False:
+        return report
     records = report.get("requests", [])
     reference = "operator-control-" + nonce[:12]
     assert report.get("actor") == "operator-verification" and report.get("nonce") == nonce

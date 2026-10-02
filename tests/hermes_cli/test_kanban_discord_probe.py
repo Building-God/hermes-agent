@@ -42,3 +42,14 @@ def test_native_client_uses_configured_key_and_serving_home_not_worker_profile(t
     assert report["independent_process_readback"]["root"] == str(root)
     assert report["human_receipt"] is False
     assert len(seen) == 3
+
+
+def test_http_refusal_preserves_native_agent_failure_evidence(monkeypatch):
+    from io import BytesIO
+    from urllib.error import HTTPError
+    body = {"passed": False, "actor": "operator-verification", "requests": [],
+            "failures": ["native handler deadline exceeded"], "human_receipt": False}
+    def refused(*args, **kwargs):
+        raise HTTPError("http://127.0.0.1:8642/api/operator/verify-discord", 422, "failed", {}, BytesIO(json.dumps(body).encode()))
+    monkeypatch.setattr(probe, "urlopen", refused)
+    assert probe.read_json("http://127.0.0.1:8642/api/operator/verify-discord", {}, payload={"nonce": "a" * 32}) == body

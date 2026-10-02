@@ -1502,9 +1502,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return web.json_response(result if isinstance(result, dict) else {})
 
     async def _handle_operator_discord_verification(self, request: "web.Request") -> "web.Response":
-        from gateway.operator_discord_verifier import authorized, reproduce
-        from hermes_cli.config import get_hermes_home
-        home = get_hermes_home()
+        from gateway.operator_discord_verifier import authorized, reproduce, serving_home
+        home = serving_home()
         if not authorized(request.headers.get("X-Hermes-Operator-Token", ""), home):
             return _error_response("Invalid operator verification capability", 403, code="operator_verification_denied")
         if _api_request_profile.get() is not None:
