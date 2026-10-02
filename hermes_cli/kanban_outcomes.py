@@ -25,6 +25,24 @@ def declared_check(config, original):
     return json.loads(manifest.read_text(encoding='utf8'))['checks'].get(original)
 
 
+def outcome_signature(declared):
+    return hashlib.sha256(json.dumps(declared,sort_keys=True,separators=(',',':')).encode()).hexdigest()
+
+
+def receipt_matches_declaration(report, declared):
+    """Old successes cannot certify a changed interface or outcome contract."""
+    if not report.get('passed') or report.get('kind')!=declared['kind']:return False
+    signature=report.get('outcome_check_sha256')
+    if signature:return signature==outcome_signature(declared)
+    # Compatibility is limited to an actual R17 primary HTTP drill against
+    # precisely the current client; earlier direct-client probes are stale.
+    if declared['kind'] not in ('conversation','dashboard') or not declared.get('primary_http_url'):return False
+    requests=report.get('requests') or []
+    return bool(report.get('actor')=='operator-verification'
+                and report.get('router_sha256')==declared.get('client_sha256')
+                and len(requests)>=6 and all(r.get('transport')=='primary-http' for r in requests))
+
+
 def _local_json(url):
     if urlparse(url).hostname not in ('localhost', '127.0.0.1', '::1'):
         raise ValueError('Outcome check must use the declared local service')
@@ -124,6 +142,7 @@ def verify_outcome(conn, task_id, run_id, config):
     except Exception as error:
         report = {'passed': False, 'failures': [str(error)[:500]], 'error_type': type(error).__name__}
     report.update(original_task_id=original, review_run_id=run_id,
+                  outcome_check_sha256=outcome_signature(declared),
                   started_at=started, ended_at=time.time(), kind=declared['kind'],
                   human_receipt='unobserved; not inferred')
     return report

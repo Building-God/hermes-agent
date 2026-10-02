@@ -486,8 +486,10 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
         if outcome and not failure:
             native=conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='operator_outcome_verified' AND id<? ORDER BY id DESC LIMIT 1",(tid,completed['run_id'],completed['id'])).fetchone()
             native_data=json.loads(native['payload'] or '{}') if native else {}
-            if not native_data.get('passed') or native_data.get('original_task_id')!=tid or native_data.get('kind')!=outcome['kind']:
+            from hermes_cli.kanban_outcomes import receipt_matches_declaration, outcome_signature
+            if native_data.get('original_task_id')!=tid or not receipt_matches_declaration(native_data,outcome):
                 failure='The declared original functional outcome has no native current-effects verification in its owned review run. Existing cycle, task-state or worker receipts cannot certify conversation or queue success. Reproduce the actual outcome; native completion will check it and return missing effects to the implementer.'
+                failure+=' Current declared outcome signature: '+outcome_signature(outcome)+'.'
         declared=(cfg.get('agent_owned_faults') or {}).get(tid,{})
         if not failure and declared.get('completed_event_id')==completed['id'] and declared.get('source') and declared.get('reason'):
             failure='Audit-proved invalid completion: '+str(declared['reason'])
