@@ -119,6 +119,17 @@ def test_operator_auth_fails_closed_on_expiry_identity_and_shared_ui_token(tmp_p
     assert not verifier.authorized("shared", tmp_path, now=100)
 
 
+def test_operator_capability_home_is_bound_to_serving_source_not_active_http_profile(tmp_path, monkeypatch):
+    home = tmp_path / "owner"
+    root = home / "releases/sealed-source"
+    monkeypatch.setattr(verifier, "__file__", str(root / "gateway/operator_discord_verifier.py"))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "different-profile"))
+    assert verifier.serving_home() == home
+    monkeypatch.setattr(verifier, "__file__", str(tmp_path / "unmanaged/gateway/operator_discord_verifier.py"))
+    with pytest.raises(ValueError, match="managed serving release"):
+        verifier.serving_home()
+
+
 @pytest.mark.asyncio
 async def test_endpoint_denies_missing_auth_and_arbitrary_identity_or_prompt(tmp_path, monkeypatch):
     from gateway.platforms.api_server import APIServerAdapter

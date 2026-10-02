@@ -25,6 +25,15 @@ _REPRODUCTION_SECONDS = 120
 _scope: ContextVar["Scope | None"] = ContextVar("operator_discord_capture", default=None)
 
 
+def serving_home() -> Path:
+    """Bind the capability to the sealed serving owner, outside HTTP profile scope."""
+    root = Path(__file__).resolve().parents[1]
+    home = root.parent.parent
+    if not root.is_relative_to(home / "releases"):
+        raise ValueError("Operator verification requires a managed serving release")
+    return home
+
+
 @dataclass
 class Scope:
     chat_id: str
