@@ -335,6 +335,9 @@ class _Collector:
             logger.debug("kanban notifier: cannot open board %s: %s", slug, exc)
             return
         try:
+            if self.include_unowned:
+                from hermes_cli.kanban_operator import enforce_acceptance_deadlines
+                enforce_acceptance_deadlines(conn)
             if self.gc_due:
                 self._gc_stale_subs(conn, slug)
             # No explicit init_db(): connect() already runs the migration once per
