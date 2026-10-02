@@ -2349,6 +2349,9 @@ class GatewayTurnMixin:
         validated through the SAME ``_get_platform_tools`` path (unknown / platform-restricted
         toolsets dropped, not trusted)."""
         from hermes_cli.tools_config import _get_platform_tools
+        from gateway.operator_discord_verifier import tool_free_capture
+        if tool_free_capture(source):
+            return []
         try:
             adapter = self._delivery_adapter_for(source)
             override = adapter.toolsets_for_source(source) if adapter is not None else None

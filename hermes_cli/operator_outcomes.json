@@ -4,11 +4,14 @@
   "scope": "Sealed defaults close the serving-before-policy race; native current effects required at completion, no worker receipt substitution",
   "checks": {
     "t_5cb8e6be": {
-      "client_path": "C:/Users/User/DiscordBots/Jarvis/hermes_dash_client.py",
-      "client_sha256": "2d4b24b6d77b42cb4ce309334b515aa46d06e5283c029767493fc484fe42447b",
       "kind": "conversation",
       "required_transport": "discord-front-door",
-      "primary_http_url": "http://127.0.0.1:7888/api/chat"
+      "discord_probe_url": "http://127.0.0.1:8642/api/operator/verify-discord",
+      "discord_origin": {
+        "author_id": "938599234989617222",
+        "channel_id": "1488868684830212276",
+        "message_id": "1555053191962427476"
+      }
     },
     "t_2932862d": {
       "client_path": "C:/Users/User/DiscordBots/Jarvis/hermes_dash_client.py",
