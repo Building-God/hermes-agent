@@ -251,6 +251,33 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
     runtime = max(60, int(cfg.get("attempt_seconds", 900)))
     deadline = max(runtime, int(cfg.get("request_seconds", 7200)))
     actions = []
+    # Correct the exact native timer defect once: an original-deadline stop
+    # clipped a later reviewer-created rework budget. Preserve both old clocks.
+    for tid in cfg.get('cohort_task_ids', []):
+        task=kb.get_task(conn,tid)
+        phase=_last(conn,tid,'operator_acceptance_recovery')
+        rework=_last(conn,tid,'operator_rework_due')
+        changes=_last(conn,tid,'changes_requested')
+        stop=audited_original_stop_event(conn,tid)
+        origin=conn.execute('SELECT 1 FROM task_user_origins WHERE task_id=?',(tid,)).fetchone()
+        if (not origin or not task or task.status!='blocked' or task.block_kind!='capability'
+            or task.claim_lock or task.result or not phase or not rework or not changes or not stop
+            or stop['kind']!='operator_request_stopped' or _payload(stop).get('owner')!='agent'
+            or not (phase['id']<changes['id']<rework['id']<stop['id'])
+            or _payload(rework).get('due_at',0)<=_payload(phase).get('due_at',0)
+            or _last(conn,tid,'operator_rework_clock_recovered')):
+            continue
+        stopped=conn.execute('SELECT created_at FROM task_events WHERE id=?',(stop['id'],)).fetchone()['created_at']
+        if not (_payload(phase).get('due_at',0)<=stopped<_payload(rework).get('due_at',0)):
+            continue
+        with kb.write_txn(conn):
+            changed=conn.execute("UPDATE tasks SET status='ready',block_kind=NULL WHERE id=? AND status='blocked' AND block_kind='capability' AND claim_lock IS NULL",(tid,)).rowcount
+            if not changed: continue
+            payload={'owner':'agent','source_stop_event_id':stop['id'],'source_rework_event_id':rework['id'],'source_changes_event_id':changes['id'],'due_at':now+runtime,'lifetime_limit':1,'reason':'Native original clock clipped the later rework clock; resume original implementer, preserve breached deadline and all history'}
+            kb._append_event(conn,tid,'operator_rework_clock_recovered',payload)
+            kb._append_event(conn,tid,'operator_acceptance_recovery',payload)
+            kb._append_event(conn,tid,'operator_rework_due',payload)
+        actions.append({'task_id':tid,'rework_clock_recovered':True})
     # Invalid acceptance cannot remain the card's canonical answer while its
     # correction is pending. Preserve exact prior text in durable evidence.
     for tid in cfg.get('cohort_task_ids',[]):
@@ -418,7 +445,8 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
             reviewer=acceptance_owner(conn,cfg,task.assignee)
             if reviewer==task.assignee:
                 raise ValueError('corrective acceptance reviewer must differ from the false-claim actor')
-            ok,reason=kb.request_review(conn,tid,reviewer=reviewer,summary=failure+' Independently verify objective outcome and issue a corrected substantive result in the original conversation. Do not repeat external effects.',resume_audited_origin=True,with_reason=True)
+            correction={'native_missing_outcome':{'source_completed_event_id':completed['id'],'reason':failure,'scope':'New native evidence requirement; transition authority only, current effects remain unproved'}}
+            ok,reason=kb.request_review(conn,tid,reviewer=reviewer,summary=failure+' Independently verify objective outcome and issue a corrected substantive result in the original conversation. Do not repeat external effects.',metadata={'acceptance_receipts':correction},resume_audited_origin=True,with_reason=True)
             if not ok:
                 raise ValueError(reason or 'native corrective review refused')
             with kb.write_txn(conn):
@@ -454,7 +482,10 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
         except Exception as error:
             _exception(conn,tid,"acceptance_recovery_failed",error=str(error)[:300])
     for event in conn.execute("SELECT e.* FROM task_events e JOIN tasks t ON t.id=e.task_id WHERE e.kind='operator_acceptance_recovery' AND t.status IN ('review','running') AND e.id=(SELECT MAX(latest.id) FROM task_events latest WHERE latest.task_id=e.task_id AND latest.kind='operator_acceptance_recovery')").fetchall():
-        info=_payload(event);tid=event["task_id"]
+        info=dict(_payload(event));tid=event["task_id"]
+        rework=_last(conn,tid,'operator_rework_due')
+        if rework and rework['id']>event['id']:
+            info['due_at']=max(info['due_at'],_payload(rework).get('due_at',0))
         if now < info["due_at"]:
             continue
         _exception(conn,tid,"acceptance_review_deadline_exceeded",due_at=info["due_at"])
@@ -648,6 +679,9 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
         # A rejected corrective review returns to ready. It retains this SAME
         # finite phase; the original deadline remains breached, never renewed.
         bounded_acceptance=acceptance_phase and row['status'] in ('ready','review','running') and now<_payload(acceptance_phase).get('due_at',0)
+        rework=_last(conn,tid,'operator_rework_due')
+        if acceptance_phase and rework and rework['id']>acceptance_phase['id'] and row['status'] in ('ready','review','running'):
+            bounded_acceptance=bounded_acceptance or now<_payload(rework).get('due_at',0)
         if now>=due and row['status'] in ('ready','running','review') and not bounded_acceptance:
             if row['status']=='running':
                 stopped=kb.block_task(conn,tid,reason='Agent-owned original request deadline exhausted; do not start another external action.',kind='capability')
