@@ -3821,6 +3821,13 @@ def block_task(
         returned=return_owned_review_failure(conn,task_id,reason,expected_run_id=expected_run_id,source='manual_block',kind=kind)
         if returned is not None:
             return returned
+    if kind == 'needs_input':
+        from hermes_cli.kanban_operator import policy
+        from hermes_cli.kanban_outcomes import declared_check
+        cfg = policy(conn)
+        outcome = declared_check(cfg, task_id) if cfg.get('enabled') else None
+        if outcome and outcome.get('kind') in ('conversation', 'dashboard', 'queue'):
+            raise ValueError('This original has a declared independently executable technical outcome. Deployment, testing and review remain agent-owned. Request independent review or retain an agent capability exception; Harry receipt is separate and never gates technical completion.')
     if kind in ('needs_input','dependency'):
         from hermes_cli.kanban_operator import policy,repair_descendant_hold
         repair = conn.execute("SELECT created_by FROM tasks WHERE id=?",(task_id,)).fetchone()

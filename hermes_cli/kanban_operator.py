@@ -444,6 +444,33 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
             actions.append(release_action)
     except Exception as error:
         actions.append({'exception':'release_entry_reconciliation_failed','owner':'agent','error':type(error).__name__})
+    # Exact newly audited human-handoff failures retain all spent attempts and
+    # historical deadlines. A changed native audit is transition evidence only.
+    for tid in cfg.get('cohort_task_ids', []):
+        task=kb.get_task(conn,tid);hold=_last_hold(conn,tid)
+        audit=(cfg.get('agent_owned_faults') or {}).get(tid,{})
+        from hermes_cli.kanban_outcomes import declared_check
+        outcome=declared_check(cfg,tid)
+        if (not task or task.status!='blocked' or task.block_kind!='needs_input' or task.claim_lock
+            or not hold or audit.get('blocked_event_id')!=hold['id'] or not audit.get('source') or not audit.get('reason')
+            or not outcome or outcome.get('kind') not in ('conversation','dashboard','queue')
+            or not conn.execute('SELECT 1 FROM task_user_origins WHERE task_id=?',(tid,)).fetchone()):continue
+        previous=conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='operator_original_agent_review_handoff'",(tid,)).fetchall()
+        if any(_payload(p).get('source_event_id')==hold['id'] for p in previous):continue
+        if len(previous)>=int(cfg.get('max_review_cycles',3)):
+            _exception(conn,tid,'original_agent_handoff_budget_exhausted',source_event_id=hold['id']);continue
+        try:
+            reviewer=acceptance_owner(conn,cfg,task.assignee)
+            with kb.write_txn(conn):
+                ok,reason=kb.request_review(conn,tid,reviewer=reviewer,
+                    summary='Audited agent-owned testing/release hold. Independently execute the original functional outcome, safely release authorised candidate work when needed, or return concrete changed-evidence rework. Never ask Harry to publish, run tests or verify technical effects. Preserve genuine billing/device choices and separate result receipt.',
+                    metadata={'acceptance_receipts':{'native_agent_hold_correction':{'source_event_id':hold['id'],'source':audit['source'],'reason':audit['reason'],'acceptance':'unproved'}}},resume_audited_origin=True,with_reason=True)
+                if not ok:raise ValueError(reason or 'original agent handoff refused')
+                phase={'owner':'agent','source_event_id':hold['id'],'due_at':now+runtime,'reviewer':reviewer,'acceptance':'unproved'}
+                kb._append_event(conn,tid,'operator_original_agent_review_handoff',phase)
+                kb._append_event(conn,tid,'operator_acceptance_recovery',phase)
+            actions.append({'task_id':tid,'original_agent_review_handoff':reviewer})
+        except Exception as error:_exception(conn,tid,'original_agent_review_handoff_failed',error=str(error)[:300])
     # Reconcile the observed false acceptance even when an earlier audit phase
     # completed. One corrective review, bounded independently, preserves effects.
     for tid in cfg.get('cohort_task_ids',[]):
@@ -485,7 +512,7 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
     # single native reviewer handoff; no original external action is replayed.
     for tid in cfg.get("cohort_task_ids",[]):
         row=kb.get_task(conn,tid)
-        if not row or row.claim_lock or _last(conn,tid,"operator_acceptance_recovery"):
+        if not row or row.claim_lock or _last(conn,tid,"operator_acceptance_recovery") or _last(conn,tid,'operator_original_agent_review_handoff'):
             continue
         completed=_last(conn,tid,"completed")
         declared=(cfg.get("agent_owned_faults") or {}).get(tid,{})
