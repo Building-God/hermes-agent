@@ -33,9 +33,24 @@ def repair_descendant_hold(conn,repair_id,reason):
     return any(ref!=repair_id and kb._would_cycle(conn,ref,repair_id) for ref in set(re.findall(r'\bt_[a-zA-Z0-9]+\b',str(reason or ''))))
 
 
+def original_fault(conn, task_id):
+    return conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind IN ('operator_dependency_fault','gave_up') ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()
+
+
+def current_repair(conn, event):
+    latest = _last(conn, event['task_id'], 'operator_repair_created')
+    fault = original_fault(conn, event['task_id'])
+    return bool(latest and latest['id'] == event['id'] and fault
+                and _payload(event).get('fault_event_id') == fault['id'])
+
+
+def repair_verified(conn, task_id, repair_id):
+    return conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='operator_repair_verified' AND CASE WHEN json_valid(payload) THEN json_extract(payload,'$.repair_task_id') END=? LIMIT 1", (task_id, repair_id)).fetchone() is not None
+
+
 def verified_repair_for_original(conn,original_id):
     event=_last(conn,original_id,'operator_repair_created')
-    if not event:
+    if not event or not current_repair(conn,event):
         return None
     repair_id=_payload(event).get('repair_task_id')
     repair=conn.execute('SELECT status FROM tasks WHERE id=?',(repair_id,)).fetchone()
@@ -46,7 +61,7 @@ def verified_repair_for_original(conn,original_id):
     implementer=_payload(review).get('implementer')
     run=conn.execute('SELECT profile FROM task_runs WHERE id=?',(completed['run_id'],)).fetchone()
     claim=conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed' ORDER BY id DESC LIMIT 1",(repair_id,completed['run_id'])).fetchone()
-    if not implementer or not isinstance(contract,dict) or contract.get('original_task_id')!=original_id or contract.get('owner')!='agent' or not payload.get('acceptance_receipts') or not run or run['profile']==implementer or not claim or json.loads(claim['payload'] or '{}').get('source_status')!='review':
+    if not implementer or not isinstance(contract,dict) or contract.get('original_task_id')!=original_id or contract.get('fault_event_id')!=_payload(event).get('fault_event_id') or contract.get('owner')!='agent' or not payload.get('acceptance_receipts') or not run or run['profile']==implementer or not claim or json.loads(claim['payload'] or '{}').get('source_status')!='review':
         return None
     return {'repair_task_id':repair_id,'review_run_id':completed['run_id']}
 
@@ -89,7 +104,7 @@ def repair_contract(conn, repair_id, *, audited_native_restoration=False):
     boundary=max(changes['id'] if changes else event['id'],review['id'] if review else event['id'])
     drift=conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='operator_repair_hold_reconciled' AND id>? ORDER BY id DESC LIMIT 1",(event['task_id'],boundary)).fetchone()
     restored=(audited_native_restoration and drift and _payload(drift).get('owner')=='agent' and _payload(drift).get('repair_task_id')==repair_id)
-    if original is None or original['status']!='blocked' or original['block_kind']!='dependency' or original['claim_lock'] is not None or (drift and not restored):
+    if not current_repair(conn,event) or original is None or original['status']!='blocked' or original['block_kind']!='dependency' or original['claim_lock'] is not None or (drift and not restored):
         return None,('Repair failed its native authority contract: keep the original agent-owned dependency hold until independent acceptance. '
                      'Do not relabel it needs_input or edit its row directly. Reproduce and repair the original requested outcome; '
                      'changing ownership flags or asking Harry for deployment/review is not acceptance.')
@@ -348,6 +363,7 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
     # A repair cannot depend on the failed original that is waiting for it.
     # Correct only the reverse edge identified by durable native repair origin.
     for event in conn.execute("SELECT * FROM task_events WHERE kind='operator_repair_created'").fetchall():
+        if not current_repair(conn,event):continue
         original_id=event['task_id'];repair_id=_payload(event).get('repair_task_id')
         if not repair_id:continue
         original=kb.get_task(conn,original_id);repair=kb.get_task(conn,repair_id)
@@ -763,13 +779,20 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
         tid = row["id"]
         if row['block_kind']=='capability' and not (_last(conn,tid,'operator_request_stopped') or _last(conn,tid,'operator_acceptance_stopped')):
             continue # Do not reinterpret unrelated auth/capability fences.
-        fault = _last(conn, tid, "operator_dependency_fault") or _last(conn, tid, "gave_up")
+        fault = original_fault(conn,tid)
         if not fault or (_payload(fault).get("sticky") and not _payload(fault).get("operator_rework")):
             continue
         if now - fault["created_at"] > int(cfg.get("repair_window_seconds", 172800)):
             continue
-        if _last(conn, tid, "operator_repair_created") or row["created_by"] == "operator-repair":
+        previous = conn.execute("SELECT * FROM task_events WHERE task_id=? AND kind='operator_repair_created' ORDER BY id",(tid,)).fetchall()
+        if row["created_by"] == "operator-repair" or any(_payload(event).get('fault_event_id') == fault['id'] for event in previous):
             continue
+        if len(previous) >= int(cfg.get('max_original_repairs',3)):
+            _exception(conn,tid,'repair_budget_exhausted',fault_event_id=fault['id'],attempts=len(previous))
+            continue
+        if any((child := kb.get_task(conn,_payload(event).get('repair_task_id'))) and
+               (child.claim_lock is not None or child.status not in ('done','archived','blocked')) for event in previous):
+            continue  # Do not overlap a previous worker or an unfenced failed claim.
         reason = _payload(fault).get("error", "automatic worker failure")
         body = (
             "## Task\nRepair the agent-owned failure on " + tid + ".\n"
@@ -789,12 +812,17 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
         except Exception as error:
             _exception(conn, tid, "repair_owner_unavailable", error=type(error).__name__)
             continue
-        repair = kb.create_task(conn, title="Repair execution failure: " + row["title"][:100],
-                                body=body, assignee=owner,
-                                created_by="operator-repair", goal_mode=True,
-                                max_runtime_seconds=runtime, max_retries=1,
-                                idempotency_key="operator-repair:" + tid, board=board)
         with kb.write_txn(conn):
+            current=kb.get_task(conn,tid)
+            latest=original_fault(conn,tid)
+            recorded=_last(conn,tid,'operator_repair_created')
+            if not current or current.status!='blocked' or current.claim_lock or not latest or latest['id']!=fault['id'] or (recorded and _payload(recorded).get('fault_event_id')==fault['id']):
+                continue
+            repair = kb.create_task(conn, title="Repair execution failure: " + row["title"][:100],
+                                    body=body, assignee=owner,
+                                    created_by="operator-repair", goal_mode=True,
+                                    max_runtime_seconds=runtime, max_retries=1,
+                                    idempotency_key="operator-repair:" + tid + ':' + str(fault['id']), board=board)
             kb._append_event(conn, tid, "operator_repair_created",
                              {"repair_task_id": repair, "fault_event_id": fault["id"],
                               "due_at": now + runtime, "owner": "agent"})
@@ -809,9 +837,13 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
         repair = kb.get_task(conn, info["repair_task_id"])
         if not repair:
             continue
+        if not current_repair(conn,event):
+            if repair.status not in ('done','archived','blocked') or repair.claim_lock is not None:
+                kb.block_task(conn,repair.id,reason='Superseded fault: this repair cannot accept or reopen the newer original failure.',kind='capability')
+            continue
         # Repair workers have direct terminal tools. Reconcile accidental raw
         # row edits with the durable hold instead of trusting a relabeled flag.
-        if not _last(conn,tid,"operator_repair_verified"):
+        if not repair_verified(conn,tid,repair.id):
             original=kb.get_task(conn,tid)
             hold=_last_hold(conn,tid)
             diagnosis=(cfg.get('agent_owned_faults') or {}).get(tid,{})
@@ -838,10 +870,10 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
             evidence = _payload(completed).get("acceptance_receipts")
             contract = _payload(completed).get('operator_repair_contract')
             claim = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed' ORDER BY id DESC LIMIT 1",(repair.id,completed["run_id"])).fetchone()
-            if not run or not implementer or run["profile"] == implementer or not evidence or not isinstance(contract,dict) or contract.get('original_task_id')!=tid or contract.get('owner')!='agent' or not claim or json.loads(claim["payload"] or "{}").get("source_status") != "review":
+            if not run or not implementer or run["profile"] == implementer or not evidence or not isinstance(contract,dict) or contract.get('original_task_id')!=tid or contract.get('fault_event_id')!=info.get('fault_event_id') or contract.get('owner')!='agent' or not claim or json.loads(claim["payload"] or "{}").get("source_status") != "review":
                 _exception(conn,tid,"repair_acceptance_unproved",repair_task_id=repair.id)
                 continue
-            if _last(conn,tid,'operator_repair_verified'):
+            if repair_verified(conn,tid,repair.id):
                 continue  # This one repair cannot repeatedly renew original execution.
             original_deadline=_last(conn,tid,'operator_deadline')
             if original_deadline and now>=_payload(original_deadline).get('due_at',0):
@@ -890,7 +922,8 @@ def _reconcile(conn, *, board=None, settings=None, now=None) -> list[dict]:
             phase_due=(_payload(review_handoff)["due_at"] if review_handoff else first_review["created_at"]+runtime) if first_review else info["due_at"]
             if now < phase_due:
                 continue
-            if not _last(conn, tid, "operator_repair_overdue"):
+            overdue=_last(conn,tid,'operator_repair_overdue')
+            if not overdue or _payload(overdue).get('repair_task_id')!=repair.id:
                 with kb.write_txn(conn):
                     kb._append_event(conn, tid, "operator_repair_overdue",
                                      {"repair_task_id": repair.id, "owner": "agent", "due_at": phase_due,"phase":"review" if first_review else "implementation"})
