@@ -2827,11 +2827,21 @@ def _tick_spawn_budget(
 
 def _lane_rows(conn: sqlite3.Connection, status: str) -> list[sqlite3.Row]:
     """Unclaimed rows of one lane in dispatch order."""
-    return conn.execute(
+    rows=conn.execute(
         "SELECT id, assignee FROM tasks "
         f"WHERE status = '{status}' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
+    if status=='ready':
+        from hermes_cli.kanban_operator import policy,_last,_payload
+        if policy(conn).get('enabled',False):
+            now=int(time.time())
+            def due(row):
+                event=_last(conn,row['id'],'operator_rework_due')
+                value=_payload(event).get('due_at',0)
+                return value if event and now<value else float('inf')
+            rows.sort(key=due)
+    return rows
 
 
 def _any_spawnable_review(
@@ -2840,6 +2850,7 @@ def _any_spawnable_review(
     *,
     per_profile_cap: Optional[int] = None,
     per_profile_running: Optional[dict[str, int]] = None,
+    lane: str = 'review',
 ) -> bool:
     """Mirror review dispatch gates before reserving ready-lane capacity.
 
@@ -2861,7 +2872,7 @@ def _any_spawnable_review(
             continue
         if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
             continue
-        if check_respawn_guard(conn, row["id"], lane="review", assignee=assignee) is None:
+        if check_respawn_guard(conn, row["id"], lane=lane, assignee=assignee) is None:
             return True
     return False
 
@@ -2952,10 +2963,16 @@ def _dispatch_once_locked(
     # backlog. When spawnable review work exists and there is any budget, hold
     # one slot back.
     ready_budget = spawn_budget
+    from hermes_cli.kanban_operator import policy,_last,_payload
+    urgent_ready=[]
+    if policy(conn).get('enabled',False):
+        now=int(time.time())
+        urgent_ready=[row for row in ready_rows if now<_payload(_last(conn,row['id'],'operator_rework_due')).get('due_at',0)]
+    native_rework_waiting=_any_spawnable_review(conn,urgent_ready,per_profile_cap=per_profile_cap,per_profile_running=per_profile_running,lane='ready')
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
         conn, review_rows,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
-    ):
+    ) and not (spawn_budget==1 and native_rework_waiting):
         ready_budget = max(spawn_budget - 1, 0)
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,

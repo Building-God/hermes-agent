@@ -860,7 +860,8 @@ def test_verified_late_repair_hands_original_to_acceptance_without_replaying_wor
     operator.reconcile(board,settings=settings,now=due+3)
     assert kb.get_task(board,tid).status=='ready'
     assert operator._payload(operator._last(board,tid,'operator_deadline'))['due_at']==due
-    operator.reconcile(board,settings=settings,now=phase['due_at']+1)
+    rework_due=operator._payload(operator._last(board,tid,'operator_rework_due'))['due_at']
+    operator.reconcile(board,settings=settings,now=rework_due+1)
     assert kb.get_task(board,tid).status=='blocked'
     assert kb.get_task(board,tid).block_kind!='needs_input'
 
@@ -1762,3 +1763,88 @@ def test_native_probe_uses_its_prepared_runtime_not_user_site_interpreter(monkey
     expected=Path(outcomes.__file__).resolve().parents[1]/'venv'/('Scripts/python.exe' if outcomes.os.name=='nt' else 'bin/python')
     assert seen[0][0][0]==str(expected)
     assert seen[0][0][1]=='-I' and seen[0][1]['timeout']==150
+
+
+@pytest.mark.parametrize('mode',['exact','human','outside','late','no_origin','already'])
+def test_native_clipped_rework_clock_recovers_once_without_resetting_original(board,monkeypatch,mode):
+    monkeypatch.setattr(kb.time,'time',lambda:150)
+    origin={'platform':'discord','chat_id':'c','message_id':'clock','user_id':'harry','text':'Repair fixture'}
+    tid=kb.create_task(board,title='real clipped fixture',assignee='pilot',user_origin=None if mode=='no_origin' else origin)
+    settings={'enabled':True,'cohort_task_ids':[] if mode=='outside' else [tid],'attempt_seconds':60,'request_seconds':120}
+    monkeypatch.setattr(operator,'policy',lambda conn:settings)
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'operator_deadline',{'due_at':1})
+        kb._append_event(board,tid,'operator_acceptance_recovery',{'owner':'agent','due_at':100})
+        kb._append_event(board,tid,'changes_requested',{'implementer':'pilot','reviewer':'reviewer','reason':'Missing real fixture effects'})
+        kb._append_event(board,tid,'operator_rework_due',{'owner':'agent','due_at':200})
+        board.execute("UPDATE tasks SET status='blocked',block_kind=? WHERE id=?",('needs_input' if mode=='human' else 'capability',tid))
+        kb._append_event(board,tid,'operator_request_stopped',{'owner':'agent','due_at':1})
+        if mode=='late':board.execute("UPDATE task_events SET created_at=201 WHERE task_id=? AND kind='operator_request_stopped'",(tid,))
+        if mode=='already':kb._append_event(board,tid,'operator_rework_clock_recovered',{'source_stop_event_id':1})
+    operator.reconcile(board,settings=settings,now=150)
+    repaired=operator._last(board,tid,'operator_rework_clock_recovered')
+    if mode!='exact':
+        assert not repaired or mode=='already'
+        return
+    assert kb.get_task(board,tid).status=='ready' and kb.get_task(board,tid).assignee=='pilot'
+    assert operator._payload(operator._last(board,tid,'operator_deadline'))['due_at']==1
+    assert operator._payload(repaired)['due_at']==210
+    operator.reconcile(board,settings=settings,now=151)
+    assert operator._last(board,tid,'operator_rework_clock_recovered')['id']==repaired['id']
+    operator.reconcile(board,settings=settings,now=211)
+    assert kb.get_task(board,tid).status=='blocked'
+    assert operator._last(board,tid,'operator_rework_clock_recovered')['id']==repaired['id']
+
+
+def test_native_single_slot_dispatch_selects_due_rework_before_review_backlog(board,monkeypatch):
+    ordinary=kb.create_task(board,title='ordinary backlog',assignee='pilot',priority=999)
+    urgent=kb.create_task(board,title='native rework',assignee='pilot',priority=1)
+    review=kb.create_task(board,title='review backlog',assignee='reviewer')
+    with kb.write_txn(board):
+        board.execute("UPDATE tasks SET status='ready' WHERE id IN (?,?)",(ordinary,urgent))
+        board.execute("UPDATE tasks SET status='review' WHERE id=?",(review,))
+        kb._append_event(board,urgent,'operator_rework_due',{'owner':'agent','due_at':int(kb.time.time())+60})
+    monkeypatch.setattr(operator,'policy',lambda conn:{'enabled':True})
+    monkeypatch.setattr(operator,'reconcile',lambda *a,**kw:[])
+    monkeypatch.setattr(dispatch,'_run_reclaim_phase',lambda *a,**kw:None)
+    monkeypatch.setattr(dispatch,'_tick_spawn_budget',lambda *a,**kw:(True,1))
+    monkeypatch.setattr(dispatch,'review_dispatch_enabled',lambda:True)
+    monkeypatch.setattr(dispatch,'check_respawn_guard',lambda *a,**kw:None)
+    seen=[]
+    def spawn(conn,row,assignee,result,**kwargs):
+        seen.append((row['id'],kwargs['lane']))
+        return True
+    monkeypatch.setattr(dispatch,'_dispatch_lane_task',spawn)
+    dispatch._dispatch_once_locked(board,max_spawn=1,max_in_progress=1,spawn_fn=lambda *a:None)
+    assert seen==[(urgent,'ready')]
+
+
+def test_missing_native_outcome_recheck_supplies_new_transition_evidence(board,monkeypatch):
+    tid,settings=accepted_origin(board,monkeypatch)
+    with kb.write_txn(board):
+        kb._append_event(board,tid,'changes_requested',{'reason':'old candidate required real change'})
+    settings['outcome_checks']={tid:{'kind':'queue','url':'http://127.0.0.1/fixture'}}
+    operator.reconcile(board,settings=settings)
+    assert kb.get_task(board,tid).status=='review'
+    handoff=operator._payload(operator._last(board,tid,'review_requested'))
+    receipt=handoff['acceptance_receipts']['native_missing_outcome']
+    assert receipt['source_completed_event_id'] and 'remain unproved' in receipt['scope']
+
+
+def test_original_clock_does_not_cut_off_active_implementer_rework(board,monkeypatch):
+    tid=kb.create_task(board,title='active original rework',assignee='pilot',user_origin={'platform':'discord','chat_id':'c','message_id':'active-clock','user_id':'harry','text':'Repair fixture'})
+    settings={'enabled':True,'cohort_task_ids':[tid],'attempt_seconds':60,'request_seconds':120}
+    monkeypatch.setattr(operator,'policy',lambda conn:settings)
+    monkeypatch.setattr(kb.time,'time',lambda:150)
+    with kb.write_txn(board):
+        board.execute("UPDATE tasks SET status='ready' WHERE id=?",(tid,))
+        kb._append_event(board,tid,'operator_deadline',{'due_at':1})
+        kb._append_event(board,tid,'operator_acceptance_recovery',{'owner':'agent','due_at':100})
+        kb._append_event(board,tid,'changes_requested',{'implementer':'pilot','reason':'Native missing fixture effect'})
+        kb._append_event(board,tid,'operator_rework_due',{'owner':'agent','due_at':200})
+    work=kb.claim_task(board,tid)
+    assert work
+    operator.reconcile(board,settings=settings,now=150)
+    assert kb.get_task(board,tid).status=='running'
+    assert operator._last(board,tid,'operator_acceptance_stopped') is None
+    assert operator._last(board,tid,'operator_request_stopped') is None
