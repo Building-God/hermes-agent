@@ -183,6 +183,9 @@ class DispatchResult:
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed for no heartbeat within ``dispatch_stale_timeout_seconds``."""
+    stalled: list[str] = field(default_factory=list)
+    """Task ids reclaimed for no durable progress (heartbeat AND checkpoint stale) within
+    ``progress_stall_seconds`` (the primary progress judge)."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error - also auto-blocked), ``"recent_success"`` (completed run
@@ -848,20 +851,43 @@ def heartbeat_worker(
     return True
 
 
-def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
+def _latest_progress_at(conn: sqlite3.Connection, task_id: str, last_heartbeat_at) -> int:
+    """Latest observed-progress timestamp for a running task (0 = never progressed).
+
+    Progress = the newer of the worker's ``last_heartbeat_at`` (auto-touched by the harness as a
+    side effect of real model API activity) and its newest durable checkpoint (manual or auto).
+    Either signal counts; a worker is only "stalled" when BOTH are stale.
+    """
+    hb = int(last_heartbeat_at) if last_heartbeat_at else 0
+    row = conn.execute(
+        "SELECT MAX(created_at) FROM task_checkpoints WHERE task_id = ?", (task_id,)
+    ).fetchone()
+    cp = int(row[0]) if row and row[0] is not None else 0
+    return max(hb, cp)
+
+
+def enforce_max_runtime(
+    conn: sqlite3.Connection, *, signal_fn=None, progress_stall_seconds: int = 0,
+) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
     SIGTERM, short grace, then SIGKILL. Emits ``timed_out`` and restores the
     task's source phase so the next tick re-spawns the same kind of worker -
     unless the circuit breaker already gave up, leaving it blocked. Host-local
     only (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a test hook.
+
+    Wall-clock is demoted to a BACKSTOP: when ``progress_stall_seconds > 0``, a worker that is
+    still making durable progress (fresh heartbeat or checkpoint) is NOT killed at the clock
+    boundary, so a long-but-progressing job runs to completion. Only a worker that is ALSO stalled
+    (no progress for ``progress_stall_seconds``) is reclaimed here; ``detect_stalled_workers`` is
+    the primary progress judge that fires before this backstop.
     """
     timed_out: list[str] = []
     now = int(time.time())
     host_prefix = _kb._host_prefix()
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.worker_started_at, "
+        "SELECT t.id, t.worker_pid, t.worker_started_at, t.last_heartbeat_at, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -880,6 +906,12 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         limit = int(row["max_runtime_seconds"])
         if elapsed < limit:
             continue
+        if progress_stall_seconds > 0:
+            # Demote wall-clock to a backstop: skip a worker that is still making durable
+            # progress, so a long job is not shot at the clock mid-step.
+            last_progress = _latest_progress_at(conn, row["id"], row["last_heartbeat_at"])
+            if last_progress and (now - last_progress) < progress_stall_seconds:
+                continue
 
         pid = int(row["worker_pid"])
         tid = row["id"]
@@ -943,6 +975,96 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
             )
     return timed_out
+
+
+def detect_stalled_workers(
+    conn: sqlite3.Connection, *, progress_stall_seconds: int = 0, signal_fn=None,
+) -> list[str]:
+    """Reclaim running workers that made NO durable progress (the PRIMARY progress judge).
+
+    A worker is "stalled" when it has been running at least ``progress_stall_seconds`` and its
+    newest observed-progress timestamp (heartbeat OR checkpoint) is older than
+    ``progress_stall_seconds``. Emits a ``stalled`` event with the reason recorded, closes the run
+    ``outcome='stalled'``, and returns the task to its source phase. ``0`` disables the check
+    (backward-compatible). A live host-local worker is terminated first; ``signal_fn`` is a test hook.
+    """
+    if progress_stall_seconds <= 0:
+        return []
+
+    now = int(time.time())
+    host_prefix = _kb._host_prefix()
+    stalled: list[str] = []
+
+    rows = conn.execute(
+        "SELECT t.id, t.worker_pid, t.worker_started_at, t.last_heartbeat_at, t.claim_lock, "
+        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+        "FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
+    ).fetchall()
+
+    for row in rows:
+        lock = row["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue
+        if row["active_started_at"] is None:
+            continue
+        elapsed = now - int(row["active_started_at"])
+        if elapsed < progress_stall_seconds:
+            continue
+        last_progress = _latest_progress_at(conn, row["id"], row["last_heartbeat_at"])
+        if last_progress and (now - last_progress) < progress_stall_seconds:
+            continue  # still making durable progress
+
+        pid = int(row["worker_pid"])
+        tid = row["id"]
+        started_at = _kb._row_get(row, "worker_started_at")
+        termination = _terminate_reclaimed_worker(
+            pid, lock, signal_fn=signal_fn, started_at=started_at,
+        )
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, tid, lock, now, termination,
+                reason="progress_stall_worker_alive",
+            )
+            continue
+
+        error = f"no progress for {progress_stall_seconds}s"
+        with _kb.write_txn(conn):
+            retry_status = _kb._retry_status_for_run(conn, tid)
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
+                "last_heartbeat_at = NULL "
+                "WHERE id = ? AND status = 'running' "
+                "  AND worker_pid = ? AND claim_lock IS ?",
+                (retry_status, tid, pid, lock),
+            )
+            if cur.rowcount == 1:
+                payload = {
+                    "pid": pid,
+                    "elapsed_seconds": int(elapsed),
+                    "progress_stall_seconds": progress_stall_seconds,
+                    "last_progress_at": last_progress or None,
+                    "retry_status": retry_status,
+                }
+                payload.update(termination)
+                run_id = _kb._end_run(
+                    conn, tid, outcome="stalled", status="stalled",
+                    error=error, metadata=payload,
+                )
+                _kb._append_event(conn, tid, "stalled", payload, run_id=run_id)
+                stalled.append(tid)
+        if cur.rowcount == 1:
+            _record_task_failure(
+                conn, tid,
+                error=error,
+                outcome="stalled",
+                release_claim=False,
+                end_run=False,
+                event_payload_extra={"pid": pid, "retry_status": retry_status},
+            )
+    return stalled
 
 
 # A running task with no heartbeat for this long is inactive regardless of
@@ -2348,6 +2470,25 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
+def configured_progress_stall_seconds() -> int:
+    """Read ``kanban.progress_stall_seconds`` from config, or 0 (off) when unset/invalid.
+
+    Shared so the standalone daemon and the gateway dispatcher agree on the progress
+    watchdog's stall threshold; ``0`` disables it and leaves wall-clock ``max_runtime_seconds``
+    as the only runtime kill.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("progress_stall_seconds")
+    except Exception:
+        return 0
+    try:
+        ival = int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+    return ival if ival >= 0 else 0
+
+
 def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Number of tasks in ``status='running'``.
 
@@ -2431,6 +2572,7 @@ def dispatch_once(
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
+    progress_stall_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
@@ -2454,6 +2596,7 @@ def dispatch_once(
             max_in_progress=max_in_progress,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
+            progress_stall_seconds=progress_stall_seconds,
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
@@ -2689,8 +2832,9 @@ def _run_reclaim_phase(
     failure_limit: int,
     reconcile_orphans: bool,
     board: Optional[str] = None,
+    progress_stall_seconds: int = 0,
 ) -> None:
-    """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
+    """Reclaim stale/orphaned/crashed/stalled/timed-out running tasks, then promote."""
     reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
@@ -2702,7 +2846,10 @@ def _run_reclaim_phase(
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
-    result.timed_out = enforce_max_runtime(conn)
+    # Progress-based watchdog is the PRIMARY judge: kill a worker that has made no durable
+    # progress (heartbeat AND checkpoint stale), then let the wall-clock backstop run.
+    result.stalled = detect_stalled_workers(conn, progress_stall_seconds=progress_stall_seconds)
+    result.timed_out = enforce_max_runtime(conn, progress_stall_seconds=progress_stall_seconds)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
@@ -2838,6 +2985,7 @@ def _dispatch_once_locked(
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
+    progress_stall_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
@@ -2852,6 +3000,7 @@ def _dispatch_once_locked(
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
+        progress_stall_seconds=progress_stall_seconds,
     )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
@@ -3523,12 +3672,14 @@ def run_daemon(
             # Re-resolved every tick (config load is mtime-cached) so operator
             # edits apply without a restart.
             max_in_progress = resolve_max_in_progress(configured_max_in_progress())
+            progress_stall_seconds = configured_progress_stall_seconds()
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
+                    progress_stall_seconds=progress_stall_seconds,
                 )
             if on_tick is not None:
                 with contextlib.suppress(Exception):

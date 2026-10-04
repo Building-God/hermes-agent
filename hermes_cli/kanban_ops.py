@@ -73,6 +73,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress = kbd.resolve_max_in_progress(
             kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
         )
+        # Progress-based watchdog (0 disables); mirrors the gateway dispatcher.
+        progress_stall_seconds = kbd._positive_int(
+            _kanban_cfg.get("progress_stall_seconds"), 0, minimum=0
+        )
         # CLI --max is the more explicit signal, so it wins over kanban.max_spawn.
         cli_max = getattr(args, "max", None)
         max_spawn = (
@@ -80,6 +84,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     except Exception:
         default_assignee = max_in_progress_per_profile = max_in_progress = None
+        progress_stall_seconds = 0
         max_spawn = getattr(args, "max", None)
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
@@ -90,11 +95,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            progress_stall_seconds=progress_stall_seconds,
         )
     if getattr(args, "json", False):
         _print_json({
             **{k: getattr(res, k)
-               for k in ("reclaimed", "crashed", "timed_out", "stale", "auto_blocked", "promoted",
+               for k in ("reclaimed", "crashed", "timed_out", "stale", "stalled", "auto_blocked", "promoted",
                          "reaped_terminal_workers")},
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws} for (tid, who, ws) in res.spawned

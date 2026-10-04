@@ -73,9 +73,14 @@ class ActivityTrackingMixin:
             # Never let the bridge break the loop; this guard covers import-time failures.
             with suppress(Exception):
                 from tools.kanban_tools import (
-                    heartbeat_current_worker_from_env, inject_new_comments_from_env
+                    checkpoint_current_worker_from_env,
+                    heartbeat_current_worker_from_env,
+                    inject_new_comments_from_env,
                 )
                 heartbeat_current_worker_from_env()
+                # Leave a durable progress checkpoint (rate-limited) so the
+                # dispatcher's progress watchdog can tell "progressing" from "stalled".
+                checkpoint_current_worker_from_env()
                 # Fold new operator notes into the running turn (OUT-OF-BAND steer).
                 inject_new_comments_from_env(self)
         if force_persist:

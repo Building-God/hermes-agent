@@ -1904,6 +1904,15 @@ DEFAULT_CONFIG = {
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
         "dispatch_stale_timeout_seconds": 14400,
+        # Progress-based watchdog (the PRIMARY kill judge): a running worker that has made no durable
+        # progress (no heartbeat AND no checkpoint) for this many seconds is reclaimed as a genuine
+        # stall, with the stall reason recorded. Wall-clock ``max_runtime_seconds`` is demoted to a
+        # backstop that only bites a worker that is ALSO stalled. 0 = off.
+        "progress_stall_seconds": 600,
+        # Harness auto-checkpoint cadence: a dispatcher-owned worker writes a durable progress
+        # checkpoint automatically (without calling the checkpoint API) at most this often, in seconds.
+        # 0 = off.
+        "checkpoint_interval_seconds": 60,
         # Each tick, requeue 'running' cards with broken claim bookkeeping (claim_lock or
         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
         # keeps orphans frozen for manual forensics.

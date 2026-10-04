@@ -592,6 +592,70 @@ def heartbeat_current_worker_from_env() -> bool:
         return False
 
 
+# Harness auto-checkpoint: a dispatcher-owned worker leaves a durable
+# ``task_checkpoints`` row automatically (no checkpoint API call) so the
+# dispatcher's progress watchdog can tell "still progressing" from "stalled".
+_AUTO_CHECKPOINT_FALLBACK_INTERVAL_SECONDS = 60.0
+_auto_checkpoint_last_attempt: float = 0.0
+
+
+def _auto_checkpoint_interval_seconds() -> float:
+    """``kanban.checkpoint_interval_seconds`` from config, else the 60s fallback.
+
+    ``<= 0`` disables auto-checkpoints. Read lazily so ``tools/`` never imports
+    CLI config at import time; any read failure falls back to the default.
+    """
+    try:
+        import hermes_cli.config as cfgmod
+        raw = ((cfgmod.load_config_readonly() or {}).get("kanban") or {}).get(
+            "checkpoint_interval_seconds")
+        val = float(raw) if raw is not None else _AUTO_CHECKPOINT_FALLBACK_INTERVAL_SECONDS
+        return val
+    except Exception:
+        return _AUTO_CHECKPOINT_FALLBACK_INTERVAL_SECONDS
+
+
+def checkpoint_current_worker_from_env() -> bool:
+    """Write a durable auto-checkpoint for the current worker; True iff it lands.
+
+    Mirrors the auto-heartbeat bridge: rate-limited by
+    ``kanban.checkpoint_interval_seconds`` (default 60s, 0 off), best-effort, never
+    raises, and refused for delegate children. The progress payload carries only
+    ``{"_auto": True}`` - the row's ``created_at`` is the progress timestamp the
+    dispatcher watches, so a worker need never call ``kanban_checkpoint`` itself.
+    """
+    global _auto_checkpoint_last_attempt
+    tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not tid:
+        return False
+    if _is_delegated_child_context():
+        return False
+    interval = _auto_checkpoint_interval_seconds()
+    if interval <= 0:
+        return False
+    now = time.monotonic()
+    if (now - _auto_checkpoint_last_attempt) < interval:
+        return False
+    _auto_checkpoint_last_attempt = now
+    run_id = _worker_run_id(tid)
+    if run_id is None:
+        return False
+    try:
+        with _board(None, quiet_close=True) as (kb, conn):
+            # Only this worker's own current running attempt may leave a trail;
+            # a reclaimed stale run must not append to a live successor's card.
+            task = kb.get_task(conn, tid)
+            if task is None or task.status != "running" or task.current_run_id != run_id:
+                return False
+            kb.save_task_checkpoint(
+                conn, tid, expected_run_id=run_id, progress={"_auto": True},
+            )
+        return True
+    except Exception:
+        logger.debug("auto-checkpoint: bridge failed", exc_info=True)
+        return False
+
+
 # Live operator-note injection: poll the task for new comments and steer them in
 # OUT-OF-BAND, so a user can talk to a running task without block → comment → unblock.
 # Watermarked per task (seeded on first poll: that history is already in the context).

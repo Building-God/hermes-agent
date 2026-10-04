@@ -42,6 +42,7 @@ class _DispatcherSettings:
     reconcile_orphans: bool
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    progress_stall_seconds: int = 0
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -92,6 +93,18 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
                        "disabling stale detection", raw_stale)
         stale_timeout_seconds = 0
 
+    # Progress-based watchdog (the PRIMARY kill judge): a running worker with no
+    # durable progress (heartbeat AND checkpoint stale) for this many seconds is
+    # reclaimed as a genuine stall. 0 disables the progress watchdog (and leaves
+    # wall-clock ``max_runtime_seconds`` as the only runtime kill).
+    raw_stall = kanban_cfg.get("progress_stall_seconds", 0)
+    try:
+        progress_stall_seconds = int(raw_stall or 0)
+    except (TypeError, ValueError):
+        logger.warning("kanban dispatcher: invalid kanban.progress_stall_seconds=%r; "
+                       "disabling the progress watchdog", raw_stall)
+        progress_stall_seconds = 0
+
     # Fallback profile for tasks created without an assignee (e.g. via the
     # dashboard). Empty (the schema default) keeps skipping them.
     # When set, the dispatcher applies it to unassigned ready tasks instead of skipping them indefinitely
@@ -108,6 +121,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         max_in_progress=effective_max_in_progress,
         failure_limit=failure_limit,
         stale_timeout_seconds=stale_timeout_seconds,
+        progress_stall_seconds=progress_stall_seconds,
         # Requeue 'running' cards with broken claim bookkeeping (zombie-card
         # reconciliation); false keeps orphans frozen for manual forensics.
         reconcile_orphans=bool(kanban_cfg.get("reconcile_orphans", True)),
@@ -347,9 +361,10 @@ def _log_spawn_results(results: Optional[list]) -> bool:
             # Quiet by default: an idle gateway stays silent.
             logger.info(
                 "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
+                "crashed=%d stalled=%d timed_out=%d promoted=%d auto_blocked=%d",
                 slug, len(res.spawned), res.reclaimed,
                 len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
+                len(getattr(res, "stalled", [])) if getattr(res, "stalled", None) is not None else 0,
                 len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
                 res.promoted,
                 len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
