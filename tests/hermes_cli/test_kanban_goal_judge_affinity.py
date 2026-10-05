@@ -108,5 +108,7 @@ def test_goal_loop_judge_binds_per_task_affinity_scope():
             first_response="first",
         )
     assert result["outcome"] == "blocked_budget"
-    assert seen == ["kanban:task-7", "kanban:task-7"]
+    # Every between-turns judge call (including auto-resume re-judges) must run
+    # under the per-task scope; a bound scope is never leaked.
+    assert seen and all(s == "kanban:task-7" for s in seen)
     assert get_affinity_scope() is None
