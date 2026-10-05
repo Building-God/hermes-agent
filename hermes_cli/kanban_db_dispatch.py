@@ -108,6 +108,66 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
 )
 
 
+# Sticky human-gate block kinds: a worker parked the card to wait on Harry
+# (``kanban_block(kind='needs_input')`` or a capability gap that needs a human).
+# A "do it now" tap unblocks these and must RESUME the paused worker, not
+# cold-re-dispatch it.
+_HUMAN_GATE_BLOCK_KINDS = frozenset({"needs_input", "capability"})
+
+
+@dataclass
+class ResumeContext:
+    """Whether a ready task is a human-tap RESUME of a parked worker, plus the
+    link that proves session continuity (``resume_of`` = the blocked run id)."""
+
+    is_resume: bool = False
+    resume_of: Optional[int] = None
+
+
+def resume_context(conn: sqlite3.Connection, task_id: str) -> "ResumeContext":
+    """Detect a "do it now" resume: a ``needs_input``/``capability``-blocked card
+    whose human ``unblocked`` tap is still the newest lifecycle signal (i.e. the
+    task has been unblocked since its last block).
+
+    The tap must hand back to the SAME worker's saved context (warm), not spin
+    up a cold ``work kanban task`` run. ``block_kind`` survives the unblock
+    (only ``complete_task`` clears it), so ``block_kind in _HUMAN_GATE_BLOCK_KINDS``
+    plus an ``unblocked`` event NEWER than the last ``blocked`` event is exactly
+    the "just tapped" window. This is checked by event ordering, not "latest
+    event == unblocked", because the dispatcher's own ``claim`` appends a
+    ``claimed`` event after the tap and would otherwise mask the resume.
+    """
+    row = conn.execute(
+        "SELECT block_kind FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None or row["block_kind"] not in _HUMAN_GATE_BLOCK_KINDS:
+        return ResumeContext()
+    last_unblocked = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? AND kind = 'unblocked' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if last_unblocked is None:
+        return ResumeContext()
+    last_blocked = conn.execute(
+        "SELECT id FROM task_events WHERE task_id = ? AND kind = 'blocked' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if last_blocked is not None and last_blocked["id"] >= last_unblocked["id"]:
+        # Still parked (or re-blocked after the tap): no warm resume yet.
+        return ResumeContext()
+    resume_of = None
+    run_row = conn.execute(
+        "SELECT id FROM task_runs WHERE task_id = ? AND outcome = 'blocked' "
+        "ORDER BY ended_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if run_row is not None:
+        resume_of = int(run_row["id"])
+    return ResumeContext(is_resume=True, resume_of=resume_of)
+
+
 @dataclass
 class DispatchResult:
     """Outcome of a single ``dispatch`` pass.
@@ -2199,14 +2259,27 @@ def dispatch_once(
     return result
 
 
-def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
+def _call_spawn_fn(
+    spawn_fn,
+    task: Task,
+    workspace: str,
+    board: Optional[str],
+    resume_ctx: Optional[ResumeContext] = None,
+) -> Optional[int]:
     """Back-compat: older spawn_fn signatures (and test stubs) accept only
-    ``(task, workspace)``; pass ``board`` only when the callable supports it."""
+    ``(task, workspace)``; pass ``board``/``resume_ctx`` only when the callable
+    supports them."""
     import inspect
     try:
         sig = inspect.signature(spawn_fn)
-        if "board" in sig.parameters:
-            return spawn_fn(task, workspace, board=board)
+        params = sig.parameters
+        kwargs = {}
+        if "board" in params:
+            kwargs["board"] = board
+        if "resume_ctx" in params:
+            kwargs["resume_ctx"] = resume_ctx
+        if kwargs:
+            return spawn_fn(task, workspace, **kwargs)
         return spawn_fn(task, workspace)
     except (TypeError, ValueError):
         return spawn_fn(task, workspace)
@@ -2313,8 +2386,15 @@ def _dispatch_lane_task(
     # LiteLLM fallback: when the (profile, provider) circuit is OPEN,
     # route this worker through the LiteLLM proxy instead of the primary provider.
     _apply_litellm_fallback(conn, claimed)
+    # A human "do it now" tap on a needs_input/capability-parked card must
+    # RESUME the paused worker (warm context) rather than cold re-dispatch.
+    # Review-lane spawns are never resumes (they are the review input itself).
+    resume_ctx = resume_context(conn, claimed.id) if lane == "ready" else None
     try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+        pid = _call_spawn_fn(
+            spawn_fn if spawn_fn is not None else _default_spawn,
+            claimed, str(workspace), board, resume_ctx=resume_ctx,
+        )
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
@@ -2933,7 +3013,12 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _kb._log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
-def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
+def _worker_argv(
+    task: Task,
+    profile_arg: str,
+    hermes_home: Optional[str],
+    resume_ctx: Optional[ResumeContext] = None,
+) -> list[str]:
     """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
     cmd = [
         *_resolve_hermes_argv(),
@@ -2964,7 +3049,22 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
+    # A human "do it now" tap resumes the paused worker with its half-done
+    # context still warm, instead of cold re-dispatching (which is why "nothing
+    # happens" after Harry clicks ready). The resume prompt tells the worker to
+    # continue from the latest comments (the tap answer) and its prior
+    # checkpoint rather than re-read everything from scratch.
+    if resume_ctx is not None and resume_ctx.is_resume:
+        prompt = (
+            f"resume kanban task {task.id} - this card was parked waiting on a "
+            "human, and they have just unblocked it (a 'do it now' tap). Pick up "
+            "where the previous run left off instead of re-orienting from zero: "
+            "read the newest comments for the human's answer, load your prior "
+            "checkpoint, and continue that work to completion now."
+        )
+    else:
+        prompt = f"work kanban task {task.id}"
+    cmd.extend(["chat", "-q", prompt])
     # goal_mode rides the same `-q` path: cli.py runs the judge loop there too, so the
     # worker log keeps its live tool feed (forcing -Q blanked it).
     return cmd
@@ -3021,7 +3121,13 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     ).argv
 
 
-def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
+def _default_spawn(
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+    resume_ctx: Optional[ResumeContext] = None,
+) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
     Returns the child's PID so the dispatcher can detect crashes before the
@@ -3130,7 +3236,15 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    # A human "do it now" tap hands back to the warm worker: mark the child so
+    # its prompt/session can be traced (HERMES_KANBAN_RESUME) and link it to the
+    # run it is resuming (HERMES_KANBAN_RESUME_OF) for session-continuity proof.
+    if resume_ctx is not None and resume_ctx.is_resume:
+        env["HERMES_KANBAN_RESUME"] = "1"
+        if resume_ctx.resume_of is not None:
+            env["HERMES_KANBAN_RESUME_OF"] = str(resume_ctx.resume_of)
+
+    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"), resume_ctx)
     # The module argv must carry the import context that made it resolvable:
     # the shim's in-process path injection is invisible to the bare child.
     _propagate_module_import_root(cmd, env)
