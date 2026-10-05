@@ -57,14 +57,77 @@ class GatewayKanbanWatchersMixin:
             await asyncio.sleep(min(1.0, interval - slept))
             slept += 1.0
 
+    def _dispatcher_wake_event(self) -> asyncio.Event:
+        """The shared event the notifier sets to wake the dispatcher immediately.
+
+        Created lazily on first use (``asyncio.Event`` is loop-agnostic until
+        awaited, so either watcher may touch it first). One event per gateway
+        process: the notifier and dispatcher loops are sibling tasks on the
+        same loop, so a plain in-process Event is the whole channel - no new
+        queue, scheduler or notification path.
+        """
+        ev = getattr(self, "_kanban_dispatcher_wake", None)
+        if ev is None:
+            ev = asyncio.Event()
+            self._kanban_dispatcher_wake = ev
+        return ev
+
+    def _signal_dispatcher_wake(self) -> None:
+        """Wake the embedded dispatcher so it ticks NOW instead of at the next poll.
+
+        Idempotent: setting an already-set event is a no-op, so several terminal
+        events (a completion, a tap, a merge) coalesce into one immediate tick
+        and the dispatcher's own ready-queue drain keeps dedupe - one completion
+        fires one continuation - inside the existing dispatch fence. Never
+        re-entrant: the dispatcher consumes the edge before ticking.
+        """
+        self._dispatcher_wake_event().set()
+
+    async def _sleep_between_ticks_or_wake(self, interval: float) -> None:
+        """Sleep *interval* (floored to 1s), but return EARLY when woken.
+
+        The event-driven counterpart to :meth:`_sleep_between_ticks`: instead of
+        a bare poll sleep, each 1s slice races ``asyncio.sleep`` against the wake
+        event, so a completion / tap / merge interrupts the slice and returns
+        control to the dispatcher loop immediately - no waiting out the interval,
+        and ``stop()`` still lands within 1s via the ``self._running`` guard and
+        the 1s slice bound.
+        """
+        interval = max(interval, 1.0)
+        wake = self._dispatcher_wake_event()
+        slept = 0.0
+        while slept < interval and self._running and not wake.is_set():
+            chunk = min(1.0, interval - slept)
+            sleep_task = asyncio.create_task(asyncio.sleep(chunk))
+            wake_task = asyncio.create_task(wake.wait())
+            _done, pending = await asyncio.wait(
+                {sleep_task, wake_task}, return_when=asyncio.FIRST_COMPLETED,
+            )
+            # Cancel and drain the losing task so it can't outlive the slice as
+            # a pending task (which would warn on GC) before the next slice
+            # re-creates it.
+            for task in pending:
+                task.cancel()
+            for task in pending:
+                try:
+                    await task
+                except BaseException:
+                    pass
+            if not wake.is_set():
+                slept += chunk
+        # Consume a wake edge that fired during the wait (idempotent set; clear
+        # so one signal yields one immediate tick and a later signal still fires).
+        if wake.is_set():
+            wake.clear()
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
         Per subscription, claims ``task_events`` newer than the stored cursor
         (kinds in TERMINAL_KINDS), sends one message per event, then advances
         the cursor. The subscription is removed only when the task is
-        ``archived``: ``done`` is reversible, so the cursor — not unsubscribing
-        — is the dedup mechanism (unsub-on-terminal dropped users when the
+        ``archived``: ``done`` is reversible, so the cursor - not unsubscribing
+        - is the dedup mechanism (unsub-on-terminal dropped users when the
         dispatcher respawned a crashed task). All SQLite work runs in a thread;
         one tick's failure never stops the next.
         """
@@ -97,7 +160,7 @@ class GatewayKanbanWatchersMixin:
 
         # Stale done-sub GC: subs survive ``done``, so boards that never
         # archive would accumulate rows scanned every tick. One DELETE per
-        # board, at startup (0 → first tick) and at most hourly.
+        # board, at startup (0 -> first tick) and at most hourly.
         _gc_next_at = 0.0
 
         while self._running:
@@ -116,6 +179,14 @@ class GatewayKanbanWatchersMixin:
                     await _KanbanNotification(
                         self, d, platform_cls=_Platform, sub_fail_counts=sub_fail_counts,
                     ).deliver()
+                if deliveries:
+                    # A terminal event was just claimed (completion, block,
+                    # unblock, review_requested, changes_requested, ...): the
+                    # dispatcher may now have a continuation to fire (promote
+                    # gated children, dispatch a reviewer, resume a tapped card).
+                    # Wake it so that continuation runs NOW instead of waiting
+                    # for the next dispatch_interval_seconds poll.
+                    self._signal_dispatcher_wake()
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
             await self._sleep_between_ticks(interval)
@@ -255,7 +326,7 @@ class GatewayKanbanWatchersMixin:
         return _load_config, _kb, kanban_cfg
 
     async def _kanban_dispatcher_watcher(self) -> None:
-        """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
+        """Embedded kanban dispatcher - one tick every `dispatch_interval_seconds`.
 
         Gated by `kanban.dispatch_in_gateway` (default True); when false the
         loop exits and an external `hermes kanban daemon` is expected. Each
@@ -274,7 +345,7 @@ class GatewayKanbanWatchersMixin:
         await asyncio.sleep(5)
 
         # Health telemetry (mirrors `_cmd_daemon`): warn when the ready queue
-        # is non-empty but spawns are 0 for N consecutive ticks — usually a
+        # is non-empty but spawns are 0 for N consecutive ticks - usually a
         # broken PATH, missing venv, or credential loss.
         bad_ticks = 0
         last_warn_at = 0
@@ -283,6 +354,7 @@ class GatewayKanbanWatchersMixin:
 
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
         while self._running:
+            any_spawned = False
             try:
                 # Reap zombies before per-board work so a board DB failure
                 # cannot block cleanup of unrelated workers.
@@ -327,6 +399,14 @@ class GatewayKanbanWatchersMixin:
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
 
-            await self._sleep_between_ticks(interval)
+            if any_spawned:
+                # Event-driven drain: a spawn this tick means the ready queue was
+                # non-empty. Run the next tick immediately instead of sleeping a
+                # full interval so a fan-out (or the per-tick max_spawn cap)
+                # empties NOW rather than trickling one worker per poll. Bounded:
+                # `any_spawned` is only true when a worker actually spawned, so
+                # this cannot tight-loop on a permanently-stuck queue.
+                continue
+            await self._sleep_between_ticks_or_wake(interval)
 
         self._release_kanban_dispatcher_lock()
