@@ -1,8 +1,8 @@
-"""Persistent session goals — the Ralph loop for Hermes.
+"""Persistent session goals - the Ralph loop for Hermes.
 
 A goal is a free-form objective that stays active across turns; after each turn an auxiliary-model
 judge decides whether it is satisfied. The continuation prompt is a normal user message appended via
-``run_conversation`` (no system-prompt mutation or toolset swap — prompt caching stays intact). Judge
+``run_conversation`` (no system-prompt mutation or toolset swap - prompt caching stays intact). Judge
 failures are fail-OPEN (``continue``); the turn budget is the backstop.
 """
 
@@ -30,6 +30,14 @@ logger = logging.getLogger(__name__)
 # ── Constants & defaults ──────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
+# How many times the kanban goal loop may auto-resume (reset its turn budget) after
+# exhausting ``goal_max_turns`` before it gives up and surfaces ONE honest
+# "still not done" block to a human. Mirrors the native /goal "budget -> pause ->
+# /goal resume" boundary, but the kanban loop AUTO-resumes (resume the same goal)
+# instead of parking the card in triage. Each resume keeps the same warm worker and
+# its context; state continuity across a worker death is carried by the auto-checkpoint
+# work (task_checkpoints), not by re-reading the card from scratch.
+DEFAULT_GOAL_RESUME_LIMIT = 3
 DEFAULT_JUDGE_TIMEOUT = 30.0
 # Judge output budget. Reasoning models burn hidden-reasoning tokens before the visible one-line
 # JSON verdict; 200 (the original) reliably truncated it and tripped the auto-pause. 4096 covers
@@ -38,7 +46,7 @@ DEFAULT_JUDGE_MAX_TOKENS = 4096
 # Cap how much of the last response we send to the judge.
 _JUDGE_RESPONSE_SNIPPET_CHARS = 4000
 # Consecutive judge *parse* failures (empty / non-JSON) before the loop auto-pauses and points at
-# the goal_judge config. API/transport errors do NOT count — those are tracked separately below.
+# the goal_judge config. API/transport errors do NOT count - those are tracked separately below.
 # Guards against small models that cannot follow the strict JSON contract burning the whole budget.
 DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 # Consecutive transport failures (401, timeout, DNS) before auto-pause: a broken API key returns
@@ -46,7 +54,7 @@ DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES = 3
 DEFAULT_MAX_CONSECUTIVE_TRANSPORT_FAILURES = 5
 
 # Quality gates: deterministic shell commands that must pass before the judge may declare DONE. A
-# failed gate short-circuits the judge — its output IS the continuation prompt, so the agent works
+# failed gate short-circuits the judge - its output IS the continuation prompt, so the agent works
 # on concrete evidence instead of a vibe check.
 DEFAULT_GATE_TIMEOUT_SECONDS = 300
 DEFAULT_GATE_MAX_RETRIES = 3
@@ -66,7 +74,7 @@ CONTINUATION_PROMPT_TEMPLATE = (
 )
 
 # With a completion contract: the block tells the agent what "done" means, how to prove it, what
-# not to break, scope, and when to stop — so it targets the verification surface.
+# not to break, scope, and when to stop - so it targets the verification surface.
 CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "[Continuing toward your standing goal]\n"
     "Goal: {goal}\n\n"
@@ -95,7 +103,7 @@ CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
 
 # Fed back when a quality gate fails: bounded output is the evidence to repair against (no judge).
 CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE = (
-    "[Continuing toward your standing goal — a quality gate failed]\n"
+    "[Continuing toward your standing goal - a quality gate failed]\n"
     "Goal: {goal}\n\n"
     "The quality gate command below must pass before this goal can be "
     "declared done, and it just failed (attempt {attempt}/{max_retries}):\n"
@@ -113,52 +121,52 @@ CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE = (
 JUDGE_SYSTEM_PROMPT = (
     "You are a strict judge evaluating whether an autonomous agent has "
     "achieved a user's stated goal. You receive the goal text, the agent's "
-    "most recent response, and — when present — a list of background "
+    "most recent response, and - when present - a list of background "
     "processes the agent has running. Decide one of four verdicts.\n\n"
-    "DONE — the goal is fully satisfied:\n"
+    "DONE - the goal is fully satisfied:\n"
     "- The response explicitly confirms the goal was completed, OR\n"
     "- The response clearly shows the final deliverable was produced.\n"
     "DONE requires the deliverable to actually exist. If the response only "
     "explains why the goal cannot be reached, the verdict is BLOCKED, not "
     "DONE.\n\n"
-    "BLOCKED — the goal cannot be satisfied as stated:\n"
+    "BLOCKED - the goal cannot be satisfied as stated:\n"
     "- The response explains the goal is genuinely unachievable (impossible, "
     "out of scope, no valid path to the deliverable), or refuses to "
     "fabricate a deliverable that cannot exist, OR\n"
     "- The response explains progress is blocked and the next step needs "
     "user input to proceed.\n"
     "Return BLOCKED with the reason describing what is blocking. BLOCKED is "
-    "a refusal, not a completion — never return BLOCKED for a goal that "
+    "a refusal, not a completion - never return BLOCKED for a goal that "
     "was achieved.\n"
     "When the block is an error the agent hit (an HTTP status, an API, "
     "sign-in or token failure), quote the error text verbatim in the reason "
     "and attribute it only to a provider, service or credential the response "
-    "itself names. Never infer one the response does not name — an unnamed "
+    "itself names. Never infer one the response does not name - an unnamed "
     "401 belongs to the model provider the agent was calling, not to some "
     "other service's token.\n\n"
-    "WAIT — the goal is NOT done, but the next step is to wait for async "
+    "WAIT - the goal is NOT done, but the next step is to wait for async "
     "work to finish rather than act again. Choose this ONLY when the agent's "
     "progress is genuinely gated on something running on its own:\n"
     "- A background process listed below is still running AND the response "
     "shows the agent is waiting on its result (e.g. a CI poller, build, "
     "test run, deploy). If the process has a session id, return it in "
-    "``wait_on_session`` — that releases when the process exits OR its "
+    "``wait_on_session`` - that releases when the process exits OR its "
     "watch_patterns trigger fires (use this for a long-lived watcher that "
     "signals mid-run and may never exit). Otherwise return its pid in "
     "``wait_on_pid`` (releases on exit only).\n"
     "- The agent says it is rate-limited / backing off / must wait a fixed "
-    "period — return seconds in ``wait_for_seconds``.\n"
+    "period - return seconds in ``wait_for_seconds``.\n"
     "- The agent has delegated subagents still running (stated below as "
     "active delegations) and the response says it is waiting on them with "
-    "nothing else dispatchable — return ``wait_for_seconds`` between 600 and "
+    "nothing else dispatchable - return ``wait_for_seconds`` between 600 and "
     "1800. Their results wake the agent on their own; re-poking it now only "
     "produces a status recap.\n"
     "Picking WAIT parks the loop without burning a turn; it resumes "
     "automatically when the pid exits or the time elapses. Do NOT pick WAIT "
-    "just because work remains — only when re-poking now would be pure "
+    "just because work remains - only when re-poking now would be pure "
     "busy-work because the agent can't progress until the async thing "
     "finishes.\n\n"
-    "CONTINUE — not done, and there is a concrete next step the agent can "
+    "CONTINUE - not done, and there is a concrete next step the agent can "
     "take right now. This is the default when in doubt.\n\n"
     "Reply ONLY with a single JSON object on one line. Shapes:\n"
     '{"verdict": "done", "reason": "<one sentence>"}\n'
@@ -188,7 +196,7 @@ JUDGE_USER_PROMPT_TEMPLATE = (
     "Agent's most recent response:\n{response}\n\n"
     "{background_block}"
     "Current time: {current_time}\n\n"
-    "Is the goal satisfied — done, blocked, continue, or wait?"
+    "Is the goal satisfied - done, blocked, continue, or wait?"
 )
 
 # With /subgoal criteria: the judge must see ALL of them met, not just the original goal.
@@ -202,10 +210,10 @@ JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "Decision: For each numbered criterion above, find concrete "
     "evidence in the agent's response that the criterion is "
     "satisfied. Do not accept generic phrases like 'all requirements "
-    "met' or 'implying it was done' — require specific evidence (a "
+    "met' or 'implying it was done' - require specific evidence (a "
     "file contents excerpt, an output line, a command result). If "
     "ANY criterion lacks specific evidence in the response, the goal "
-    "is NOT done — return CONTINUE (or WAIT if blocked on a listed "
+    "is NOT done - return CONTINUE (or WAIT if blocked on a listed "
     "background process).\n\n"
     "Is the goal AND every additional criterion satisfied?"
 )
@@ -221,18 +229,18 @@ JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE = (
     "Decision rules:\n"
     "- The goal is DONE only when the Verification criterion is satisfied AND "
     "the response shows concrete evidence of it (a command result, file "
-    "contents excerpt, test/benchmark output) — not a claim like 'done' or "
+    "contents excerpt, test/benchmark output) - not a claim like 'done' or "
     "'all tests pass' without evidence.\n"
-    "- If any stated Constraint was violated, the goal is NOT done — CONTINUE.\n"
+    "- If any stated Constraint was violated, the goal is NOT done - CONTINUE.\n"
     "- If the response shows the agent is waiting on a listed background "
     "process to satisfy the Verification criterion (e.g. CI is the "
     "verification and it's still running), return WAIT on that process "
-    "instead of re-poking — re-poking now would be pure busy-work.\n"
+    "instead of re-poking - re-poking now would be pure busy-work.\n"
     "- If the response explains the work is genuinely unachievable or hits "
-    "the stated Stop condition and needs user input, the goal is NOT done — "
+    "the stated Stop condition and needs user input, the goal is NOT done - "
     "return BLOCKED with the reason describing the block.\n"
-    "- Otherwise the goal is NOT done — CONTINUE.\n\n"
-    "Is the goal satisfied per its completion contract — done, blocked, continue, or wait?"
+    "- Otherwise the goal is NOT done - CONTINUE.\n\n"
+    "Is the goal satisfied per its completion contract - done, blocked, continue, or wait?"
 )
 
 # /goal draft: turn a plain objective into a reviewable contract (after Codex's "draft the goal").
@@ -261,7 +269,7 @@ DRAFT_CONTRACT_SYSTEM_PROMPT = (
 
 # The five contract fields, in display order (after OpenAI Codex's "strong goal" guidance: what
 # "done" means, how to prove it, what must not regress, what is in bounds, when to stop and ask).
-# A bare free-form goal stays fully supported — empty fields are omitted from every prompt.
+# A bare free-form goal stays fully supported - empty fields are omitted from every prompt.
 _CONTRACT_FIELDS = ("outcome", "verification", "constraints", "boundaries", "stop_when")
 
 _CONTRACT_LABELS = {
@@ -312,7 +320,7 @@ class GoalContract:
 def parse_contract(text: str) -> Tuple[str, GoalContract]:
     """Split user-typed goal text into a headline + contract from inline ``field: value`` lines.
 
-    A headline without an explicit ``outcome:`` IS the outcome — it is not duplicated into the
+    A headline without an explicit ``outcome:`` IS the outcome - it is not duplicated into the
     contract block (the goal text already carries it), so outcome stays empty in that case.
     """
     if not text:
@@ -371,6 +379,28 @@ class GoalGate:
         )
 
 
+def _gate_workspace() -> Tuple[Optional[str], Optional[str]]:
+    """``(cwd, refusal)`` for this check's gates. A multi-session backend's process directory is not
+    the session's project, so gates run in the scoped session workspace (#125369). A declared
+    workspace that is not a directory on this host (deleted, remote, container) is a refusal: a
+    relative gate run anywhere else would check a different project and could pass a failing goal,
+    and no agent turn can fix it, so the caller pauses instead of retrying.
+    No declared workspace keeps the classic resolution (TERMINAL_CWD, else the launch directory)."""
+    from agent.runtime_cwd import resolve_agent_cwd, scoped_session_cwd
+
+    declared = scoped_session_cwd()
+    if declared:
+        path = Path(declared).expanduser()
+        if path.is_dir():
+            return str(path), None
+        return None, (f"the session workspace {declared} is not a directory on this host, "
+                      "and running gates anywhere else would check a different project")
+    try:
+        return str(resolve_agent_cwd()), None
+    except OSError:
+        return None, None  # deleted launch directory: subprocess reports it per gate
+
+
 def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> Tuple[bool, int, str]:
     """Run one gate through the shell. Returns ``(passed, exit_code, output_tail)``; a timeout kills
     the process and counts as exit code -1."""
@@ -413,7 +443,7 @@ class GoalState:
     subgoals: List[str] = field(default_factory=list)
     # Wait barrier (judge ``wait`` verdict or ``/goal wait``): parks the loop instead of re-poking the
     # agent into busy-work. pid → until exit; session → until that process_registry session's OWN
-    # trigger fires (exit OR watch_patterns match — preferred for watchers that signal mid-run);
+    # trigger fires (exit OR watch_patterns match - preferred for watchers that signal mid-run);
     # until → wall-clock deadline. While ANY is active evaluate_after_turn returns
     # should_continue=False without burning a turn; cleared lazily when satisfied or by unwait/pause/
     # resume/clear. Defaults empty so old state_meta rows load unchanged.
@@ -491,7 +521,7 @@ _DB_BOOTSTRAP_LOOP_WAIT_S = 0.25
 
 # The call that STARTS the bootstrap (cold cache) waits this long instead. A fresh state.db init
 # (schema DDL, FTS tables, first hermes_cli.config import) measures ~300ms warm and more on slow
-# CI — well past 0.25s, which used to drop the first /goal write ("Goal set" but nothing
+# CI - well past 0.25s, which used to drop the first /goal write ("Goal set" but nothing
 # persisted). Only the kick call pays this one-time stall; later calls keep the short window.
 _DB_BOOTSTRAP_INIT_WAIT_S = 1.5
 
@@ -579,7 +609,7 @@ def _get_session_db() -> Optional[Any]:
 
 def _acquire_session_db(home: str):
     """The registry's shared handle for ``home/state.db``. A bare ``SessionDB()`` here was a SECOND
-    writer per profile beside the gateway's registry handle — its own token-writer thread and
+    writer per profile beside the gateway's registry handle - its own token-writer thread and
     close-time checkpoint (the #90837 corruption shape), doubled under multiplexing."""
     from hermes_state_registry import acquire
     return acquire(Path(home) / "state.db")
@@ -601,10 +631,10 @@ def _registry_tore_down(db) -> bool:
 
 
 def _warn_dropped_write(manager: str, kind: str, session_id: str) -> None:
-    """WARN on a dropped state write — the reply already told the user the state was set. One shared
+    """WARN on a dropped state write - the reply already told the user the state was set. One shared
     message keeps goal, loop and heartbeat logs greppable as one bug class."""
     logger.warning(
-        "%s: %s for %s not persisted — session DB unavailable "
+        "%s: %s for %s not persisted - session DB unavailable "
         "(bootstrap window exceeded, in-memory state still active)",
         manager, kind, session_id,
     )
@@ -659,7 +689,7 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
     (a failure here must not block compression). Returns True when a goal was migrated.
 
     Context compression rotates ``session_id`` to a fresh child session, but ``load_goal`` does a flat
-    ``goal:<session_id>`` lookup with no parent-lineage walk — so an active goal silently dies at the
+    ``goal:<session_id>`` lookup with no parent-lineage walk - so an active goal silently dies at the
     compaction boundary (#33618). Copy the goal onto the new session and archive the old row as ``cleared``
     so exactly one active goal row exists per logical conversation (avoids the "two active goals" hazard of
     a pure copy).
@@ -688,7 +718,7 @@ def migrate_goal_to_session(old_session_id: str, new_session_id: str, *, reason:
 def _truncate(text: str, limit: int) -> str:
     if not text:
         return ""
-    return text if len(text) <= limit else text[:limit] + "… [truncated]"
+    return text if len(text) <= limit else text[:limit] + "... [truncated]"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -819,7 +849,7 @@ def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, 
     seconds = _first_int("wait_for_seconds", "seconds", "wait_seconds")
     if seconds is not None:
         return "wait", reason, False, {"seconds": seconds}
-    return "continue", f"{reason} (wait verdict had no target — continuing)", False, None
+    return "continue", f"{reason} (wait verdict had no target - continuing)", False, None
 
 
 def _render_background_block(background_processes: Optional[List[Dict[str, Any]]]) -> str:
@@ -856,7 +886,7 @@ def _call_goal_judge_llm(call_llm, system_prompt: str, user_prompt: str, timeout
     """Route through call_llm so auxiliary.goal_judge.* config (provider/model, extra_body,
     reasoning_effort, retries) all apply. Returns the raw reply text."""
     # See #35566.
-    # Route through call_llm — same #35566 fix as the judge call above.
+    # Route through call_llm - same #35566 fix as the judge call above.
     resp = call_llm(
         task="goal_judge",
         messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
@@ -924,10 +954,10 @@ def judge_goal(
     except AuxiliaryClientUnavailable as exc:
         # No client at all (e.g. a dead Nous refresh token): name the cause so the user is sent to
         # re-authenticate, not to context-length / model debugging (#42177). Still fails open.
-        logger.info("goal judge: auxiliary client unavailable (%s) — falling through to continue", exc)
+        logger.info("goal judge: auxiliary client unavailable (%s) - falling through to continue", exc)
         return "continue", f"goal_judge auxiliary client unavailable: {exc}", False, None, True
     except Exception as exc:
-        logger.info("goal judge: API call failed (%s) — falling through to continue", exc)
+        logger.info("goal judge: API call failed (%s) - falling through to continue", exc)
         return "continue", f"judge error: {type(exc).__name__}", False, None, True
 
     verdict, reason, parse_failed, wait_directive = _parse_judge_response(raw)
@@ -1025,7 +1055,7 @@ def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Option
     if not objective:
         return None
     if timeout is None:
-        # The declared default for this path is the config key, not the module constant — see
+        # The declared default for this path is the config key, not the module constant - see
         # _goal_judge_timeout (#91022).
         # Same config-backed default as judge_goal (#91022).
         timeout = _goal_judge_timeout()
@@ -1050,7 +1080,7 @@ def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Option
     return None if contract.is_empty() else contract
 
 
-# ── GoalManager — the orchestration surface CLI + gateway talk to ──────
+# ── GoalManager - the orchestration surface CLI + gateway talk to ──────
 
 def _decision(status, should_continue: bool, prompt: Optional[str], verdict: str, reason: str, message: str) -> Dict[str, Any]:
     return {"status": status, "should_continue": should_continue, "continuation_prompt": prompt,
@@ -1108,10 +1138,10 @@ class GoalManager:
             if s.waiting_until and time.time() < s.waiting_until:
                 remaining = int(s.waiting_until - time.time())
                 wr = s.waiting_reason or f"{remaining}s"
-                return f"⏳ Goal (parked {remaining}s — {wr}, {meta}): {s.goal}"
+                return f"⏳ Goal (parked {remaining}s - {wr}, {meta}): {s.goal}"
             return f"⊙ Goal (active, {meta}): {s.goal}"
         if s.status == "paused":
-            extra = f" — {s.paused_reason}" if s.paused_reason else ""
+            extra = f" - {s.paused_reason}" if s.paused_reason else ""
             return f"⏸ Goal (paused, {meta}{extra}): {s.goal}"
         if s.status == "done":
             return f"✓ Goal done ({meta}): {s.goal}"
@@ -1233,7 +1263,7 @@ class GoalManager:
         """Public helper for the /subgoal slash command."""
         if self._state is None:
             return "(no active goal)"
-        return self._state.render_subgoals_block() or "(no subgoals — use /subgoal <text> to add criteria)"
+        return self._state.render_subgoals_block() or "(no subgoals - use /subgoal <text> to add criteria)"
 
     # --- /goal gate quality gates ---------------------------------------
 
@@ -1265,7 +1295,7 @@ class GoalManager:
         if self._state is None:
             return "(no active goal)"
         if not self._state.gates:
-            return "(no quality gates — use /goal gate add <command> to require one)"
+            return "(no quality gates - use /goal gate add <command> to require one)"
         lines = []
         for i, g in enumerate(self._state.gates, start=1):
             status = ""
@@ -1289,8 +1319,15 @@ class GoalManager:
         if state is None or not state.gates:
             return None
 
+        gate_cwd, refusal = _gate_workspace()
+        if refusal:
+            return self._pause_decision(
+                f"quality gates not run: {refusal}", "gate_failed", f"gates not run: {refusal}",
+                f"⏸ Goal paused - quality gates not run: {refusal}. Fix the workspace or "
+                f"/goal gate remove the gates, then /goal resume.",
+            )
         for gate in state.gates:
-            passed, exit_code, tail = run_gate(gate)
+            passed, exit_code, tail = run_gate(gate, cwd=gate_cwd)
             gate.last_exit_code = exit_code
             gate.last_output_tail = tail
             if passed:
@@ -1303,7 +1340,7 @@ class GoalManager:
                 return self._pause_decision(
                     f"quality gate exhausted {gate.attempts - 1} retries: $ {gate.command}",
                     "gate_failed", f"gate exhausted retries: $ {gate.command}",
-                    f"⏸ Goal paused — quality gate still failing after "
+                    f"⏸ Goal paused - quality gate still failing after "
                     f"{gate.max_retries} retries: $ {gate.command} "
                     f"(exit {exit_code}). Fix it manually or /goal gate remove it, "
                     f"then /goal resume.",
@@ -1416,7 +1453,7 @@ class GoalManager:
         else:
             tgt = f"{max(0, int(state.waiting_until - time.time()))}s remaining"
         reason = state.waiting_reason or tgt
-        return _decision("active", False, None, "waiting", reason, f"⏳ Goal parked — waiting on {tgt}: {reason}")
+        return _decision("active", False, None, "waiting", reason, f"⏳ Goal parked - waiting on {tgt}: {reason}")
 
     def _apply_wait_directive(self, wait_directive: Dict[str, Any], reason: str, *, active_delegations: int = 0) -> Optional[Dict[str, Any]]:
         """Judge said WAIT: set the barrier and park. The counted turn stands (the judge ran) but no
@@ -1438,12 +1475,12 @@ class GoalManager:
         else:
             self.wait_for_seconds(int(wait_directive["seconds"]), reason=reason, on_delegations=active_delegations)
             tgt = f"{wait_directive['seconds']}s"
-        return _decision("active", False, None, "wait", reason, f"⏳ Goal parked (judge) — waiting on {tgt}: {reason}")
+        return _decision("active", False, None, "wait", reason, f"⏳ Goal parked (judge) - waiting on {tgt}: {reason}")
 
     def _budget_pause(self, state: GoalState, verdict: str, reason: str, note: str = "") -> Dict[str, Any]:
         return self._pause_decision(
             f"turn budget exhausted ({state.turns_used}/{state.max_turns})", verdict, reason,
-            f"⏸ Goal paused — {state.turns_used}/{state.max_turns} turns used{note}. "
+            f"⏸ Goal paused - {state.turns_used}/{state.max_turns} turns used{note}. "
             "Use /goal resume to keep going, or /goal clear to stop.",
         )
 
@@ -1454,7 +1491,7 @@ class GoalManager:
     ) -> Dict[str, Any]:
         """Run gates + judge and update state. Return a decision dict (``status``, ``should_continue``,
         ``continuation_prompt``, ``verdict``, ``reason``, ``message``). Both real user prompts and our
-        own continuations increment ``turns_used`` — both consume model budget."""
+        own continuations increment ``turns_used`` - both consume model budget."""
         state = self._state
         if state is None or state.status != "active":
             return _decision(state.status if state else None, False, None, "inactive", "no active goal", "")
@@ -1498,7 +1535,7 @@ class GoalManager:
         if verdict == "blocked":
             return self._pause_decision(
                 f"judged unachievable: {reason}", "blocked", reason,
-                f"🚫 Goal judged unachievable — paused: {reason} Re-scope with /goal set, or override with /goal resume.",
+                f"🚫 Goal judged unachievable - paused: {reason} Re-scope with /goal set, or override with /goal resume.",
             )
 
         if verdict == "done":
@@ -1513,13 +1550,13 @@ class GoalManager:
             return self._pause_decision(
                 f"judge API unreachable {n_tx} turns in a row (check auxiliary.goal_judge provider/key in config.yaml)",
                 "continue", reason,
-                f"⏸ Goal paused — judge API returned errors ({n_tx} turns). Check the goal_judge provider/key in "
+                f"⏸ Goal paused - judge API returned errors ({n_tx} turns). Check the goal_judge provider/key in "
                 + _JUDGE_CONFIG_HINT.format(provider="deepseek", model="deepseek-flash"),
             )
         if n_parse >= DEFAULT_MAX_CONSECUTIVE_PARSE_FAILURES:
             return self._pause_decision(
                 f"judge model returned unparseable output {n_parse} turns in a row", "continue", reason,
-                f"⏸ Goal paused — the judge model ({n_parse} turns) isn't returning the required JSON verdict. "
+                f"⏸ Goal paused - the judge model ({n_parse} turns) isn't returning the required JSON verdict. "
                 "Route the judge to a stricter model in "
                 + _JUDGE_CONFIG_HINT.format(provider="openrouter", model="google/gemini-3-flash-preview"),
             )
@@ -1552,7 +1589,7 @@ class GoalManager:
         if self._state is None:
             return "(no active goal)"
         return self._state.contract.render_block() if self._state.has_contract() else (
-            "(no completion contract — set one with /goal draft <objective> or inline field: value lines)")
+            "(no completion contract - set one with /goal draft <objective> or inline field: value lines)")
 
 
 # ── Kanban worker goal loop ───────────────────────────────────────────
@@ -1560,7 +1597,7 @@ class GoalManager:
 # Fed to a kanban goal-mode worker that hasn't completed/blocked its task yet: short, and points it
 # back at the lifecycle contract (it already has the full task body).
 KANBAN_GOAL_CONTINUATION_TEMPLATE = (
-    "[Continuing toward this kanban task — judge says it is not done yet]\n"
+    "[Continuing toward this kanban task - judge says it is not done yet]\n"
     "Reason: {reason}\n\n"
     "Take the next concrete step toward completing the task. When the work "
     "is genuinely finished, call kanban_complete with a summary. If it is a "
@@ -1601,6 +1638,7 @@ def run_kanban_goal_loop(
     task_status_fn,
     block_fn,
     max_turns: int = DEFAULT_MAX_TURNS,
+    resume_limit: int = DEFAULT_GOAL_RESUME_LIMIT,
     first_response: str = "",
     log=None,
 ) -> Dict[str, Any]:
@@ -1610,6 +1648,12 @@ def run_kanban_goal_loop(
     ``kanban_block`` / review hand-off); otherwise judge the latest response against ``goal_text``
     (the card's title + body) and feed a continuation or finalize nudge. A WAIT verdict is treated
     as CONTINUE (workers finish via kanban tools, not by parking).
+
+    When the turn budget (``max_turns``) is exhausted the loop AUTO-RESUMES the same
+    goal (resets the counter, keeps the warm worker) up to ``resume_limit`` times, instead
+    of parking the card in triage - the native /goal "budget -> pause -> resume" boundary
+    re-applied to a spawned kanban worker. Once the resume limit is reached it surfaces
+    ONE honest ``needs_input`` block to a human.
     """
 
     def _log(msg: str) -> None:
@@ -1619,9 +1663,13 @@ def run_kanban_goal_loop(
             except Exception:
                 pass
 
-    def _block(message: str) -> None:
+    def _block(message: str, kind: Optional[str] = None) -> None:
         try:
-            block_fn(message)
+            try:
+                block_fn(message, kind=kind)
+            except TypeError:
+                # Older callers' block_fn only accepts (message); ignore the kind.
+                block_fn(message)
         except Exception as exc:
             _log(f"kanban goal loop: block_fn failed ({exc})")
 
@@ -1631,9 +1679,13 @@ def run_kanban_goal_loop(
     max_turns = int(max_turns or DEFAULT_MAX_TURNS)
     if max_turns < 1:
         max_turns = DEFAULT_MAX_TURNS
+    resume_limit = int(resume_limit or 0)
+    if resume_limit < 0:
+        resume_limit = 0
 
     last_response = first_response or ""
     turns_used = 1   # the first turn already consumed one unit of budget
+    resumes_used = 0  # how many times the budget has auto-resumed this run
     nudged_to_finalize = False
 
     while True:
@@ -1649,12 +1701,10 @@ def run_kanban_goal_loop(
             _log("kanban goal loop: " + log_fmt.format(task_id=task_id, turns=turns_used))
             return _result(outcome, reason)
         if status not in ("running", "ready"):
-            # Reclaimed / archived / unexpected — let the dispatcher own it.
+            # Reclaimed / archived / unexpected - let the dispatcher own it.
             _log(f"kanban goal loop: task {task_id} status={status!r}; stopping")
             return _result("stopped", f"status={status}")
 
-        # The between-turns judge runs outside any agent turn: bind the per-task relay-affinity
-        # scope (same shape as the handoff gates) so the relay does not reject the call (#113669).
         from agent.portal_tags import get_affinity_scope, reset_affinity_scope, set_affinity_scope
         affinity_token = None if get_affinity_scope() else set_affinity_scope(f"kanban:{task_id}")
         try:
@@ -1662,6 +1712,9 @@ def run_kanban_goal_loop(
         finally:
             if affinity_token is not None:
                 reset_affinity_scope(affinity_token)
+        if _transport_failed:
+            _log(f"kanban goal loop: judge transport failed on turn {turns_used}; stopping")
+            return _result("stopped", "judge transport failure")
         if verdict == "wait":
             verdict = "continue"
         _log(f"kanban goal loop: turn {turns_used}/{max_turns} verdict={verdict} reason={_truncate(reason, 120)}")
@@ -1669,14 +1722,14 @@ def run_kanban_goal_loop(
         if verdict == "blocked":
             # Unachievable is NOT done: block the card with the judge's reason now instead of
             # re-poking an impossible goal, and never let it land in done.
-            # The judge ruled the goal cannot be satisfied at all — this is NOT done (#100954).
+            # The judge ruled the goal cannot be satisfied at all - this is NOT done (#100954).
             _log(f"kanban goal loop: task {task_id} judged unachievable; blocking")
             _block(f"Goal-mode judge ruled the goal unachievable: {reason}")
             return _result("blocked_unachievable", f"judge verdict blocked: {reason}")
 
         if verdict == "done":
             if nudged_to_finalize:
-                # Already asked once to call kanban_complete — block for review rather than spin.
+                # Already asked once to call kanban_complete - block for review rather than spin.
                 _log(f"kanban goal loop: task {task_id} judged done but worker won't finalize; blocking")
                 _block(
                     f"Goal-mode worker's output looked complete but it never "
@@ -1688,21 +1741,52 @@ def run_kanban_goal_loop(
         else:
             prompt = KANBAN_GOAL_CONTINUATION_TEMPLATE.format(reason=_truncate(reason, 400))
 
-        # Budget check BEFORE spending another turn.
+        # Budget check BEFORE spending another turn. The native /goal loop PAUSES at its
+        # turn budget and /goal resume resets the counter; the kanban loop mirrors that
+        # by AUTO-RESUMING the same goal (reset the counter, keep the warm worker) instead
+        # of parking the card in triage. ``resume_limit`` is the backstop: once it is hit
+        # the loop surfaces ONE honest "still not done" to a human rather than looping
+        # forever or silently sitting.
         if turns_used >= max_turns:
-            _log(f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; blocking")
-            _block(
-                f"Goal-mode worker exhausted its turn budget "
-                f"({turns_used}/{max_turns}) without completing the task. "
-                f"Last judge verdict: {_truncate(reason, 300)}"
+            if resumes_used < resume_limit:
+                resumes_used += 1
+                _log(
+                    f"kanban goal loop: task {task_id} exhausted {turns_used}/{max_turns} turns; "
+                    f"resuming same goal (resume {resumes_used}/{resume_limit}) - "
+                    f"picking up from checkpoint, not re-orienting from scratch"
+                )
+                turns_used = 0
+                nudged_to_finalize = False
+                continue
+            _log(
+                f"kanban goal loop: task {task_id} still not done after {resume_limit} "
+                f"budget resumptions ({max_turns} turns each); surfacing to a human"
             )
-            return _result("blocked_budget", "turn budget exhausted")
+            _block(
+                f"Goal-mode worker still not done after {resume_limit} budget resumptions "
+                f"({max_turns} turns each) without meeting acceptance. Needs a human decision "
+                f"or re-scoping. Last judge verdict: {_truncate(reason, 300)}",
+                kind="needs_input",
+            )
+            return _result("blocked_budget", "resume limit reached")
 
         try:
-            last_response = run_turn(prompt) or ""
+            result = run_turn(prompt)
+            if isinstance(result, dict):
+                last_response = result.get("response", "") or ""
+                failed = bool(result.get("failed", False))
+                failure_reason = result.get("failure_reason") or "unknown"
+            else:
+                # backward compatibility: assume it's a string
+                last_response = result or ""
+                failed = False
+                failure_reason = None
         except Exception as exc:
             _log(f"kanban goal loop: run_turn failed ({exc}); stopping")
             return _result("stopped", f"run_turn error: {type(exc).__name__}")
+        if failed:
+            _log(f"kanban goal loop: worker failed on turn {turns_used} (reason={failure_reason}); stopping")
+            return _result("stopped", f"worker failed: {failure_reason}")
         turns_used += 1
 
 

@@ -1,4 +1,4 @@
-"""Tests for kanban goal_mode — per-card Ralph-style goal loop.
+"""Tests for kanban goal_mode - per-card Ralph-style goal loop.
 
 Covers three layers:
 
@@ -113,7 +113,7 @@ def _patch_judge(monkeypatch, verdicts):
 
 
 def test_loop_stops_when_worker_already_completed(monkeypatch):
-    # Worker called kanban_complete on its first turn — no judging needed.
+    # Worker called kanban_complete on its first turn - no judging needed.
     _patch_judge(monkeypatch, ["continue"])  # should never be consulted
     turns = []
 
@@ -127,6 +127,159 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     )
     assert res["outcome"] == "completed_by_worker"
     assert turns == []  # no extra turns
+
+
+def test_loop_stops_on_judge_transport_failure(monkeypatch):
+    """Regression #91264: judge transport failure must stop the loop instead of
+    being coerced to continue via WAIT."""
+    def _failing_judge(*args, **kwargs):
+        # 5-tuple: verdict, reason, parse_failed, wait, transport_failed
+        return "wait", "judge transport unreachable", False, None, True
+
+    monkeypatch.setattr(goals, "judge_goal", _failing_judge)
+    turns = []
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: turns.append(p) or "x",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: pytest.fail("should not block"),
+        first_response="first attempt",
+    )
+    assert res["outcome"] == "stopped"
+    assert "judge transport failure" in res["reason"]
+    assert turns == []
+
+
+def test_loop_stops_on_worker_failed_flag(monkeypatch):
+    """Regression #91264: worker returning {'failed': True} stops the loop
+    immediately with the failure reason."""
+    _patch_judge(monkeypatch, ["continue", "continue"])
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: {
+            "response": "crashed mid-execution",
+            "failed": True,
+            "failure_reason": "context_window_exceeded",
+        },
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: pytest.fail("should not block"),
+        first_response="first attempt",
+    )
+    assert res["outcome"] == "stopped"
+    assert res["reason"] == "worker failed: context_window_exceeded"
+
+
+def test_loop_stops_on_worker_failed_flag_default_reason(monkeypatch):
+    """Regression #91264: worker returning {'failed': True} without failure_reason
+    uses 'unknown' as fallback."""
+    _patch_judge(monkeypatch, ["continue", "continue"])
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: {
+            "response": "crashed without reason",
+            "failed": True,
+        },
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: pytest.fail("should not block"),
+        first_response="first attempt",
+    )
+    assert res["outcome"] == "stopped"
+    assert res["reason"] == "worker failed: unknown"
+
+
+def _always_judge(monkeypatch, verdict="continue", reason="keep going"):
+    """Patch judge_goal to return a single verdict every call (never runs out)."""
+    def _fake(goal, response, **_kw):
+        return verdict, reason, False, None, False
+    monkeypatch.setattr(goals, "judge_goal", _fake)
+
+
+def test_budget_exhaustion_resumes_same_goal_instead_of_blocking(monkeypatch):
+    """A goal that needs more than ``max_turns`` turns must AUTO-RESUME (keep the
+    same warm worker) instead of parking the card in triage. The worker here
+    completes the task via kanban_complete mid-loop, so ``block_fn`` is never
+    called and the loop keeps running past its first budget.
+    """
+    _always_judge(monkeypatch, "continue")
+    turns = []
+
+    def _run(prompt):
+        turns.append(prompt)
+        return "still working"
+
+    def _status():
+        # Worker calls kanban_complete once it has worked 5 turns.
+        return "done" if len(turns) >= 5 else "running"
+
+    blocked = []
+    logs = []
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=_run,
+        task_status_fn=_status,
+        block_fn=lambda r, **kw: blocked.append((r, kw)),
+        max_turns=2,
+        resume_limit=3,
+        first_response="first attempt",
+        log=logs.append,
+    )
+    assert res["outcome"] == "completed_by_worker"
+    assert blocked == []  # never parked
+    assert len(turns) >= 5  # kept working past the 2-turn budget
+    assert any("resuming same goal" in m and "picking up from checkpoint" in m for m in logs)
+
+
+def test_budget_exhaustion_resume_cap_surfaces_one_honest_block(monkeypatch):
+    """After ``resume_limit`` auto-resumes the loop stops and surfaces ONE honest
+    ``needs_input`` block (never a silent park and never an infinite loop).
+    """
+    _always_judge(monkeypatch, "continue")
+    turns = []
+
+    blocked = []
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: turns.append(p) or "still working",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r, **kw: blocked.append((r, kw)),
+        max_turns=2,
+        resume_limit=2,
+        first_response="first attempt",
+    )
+    assert res["outcome"] == "blocked_budget"
+    assert res["reason"] == "resume limit reached"
+    assert len(blocked) == 1
+    reason, kwargs = blocked[0]
+    assert kwargs.get("kind") == "needs_input"
+    assert "still not done after 2 budget resumptions" in reason
+
+
+def test_budget_exhaustion_resume_limit_defaults_to_three(monkeypatch):
+    """``resume_limit`` defaults to ``DEFAULT_GOAL_RESUME_LIMIT`` (3) when omitted."""
+    assert goals.DEFAULT_GOAL_RESUME_LIMIT == 3
+    _always_judge(monkeypatch, "continue")
+    blocked = []
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: "still working",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r, **kw: blocked.append((r, kw)),
+        max_turns=1,  # exhaust every iteration, so we hit the cap fast
+        first_response="first attempt",
+    )
+    assert res["outcome"] == "blocked_budget"
+    assert len(blocked) == 1
+    assert "still not done after 3 budget resumptions" in blocked[0][0]
+
 
 
 
@@ -211,7 +364,7 @@ class TestCLIJudgeGate:
     def test_judge_blocked_verdict_rejects_completion(self, monkeypatch):
         """#100954: an unachievable goal must not complete silently.
 
-        The judge's ``blocked`` verdict is a refusal, not a completion —
+        The judge's ``blocked`` verdict is a refusal, not a completion -
         ``complete_task`` must never run.
         """
         rc, complete_calls = self._run(
