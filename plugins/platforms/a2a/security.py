@@ -51,6 +51,30 @@ def _configured_trusted_peers() -> frozenset[str]:
     return frozenset()
 
 
+# Identities that ``authenticate()`` assigns to loopback callers. A loopback
+# caller is the operator's own machine (the Jarvis dash, a local relay), not a
+# remote agent peer, so it must never be framed as a "remote agent peer" nor
+# subject to the A2A anti-loop ping-pong ceiling.
+_LOOPBACK_IDENTITIES = frozenset({"ip:127.0.0.1", "ip:::1", "ip:localhost", "ip:local"})
+
+
+def _configured_human_peers() -> frozenset[str]:
+    """Peer names that are the human operator's own surfaces (the Jarvis dash /
+    voice), not remote agents. ``A2A_HUMAN_PEERS`` env (comma-separated peer
+    names) or config ``a2a.human_peers`` (list)."""
+    raw = _startup_env("A2A_HUMAN_PEERS")
+    if raw:
+        return frozenset(p.strip() for p in raw.split(",") if p.strip())
+    try:
+        from hermes_cli.config import load_config
+        peers = ((load_config() or {}).get("a2a") or {}).get("human_peers", [])
+        if isinstance(peers, list):
+            return frozenset(str(peer).strip() for peer in peers if str(peer).strip())
+    except Exception:
+        pass
+    return frozenset()
+
+
 @dataclass(frozen=True)
 class A2ASecurityContext:
     """Immutable, profile-scoped security settings captured at adapter startup. HTTP request
@@ -59,6 +83,7 @@ class A2ASecurityContext:
     bearer_token: str
     peer_tokens: tuple[tuple[str, str], ...]
     trusted_peers: frozenset[str]
+    human_peers: frozenset[str]
     allow_all_users: bool
     requested_host: str
     push_secret: str
@@ -68,6 +93,7 @@ class A2ASecurityContext:
         bearer_token = _startup_env("A2A_BEARER_TOKEN")
         return cls(bearer_token=bearer_token, peer_tokens=tuple(_parse_peer_tokens(_startup_env("A2A_PEER_TOKENS")).items()),
                    trusted_peers=_configured_trusted_peers(),
+                   human_peers=_configured_human_peers(),
                    allow_all_users=_startup_env("A2A_ALLOW_ALL_USERS").lower() in {"1", "true", "yes"},
                    requested_host=_startup_env("A2A_HOST") or "127.0.0.1", push_secret=_startup_env("A2A_PUSH_SECRET") or bearer_token)
 
@@ -114,6 +140,18 @@ class A2ASecurityContext:
             return False  # the misconfiguration is logged once in A2AAdapter.connect()
         return self.allow_all_users or self.localhost_only() or not self.trusted_peers or identity in self.trusted_peers
 
+    def is_human_peer(self, identity: str) -> bool:
+        """True when ``identity`` is the operator's own surface, not a remote agent.
+
+        Loopback callers (the Jarvis dash / local relay on the operator's
+        machine) are always human; named peers listed in ``A2A_HUMAN_PEERS`` /
+        ``a2a.human_peers`` (e.g. ``jarvis-dash``, ``jarvis-interactive``) are
+        also human. Human peers skip the "remote agent peer" inbound framing and
+        the anti-loop ping-pong ceiling.
+        """
+        identity = (identity or "").strip()
+        return identity in _LOOPBACK_IDENTITIES or identity in self.human_peers
+
     def sign_push_payload(self, payload: dict) -> str:
         """HMAC-SHA256 hex over the sorted-key JSON body; "" when no secret."""
         if not self.push_secret:
@@ -159,10 +197,19 @@ def filter_inbound(text: str) -> str:
     return text
 
 
-def wrap_inbound(peer: str, text: str) -> str:
-    """Filter + frame inbound task text. EVERY message is framed — including "/..." text:
-    remote peers must never reach the gateway's operator slash commands."""
-    return PRIVACY_PREFIX.format(peer=peer or "unknown") + filter_inbound((text or "").strip())
+def wrap_inbound(peer: str, text: str, *, human: bool = False) -> str:
+    """Filter + frame inbound task text.
+
+    Remote agent peers are framed with ``PRIVACY_PREFIX`` so the agent treats
+    the content as untrusted external input and the gateway's operator slash
+    commands stay out of reach. ``human=True`` peers (the operator's own dash /
+    voice) are NOT framed as a remote agent - only the injection markers are
+    defanged, matching how a first-class human surface (Discord) is handled.
+    """
+    filtered = filter_inbound((text or "").strip())
+    if human:
+        return filtered
+    return PRIVACY_PREFIX.format(peer=peer or "unknown") + filtered
 
 
 def redact_outbound(text: str) -> str:

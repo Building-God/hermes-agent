@@ -536,17 +536,22 @@ class A2AAdapter(BasePlatformAdapter):
         text = protocol.extract_text(params)
         context_id = protocol.extract_context_id(params) or protocol.new_context_id()
         task_id = protocol.new_task_id()
+        # Human/operator peers (the Jarvis dash, the operator's own voice) are
+        # first-class human surfaces, not remote agents. They are NOT subject to
+        # the anti-loop ping-pong ceiling and are NOT framed as "remote agent
+        # peer" - matching how Discord handles the operator. (t_086226e9)
+        human = self._security_context.is_human_peer(peer)
         turn = self._turns.track(context_id)
         max_turns = protocol.max_pingpong_turns()
         rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
-        if turn > max_turns:
+        if turn > max_turns and not human:
             protocol.metrics.anti_loop_triggers += 1
             logger.warning("A2A: anti-loop triggered for context %s (turn %d > %d)", context_id, turn, max_turns)
             return self._end_task(rec, protocol.STATE_REJECTED, f"Anti-loop protection: context {context_id} exceeded "
                                   f"{max_turns} turns. Start a new context or increase A2A_MAX_PINGPONG_TURNS.")
         if not text:
             return self._end_task(rec, protocol.STATE_REJECTED, "Empty task — nothing to do.")
-        framed = security.wrap_inbound(peer, text)
+        framed = security.wrap_inbound(peer, text, human=human)
         security.audit("inbound", peer, task_id, text)
         protocol.persist_message(context_id, "user", text, task_id)
         protocol.metrics.inbound_total += 1
