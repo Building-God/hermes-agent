@@ -55,6 +55,12 @@ _LITELLM_FALLBACK_MODEL = "chat"  # LiteLLM alias (sonnet -> deepseek -> glm)
 # dispatcher parks the task in ``blocked`` with a reason - prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
 
+# A card blocked needs_input with no answer for longer than this many seconds
+# is auto-released to ready so the owning worker respawns from its checkpoint
+# and applies a logged safe default (never a re-ask). Configurable via
+# kanban.stale_needs_input_ttl_seconds; 0 disables the release.
+DEFAULT_STALE_NEEDS_INPUT_TTL_SECONDS = 24 * 60 * 60
+
 # Worker log files larger than this at spawn time are rotated.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
 DEFAULT_LOG_BACKUP_COUNT = 1
@@ -183,6 +189,9 @@ class DispatchResult:
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
     """Task ids reclaimed for no heartbeat within ``dispatch_stale_timeout_seconds``."""
+    stale_needs_input_released: list[str] = field(default_factory=list)
+    """Task ids whose unanswered ``needs_input`` block passed the stale TTL and
+    was auto-released to ``ready`` with a logged safe-default note this tick."""
     respawn_guarded: list[tuple[str, str]] = field(default_factory=list)
     """``(task_id, reason)`` skipped by the respawn guard: ``"blocker_auth"``
     (quota/auth error - also auto-blocked), ``"recent_success"`` (completed run
@@ -2491,6 +2500,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    stale_needs_input_ttl_seconds: int = DEFAULT_STALE_NEEDS_INPUT_TTL_SECONDS,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -2514,6 +2524,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             reconcile_orphans=reconcile_orphans,
+            stale_needs_input_ttl_seconds=stale_needs_input_ttl_seconds,
         )
 
     try:
@@ -2744,6 +2755,7 @@ def _run_reclaim_phase(
     stale_timeout_seconds: int,
     failure_limit: int,
     reconcile_orphans: bool,
+    stale_needs_input_ttl_seconds: int = DEFAULT_STALE_NEEDS_INPUT_TTL_SECONDS,
     board: Optional[str] = None,
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
@@ -2759,6 +2771,9 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
+    result.stale_needs_input_released = _kb.release_stale_needs_input_blocks(
+        conn, ttl_seconds=stale_needs_input_ttl_seconds,
+    )
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
@@ -2909,6 +2924,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    stale_needs_input_ttl_seconds: int = DEFAULT_STALE_NEEDS_INPUT_TTL_SECONDS,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -2927,6 +2943,7 @@ def _dispatch_once_locked(
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
+        stale_needs_input_ttl_seconds=stale_needs_input_ttl_seconds,
     )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,

@@ -29,6 +29,11 @@ def _kbd():
 
 _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malformed")
 
+# Mirror of kanban_db_dispatch.DEFAULT_STALE_NEEDS_INPUT_TTL_SECONDS; used only as
+# the dataclass default so positional construction of ``_DispatcherSettings`` in
+# older tests keeps working. The dispatcher owns the authoritative constant.
+_DEFAULT_STALE_NEEDS_INPUT_TTL_SECONDS = 24 * 60 * 60
+
 
 @dataclass
 class _DispatcherSettings:
@@ -42,6 +47,7 @@ class _DispatcherSettings:
     reconcile_orphans: bool
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    stale_needs_input_ttl_seconds: int = _DEFAULT_STALE_NEEDS_INPUT_TTL_SECONDS
 
 
 def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
@@ -92,6 +98,20 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
                        "disabling stale detection", raw_stale)
         stale_timeout_seconds = 0
 
+    # 0 disables the stale needs_input auto-release; the default (24h) is the
+    # dispatcher's own constant so the release stays on without a config key.
+    raw_stale_needs_input = kanban_cfg.get(
+        "stale_needs_input_ttl_seconds", _DEFAULT_STALE_NEEDS_INPUT_TTL_SECONDS,
+    )
+    try:
+        stale_needs_input_ttl_seconds = int(raw_stale_needs_input or 0)
+    except (TypeError, ValueError):
+        logger.warning(
+            "kanban dispatcher: invalid kanban.stale_needs_input_ttl_seconds=%r; "
+            "disabling the stale needs_input release", raw_stale_needs_input,
+        )
+        stale_needs_input_ttl_seconds = 0
+
     # Fallback profile for tasks created without an assignee (e.g. via the
     # dashboard). Empty (the schema default) keeps skipping them.
     # When set, the dispatcher applies it to unassigned ready tasks instead of skipping them indefinitely
@@ -108,6 +128,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         max_in_progress=effective_max_in_progress,
         failure_limit=failure_limit,
         stale_timeout_seconds=stale_timeout_seconds,
+        stale_needs_input_ttl_seconds=stale_needs_input_ttl_seconds,
         # Requeue 'running' cards with broken claim bookkeeping (zombie-card
         # reconciliation); false keeps orphans frozen for manual forensics.
         reconcile_orphans=bool(kanban_cfg.get("reconcile_orphans", True)),

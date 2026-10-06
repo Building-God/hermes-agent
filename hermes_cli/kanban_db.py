@@ -4427,6 +4427,65 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return True
 
 
+def release_stale_needs_input_blocks(
+    conn: sqlite3.Connection, ttl_seconds: int, *, now: Optional[int] = None,
+) -> list[str]:
+    """Auto-release ``needs_input`` blocks unanswered past ``ttl_seconds``.
+
+    Returns the released task ids in discovery order. A worker that parked on
+    ``kanban_block(kind='needs_input')`` stays ``blocked`` forever when the
+    human never answers, so the dispatcher tick calls this to age the question
+    out: the card flips back to ``ready`` through the same parent-gating /
+    resume-phase path as :func:`unblock_task`, and a plain-English comment tells
+    the respawned worker to apply its logged safe default (or block once with
+    "I assumed X") instead of re-asking. A card answered before the TTL is
+    already out of ``blocked``, so this finds nothing and leaves it untouched.
+    ``ttl_seconds <= 0`` disables the release entirely.
+    """
+    if ttl_seconds <= 0:
+        return []
+    now_ts = now if now is not None else int(time.time())
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status = 'blocked' AND block_kind = 'needs_input'"
+    ).fetchall()
+    released: list[str] = []
+    for row in rows:
+        tid = row["id"]
+        block_ev = conn.execute(
+            "SELECT created_at FROM task_events "
+            "WHERE task_id = ? AND kind = 'blocked' "
+            "ORDER BY id DESC LIMIT 1", (tid,),
+        ).fetchone()
+        blocked_at = block_ev["created_at"] if block_ev else None
+        # No ``blocked`` event means the circuit breaker parked the card untyped;
+        # it has no ``needs_input`` timestamp to age; leave it for the breaker.
+        if blocked_at is None or now_ts - int(blocked_at) <= ttl_seconds:
+            continue
+        # ``unblock_task`` re-gates on parents, restores the resume phase, and
+        # resets ``consecutive_failures``; ``block_kind``/``block_recurrences``
+        # deliberately survive so a re-block for the same question still reads
+        # as a loop.
+        if not unblock_task(conn, tid):
+            continue
+        elapsed = now_ts - int(blocked_at)
+        note = (
+            f"[auto-released] This needs_input block went unanswered for "
+            f"{elapsed / 3600.0:.1f}h (stale-needs_input TTL). Apply your logged "
+            f"safe default now; if you must park again, block ONCE with a "
+            f"plain-English 'I assumed X'; do not re-ask the same question."
+        )
+        with write_txn(conn):
+            _append_event(conn, tid, "stale_needs_input_released", {
+                "blocked_at": int(blocked_at),
+                "ttl_seconds": ttl_seconds,
+                "released_after_seconds": elapsed,
+                "note": note,
+            })
+        add_comment(conn, tid, author="dispatcher", body=note)
+        released.append(tid)
+    return released
+
+
 def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """``review`` -> ``ready``/``todo`` so the implementer re-runs on the new
     comments; restores the implementer from the ``review_requested`` event.
