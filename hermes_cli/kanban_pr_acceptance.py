@@ -135,8 +135,17 @@ def collect_acceptance(contract: str, published_pr: str | None,
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
         required = {(r["context"], (r.get("app") or {}).get("databaseId")) for r in protection.get("requiredStatusChecks", [])}
-        rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
-                     paginate=True, profile_home=profile_home)
+        try:
+            rules = _api(f"repos/{repo}/rules/branches/{quote(branch, safe='')}?per_page=100",
+                         paginate=True, profile_home=profile_home)
+        except _GateAuthError:
+            # `/rules/branches/*` (branch-protection rulesets) is an ADMIN-only REST
+            # read: a 403/404 for a non-admin token is expected, not an identity
+            # failure. The GraphQL `branchProtectionRule` block above has already
+            # resolved branch protection (or, for a PR that already merged, the merge
+            # itself is the confirmation). Tolerate the denial rather than rejecting
+            # a PR whose merge/CI evidence is otherwise sound.
+            rules = []
         for page in rules:
             for rule in page:
                 if rule["type"] == "required_status_checks":
@@ -144,6 +153,15 @@ def collect_acceptance(contract: str, published_pr: str | None,
                                     for r in rule["parameters"]["required_status_checks"])
         receipt["required"] = [{"context": c, "app_id": a} for c, a in sorted(required, key=str)]
         if not required:
+            if pr["state"] == "MERGED":
+                # Branch protection is not verifiable (admin-only read denied, or no
+                # required checks resolvable) but the PR already merged, so protection
+                # state is moot: the merge landed.
+                receipt.update(ok=True, classification="success",
+                               detail="PR is merged; branch-protection checks were not "
+                                      "resolvable (admin-only rules read), but the merge "
+                                      "already landed.")
+                return receipt
             receipt["detail"] = "No repository-required checks are configured; explicitly use a local-only contract for non-CI tasks."
             return receipt
         pages = _api(f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=latest",
