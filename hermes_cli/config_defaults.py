@@ -1958,6 +1958,11 @@ DEFAULT_CONFIG = {
         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no
         # activity for this many days so stale rows aren't scanned forever. 0 = off.
         "done_sub_retention_days": 30,
+        # Delivery Phase 2: map a project slug -> Discord channel id so that a
+        # task carrying a project tag also sends an untagged (no @-mention) copy
+        # to that project's channel. Ships empty; the operator fills one channel
+        # id per project slug (e.g. {"sage": "1553351661894893569"}).
+        "project_channel_map": {},
     },
     # Bot Mode cross-connection relay (tools/bot_relay.py): envelopes queued by message_agent for
     # agents on other connections wait in an on-disk outbox until the Desktop drains them.
