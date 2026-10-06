@@ -19,7 +19,8 @@ from urllib.parse import urljoin
 from utils import is_truthy_value
 from tools.transcription_audio import _transcode_audio_for_stt
 from tools.transcription_common import (
-    DEFAULT_GROQ_STT_MODEL, DEFAULT_STT_MODEL, ELEVENLABS_STT_BASE_URL, GROQ_BASE_URL, GROQ_MODELS,
+    DEFAULT_DEEPGRAM_STT_MODEL, DEFAULT_GROQ_STT_MODEL, DEFAULT_STT_MODEL, DEEPGRAM_STT_BASE_URL,
+    ELEVENLABS_STT_BASE_URL, GROQ_BASE_URL, GROQ_MODELS,
     OPENAI_BASE_URL, OPENAI_MODELS, STTResponseError, XAI_STT_BASE_URL, _error_result, _get_stt_section,
     _lazy_ensure_quietly, _log_prompt_unsupported, _ok_result)
 
@@ -39,7 +40,7 @@ def _has_xai_stt_credentials() -> bool:
 def _with_openai_client(api_key: str, base_url: Optional[str], file_path: str, log_label: str, body):
     """Run ``body(client)`` on a fresh OpenAI SDK client; always closed. Transport shape comes from
     ``stt.openai.timeout`` / ``stt.openai.max_retries`` (defaults 60s, 1 retry; #112939) for every
-    rider of this helper — openai, groq and deepinfra — because a self-hosted endpoint's model cold
+    rider of this helper - openai, groq and deepinfra - because a self-hosted endpoint's model cold
     start exceeds the old fixed 30s and lost the voice message at the first attempt.
     Errors map to the shared envelope. APIConnectionError is checked before APITimeoutError (its
     subclass) so timeouts report as connection errors, as they always have."""
@@ -63,7 +64,7 @@ def _with_openai_client(api_key: str, base_url: Optional[str], file_path: str, l
     except Exception as exc:
         try:
             from openai import APIError, APIConnectionError, APITimeoutError
-        except ImportError:  # pragma: no cover — callers gate on _HAS_OPENAI
+        except ImportError:  # pragma: no cover - callers gate on _HAS_OPENAI
             APIError = APIConnectionError = APITimeoutError = ()
         if isinstance(exc, PermissionError):
             return _error_result(f"Permission denied: {file_path}")
@@ -351,6 +352,68 @@ def _transcribe_elevenlabs(
                           _extract_transcript_text, _log)
 
 
+def _transcribe_deepgram(
+    file_path: str, model_name: str, *, language: Optional[str] = None, prompt: Optional[str] = None
+) -> Dict[str, Any]:
+    """Transcribe via the Deepgram Nova-3 REST API - the same STT the dash voice spine uses.
+
+    Deepgram expects a raw audio body (``Content-Type: audio/*``), not multipart, so this posts
+    the bytes directly. ``model`` defaults to ``nova-3``; a BCP-47 ``language`` hint is forwarded
+    as the ``language`` query param. ``punctuate``/``smart_format`` mirror the dash's quality
+    flags and stay on unless disabled under ``stt.deepgram``.
+    """
+    import requests
+    from urllib.parse import quote
+    from tools.transcription_tools import _load_stt_config, _resolve_provider_key, _resolve_stt_language
+    if prompt:
+        _log_prompt_unsupported("STT provider 'deepgram'")
+    api_key = _resolve_provider_key("DEEPGRAM_API_KEY", "deepgram")
+    if not api_key:
+        return _error_result("DEEPGRAM_API_KEY not set")
+    stt_config = _load_stt_config()
+    deepgram_config = stt_config.get("deepgram") or {}
+    base_url = str(
+        deepgram_config.get("base_url") or DEEPGRAM_STT_BASE_URL
+    ).strip().rstrip("/")
+    # Language: hook override > stt.deepgram.language(_code) > stt.language > env > auto.
+    language_code = language or _resolve_stt_language("deepgram", stt_config, extra_keys=("language_code",)) or ""
+    params: Dict[str, str] = {"model": model_name or DEFAULT_DEEPGRAM_STT_MODEL}
+    if language_code:
+        params["language"] = language_code
+    for flag, default in (("punctuate", True), ("smart_format", True)):
+        if is_truthy_value(deepgram_config.get(flag, default)):
+            params[flag] = "true"
+    query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+    _CONTENT_TYPES = {
+        ".wav": "audio/wav", ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".ogg": "audio/ogg",
+        ".opus": "audio/ogg", ".flac": "audio/flac", ".webm": "audio/webm", ".aac": "audio/aac",
+    }
+    content_type = _CONTENT_TYPES.get(Path(file_path).suffix.lower(), "audio/wav")
+
+    def _post() -> Any:
+        with open(file_path, "rb") as audio_file:
+            headers = {"Authorization": f"Token {api_key}", "Content-Type": content_type}
+            return requests.post(f"{base_url}/listen?{query}", headers=headers, data=audio_file, timeout=120)
+
+    def _extract_deepgram_text(body: Dict[str, Any]) -> str:
+        results = body.get("results") or {}
+        channels = results.get("channels") or []
+        if not channels:
+            return ""
+        alts = channels[0].get("alternatives") or []
+        return (alts[0].get("transcript", "") if alts else "").strip()
+
+    def _extract_deepgram_error(err_body: Dict[str, Any]) -> str:
+        return str(err_body.get("err_msg") or err_body.get("error") or "")
+
+    def _log(transcript_text: str, _body: Dict[str, Any]) -> None:
+        logger.info("Transcribed %s via Deepgram Nova-3 (%s, %d chars)",
+                    Path(file_path).name, model_name or DEFAULT_DEEPGRAM_STT_MODEL, len(transcript_text))
+
+    return _rest_provider(file_path, "deepgram", "Deepgram STT", _post, _extract_deepgram_error,
+                          _extract_deepgram_text, _log)
+
+
 def _transcribe_deepinfra(
     file_path: str, model_name: str, *, language: Optional[str] = None, prompt: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -360,7 +423,7 @@ def _transcribe_deepinfra(
     if not api_key:
         return _error_result("DEEPINFRA_API_KEY not set")
     from hermes_cli.models import deepinfra_base_url, deepinfra_model_ids
-    # ``stt.deepinfra: null`` in YAML yields None, not {} — coalesce.
+    # ``stt.deepinfra: null`` in YAML yields None, not {} - coalesce.
     base_url = deepinfra_base_url(_get_stt_section(_load_stt_config(), "deepinfra"))
     model_name = model_name or next(iter(deepinfra_model_ids("stt")), None)
     if not model_name:
@@ -374,7 +437,7 @@ def _transcribe_deepinfra(
 # ---- OpenAI audio credential resolution -----------------------------------
 def _is_local_or_private_url(url: str) -> bool:
     """True for loopback/RFC-1918/LAN-internal hosts, where an empty ``stt.openai.api_key`` is acceptable
-    (local OpenAI-compatible servers ignore the auth header — no sham ``api_key: not-needed`` needed)."""
+    (local OpenAI-compatible servers ignore the auth header - no sham ``api_key: not-needed`` needed)."""
     try:
         from urllib.parse import urlparse
         import ipaddress
@@ -393,7 +456,7 @@ def _direct_openai_credentials(cfg_api_key: str, cfg_base_url: str) -> Optional[
     from tools.tool_backend_helpers import resolve_openai_audio_api_key
     if cfg_api_key:
         return cfg_api_key, (cfg_base_url or OPENAI_BASE_URL)
-    # A local OpenAI-compatible server needs no key — send a placeholder so the SDK doesn't refuse to
+    # A local OpenAI-compatible server needs no key - send a placeholder so the SDK doesn't refuse to
     # construct a client (#25193, credit @nnnet).
     if cfg_base_url and _is_local_or_private_url(cfg_base_url):
         return "not-needed", cfg_base_url

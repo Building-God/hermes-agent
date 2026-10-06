@@ -23,7 +23,7 @@ from typing import Optional, Dict, Any
 
 from utils import is_truthy_value
 from tools.transcription_common import (
-    BUILTIN_STT_PROVIDERS, CLOUD_STT_PROVIDERS, DEFAULT_ELEVENLABS_STT_MODEL,
+    BUILTIN_STT_PROVIDERS, CLOUD_STT_PROVIDERS, DEFAULT_DEEPGRAM_STT_MODEL, DEFAULT_ELEVENLABS_STT_MODEL,
     DEFAULT_GROQ_STT_MODEL, DEFAULT_LOCAL_MODEL, DEFAULT_MISTRAL_STT_MODEL, DEFAULT_PROVIDER,
     DEFAULT_STT_MODEL, LOCAL_STT_COMMAND_ENV, LOCAL_STT_LANGUAGE_ENV, _error_result,
     _get_stt_section, _ok_result)
@@ -36,9 +36,9 @@ from tools.transcription_local import (
     _transcribe_local_command, _try_lazy_install_stt, build_local_transcribe_kwargs)
 # The ``_transcribe_<provider>`` handlers are looked up in this module's globals by _dispatch_stt_provider.
 from tools.transcription_cloud import (  # noqa: F401  (handlers dispatched via globals())
-    _has_xai_stt_credentials, _resolve_openai_audio_client_config, _transcribe_deepinfra,
-    _transcribe_elevenlabs, _transcribe_groq, _transcribe_mistral, _transcribe_openai,
-    _transcribe_xai)
+    _has_xai_stt_credentials, _resolve_openai_audio_client_config, _transcribe_deepgram,
+    _transcribe_deepinfra, _transcribe_elevenlabs, _transcribe_groq, _transcribe_mistral,
+    _transcribe_openai, _transcribe_xai)
 from tools.transcription_command import (
     _apply_pre_transcription_hook, _dispatch_to_plugin_provider, _enforce_prompt_length_limit,
     _resolve_command_stt_provider_config, _transcribe_command_stt, _unregistered_stt_provider_error)
@@ -164,7 +164,7 @@ def _resolve_explicit_openai() -> str:
 def _detect_local_backend() -> Optional[str]:
     """faster-whisper > local whisper CLI; None when no local backend is installed.
 
-    Resolution only — it must never install. Asking a status probe to resolve the provider used
+    Resolution only - it must never install. Asking a status probe to resolve the provider used
     to run a full dependency sync here (``_try_lazy_install_stt`` → ``pm.ensure_import``) under
     the per-install lock, so ``wake.status`` and ``/voice status`` could hold a sibling profile's
     backend off its port for the length of a venv rebuild. A missing faster-whisper now reports
@@ -196,13 +196,14 @@ _has_groq_key = _has_key("GROQ_API_KEY", "groq", needs_openai=True)
 _has_mistral_key = _has_key("MISTRAL_API_KEY", "mistral", needs_mistral=True)
 _has_elevenlabs_key = _has_key("ELEVENLABS_API_KEY", "elevenlabs")
 _has_deepinfra_key = _has_key("DEEPINFRA_API_KEY", "deepinfra", needs_openai=True)
+_has_deepgram_key = _has_key("DEEPGRAM_API_KEY", "deepgram")
 
 # Cloud providers in AUTO-DETECT priority order:
 #   name -> (explicit-selection probe, auto-detect probe, explicit warning, auto-detect log)
 # The probes differ only for openai (explicit has its own resolver in _EXPLICIT_RESOLVERS;
 # auto-detect also requires the SDK) and xai (auto-detect must never raise). DeepInfra is
 # LAST so a DEEPINFRA_API_KEY set for chat never displaces an xAI/ElevenLabs auto-selection.
-# Mistral only auto-selects when the SDK is present — no lazy-install during passive
+# Mistral only auto-selects when the SDK is present - no lazy-install during passive
 # auto-detection (explicit ``provider: mistral`` installs on first use).
 _CLOUD_PROVIDER_SPECS = {
     "groq": (_has_groq_key, _has_groq_key,
@@ -222,7 +223,10 @@ _CLOUD_PROVIDER_SPECS = {
                    "No local STT available, using ElevenLabs Scribe STT API"),
     "deepinfra": (_has_deepinfra_key, _has_deepinfra_key,
                   "STT provider 'deepinfra' configured but DEEPINFRA_API_KEY not set (or openai package missing)",
-                  "No local STT available, using DeepInfra Whisper API")}
+                  "No local STT available, using DeepInfra Whisper API"),
+    "deepgram": (_has_deepgram_key, _has_deepgram_key,
+                 "STT provider 'deepgram' configured but DEEPGRAM_API_KEY not set",
+                 "No local STT available, using Deepgram Nova-3 API")}
 
 # Explicit selections whose resolution is more than a probe + warning.
 _EXPLICIT_RESOLVERS = {
@@ -261,7 +265,7 @@ def _get_provider(stt_config: dict) -> str:
             from tools.tool_backend_helpers import read_selection
             if read_selection("stt") is None:
                 explicit = False
-        except Exception:  # pragma: no cover — helpers are in-repo
+        except Exception:  # pragma: no cover - helpers are in-repo
             pass
     if explicit:
         return _resolve_explicit_provider(provider)
@@ -318,7 +322,7 @@ def _start_idle_unload_watcher(timeout_seconds: int) -> None:
                 except Exception:  # noqa: BLE001 - keep the owner's last known value
                     timeout = fallback
                 if timeout <= 0:
-                    break  # unload disabled mid-flight — stand down
+                    break  # unload disabled mid-flight - stand down
                 if time.monotonic() - _last_transcription_time >= timeout:
                     _unload_local_model()
                     break
@@ -394,7 +398,7 @@ def _transcribe_local(
             # cached model, reload on CPU and retry once, else every later message fails.
             if not _looks_like_cuda_lib_error(exc):
                 raise
-            logger.warning("faster-whisper CUDA runtime failed mid-transcribe (%s) — "
+            logger.warning("faster-whisper CUDA runtime failed mid-transcribe (%s) - "
                            "evicting cached model and retrying on CPU (int8).", exc)
             model = _replace_cached_model_on_cpu(model_name)
             segments, info = model.transcribe(file_path, **transcribe_kwargs)
@@ -466,7 +470,8 @@ _BUILTIN_MODEL_KEYS = {
     "openai": ("openai", "model", DEFAULT_STT_MODEL, False),
     "mistral": ("mistral", "model", DEFAULT_MISTRAL_STT_MODEL, False),
     "elevenlabs": ("elevenlabs", "model_id", DEFAULT_ELEVENLABS_STT_MODEL, False),
-    "deepinfra": ("deepinfra", "model", "", True)}
+    "deepinfra": ("deepinfra", "model", "", True),
+    "deepgram": ("deepgram", "model", DEFAULT_DEEPGRAM_STT_MODEL, False)}
 
 
 def _builtin_model_name(provider: str, stt_config: Dict[str, Any], model: Optional[str]) -> str:
@@ -520,7 +525,7 @@ def _no_provider_error(provider: str, stt_config: Dict[str, Any]) -> Dict[str, A
     if "provider" in stt_config and provider_key and provider_key not in BUILTIN_STT_PROVIDERS and provider_key != "none":
         return _unregistered_stt_provider_error(provider_key)
     # An explicit openai selection flattened to "none" has a specific reason (e.g. managed gateway down).
-    # Surface it — with its `hermes tools` remediation — instead of the all-provider setup hint (#93045).
+    # Surface it - with its `hermes tools` remediation - instead of the all-provider setup hint (#93045).
     if provider_key == "none" and str(stt_config.get("provider") or "") == "openai" and _HAS_OPENAI:
         reason = _openai_audio_unavailable_reason()
         if reason is not None:
@@ -530,7 +535,8 @@ def _no_provider_error(provider: str, stt_config: Dict[str, Any]) -> Dict[str, A
         f"transcription, configure {LOCAL_STT_COMMAND_ENV} or install a local whisper CLI, "
         "set GROQ_API_KEY for free Groq Whisper, set MISTRAL_API_KEY for Mistral "
         "Voxtral Transcribe, configure xAI OAuth or set XAI_API_KEY for xAI Grok STT, "
-        "set ELEVENLABS_API_KEY for ElevenLabs Scribe, or set VOICE_TOOLS_OPENAI_KEY "
+        "set ELEVENLABS_API_KEY for ElevenLabs Scribe, set DEEPGRAM_API_KEY for "
+        "Deepgram Nova-3, or set VOICE_TOOLS_OPENAI_KEY "
         "or OPENAI_API_KEY for the OpenAI Whisper API.")
 
 
@@ -561,7 +567,7 @@ def transcribe_audio(
 
 def transcribe_audio_local_fallback(file_path: str, model: Optional[str] = None) -> Dict[str, Any]:
     """Try an already-installed local STT backend without changing config: passive inbound-media
-    recovery after the configured provider failed — never lazy-installs or falls through to cloud."""
+    recovery after the configured provider failed - never lazy-installs or falls through to cloud."""
     error = _validate_audio_file(file_path)
     if error:
         return error

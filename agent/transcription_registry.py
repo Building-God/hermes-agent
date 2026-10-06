@@ -21,14 +21,14 @@ logger = logging.getLogger(__name__)
 # :mod:`tools.transcription_tools`** (TestBuiltinSync fails on drift); importing it
 # directly would be a circular import.
 _BUILTIN_NAMES = frozenset({
-    "local", "local_command", "groq", "openai", "mistral", "xai", "elevenlabs", "deepinfra",
+    "local", "local_command", "groq", "openai", "mistral", "xai", "elevenlabs", "deepinfra", "deepgram",
 })
 
 
 def _warn_builtin_collision(key: str) -> None:
     logger.warning(
         "Transcription provider '%s' shadows a built-in name; registration ignored. "
-        "Built-in STT providers (%s) always win — pick a different name.",
+        "Built-in STT providers (%s) always win - pick a different name.",
         key, ", ".join(sorted(_BUILTIN_NAMES)),
     )
 
