@@ -230,3 +230,58 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
             "SELECT payload FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0])
     assert receipt["classification"] == "auth"
     assert "'ghost'" in receipt["detail"] and "cannot be resolved" in receipt["detail"]
+
+
+def test_branch_rules_403_tolerated_when_merge_or_graphql_confirms(monkeypatch):
+    """A 403/404 on the admin-only ``/rules/branches/*`` REST read must not fail
+    acceptance when branch protection was already resolved via the GraphQL block
+    (CI evidence is then verified normally) or when the PR already merged (the
+    merge is the confirmation). Regression for the non-admin-token gate that
+    rejected merged PRs on t_0f8f090a and the admin-merge workarounds."""
+    from hermes_cli import kanban_pr_acceptance as kpa
+
+    sha = "a" * 40
+    state = {"graphql_required": True, "merged": False, "conclusion": "success"}
+
+    def fake_api(endpoint, *, query=None, paginate=False, profile_home=None):
+        if endpoint == "graphql":
+            protection = ({"requiredStatusChecks": [{"context": "required", "app": {"databaseId": 1}}]}
+                          if state["graphql_required"] else None)
+            return {"data": {"repository": {"pullRequest": {
+                "headRefOid": sha, "baseRefName": "main",
+                "state": "MERGED" if state["merged"] else "OPEN",
+                "baseRef": {"branchProtectionRule": protection}}}}}
+        if "/rules/branches/" in endpoint:
+            raise kpa._GateAuthError("HTTP 403 on repos/acme/repo/rules/branches/main")
+        if "/check-runs" in endpoint:
+            return [{"total_count": 1, "check_runs": [
+                {"id": 42, "name": "required", "head_sha": sha, "app": {"id": 1},
+                 "status": "completed", "conclusion": state["conclusion"],
+                 "html_url": "https://github.com/acme/repo/actions/runs/42"}]}]
+        if "/statuses" in endpoint:
+            return []
+        if "/pulls/" in endpoint:
+            return {"head": {"sha": sha}, "base": {"ref": "main"},
+                    "state": "closed" if state["merged"] else "open",
+                    "merged": state["merged"]}
+        raise AssertionError(f"unexpected endpoint {endpoint!r}")
+
+    monkeypatch.setattr(kpa, "_api", fake_api)
+
+    # GraphQL resolves the required checks; the 403 rules read is tolerated; CI passes.
+    receipt = kpa.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is True
+    assert receipt["classification"] == "success"
+    assert receipt["required"] == [{"context": "required", "app_id": 1}]
+
+    # GraphQL resolves nothing AND the PR merged -> "merge confirmed", still accepted.
+    state.update(graphql_required=False, merged=True)
+    receipt = kpa.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is True
+    assert receipt["classification"] == "success"
+
+    # GraphQL resolves nothing AND the PR is open -> unverifiable, still rejected.
+    state.update(graphql_required=False, merged=False)
+    receipt = kpa.collect_acceptance("acme/repo", "https://github.com/acme/repo/pull/7")
+    assert receipt["ok"] is False
+    assert receipt["classification"] == "missing"
