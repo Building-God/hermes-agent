@@ -20,10 +20,11 @@ from hermes_cli.goals import judge_goal
 from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
+    KANBAN_ARCHIVE_SCHEMA,
     KANBAN_ATTACH_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
-    KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
+    KANBAN_LIST_SCHEMA, KANBAN_REASSIGN_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
     KANBAN_SCHEDULE_SCHEMA, KANBAN_SHOW_SCHEMA, KANBAN_UNBLOCK_SCHEMA)
 
 logger = logging.getLogger(__name__)
@@ -1130,6 +1131,30 @@ def _handle_create(args: dict, **kw) -> str:
         if project_id is None and workspace_kind is None and workspace_path is None:
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
+        # Dedupe: an automated fan-out must not mint a near-duplicate of an open
+        # card. On a hit, comment on the existing card and return it instead of
+        # creating a rival card (t_68036311).
+        _dedupe_title = str(title).strip()
+        dup = kb.find_duplicate_card(
+            conn, _dedupe_title, body=args.get("body"), assignee=str(assignee),
+        )
+        if dup is not None:
+            dup_id = dup["id"]
+            dup_body = (
+                f"[dedupe] suppressed a duplicate card (fuzzy title match "
+                f"{dup['ratio']:.0%} to open card '{dup['title']}'). "
+                f"Requested title: {_dedupe_title!r}. Intended body:\n\n"
+                f"{args.get('body') or '(no body)'}"
+            )
+            try:
+                kb.add_comment(conn, dup_id, author="kanban-dedupe", body=dup_body)
+            except Exception:
+                logger.warning("kanban_create dedupe: could not comment on %s", dup_id)
+            logger.info("kanban_create dedupe: %r -> existing %s (%s, %.0f%%)",
+                        _dedupe_title, dup_id, dup["status"], dup["ratio"] * 100)
+            landed = _fields(kb.get_task(conn, dup_id), _CREATED_FIELDS)
+            return _ok(task_id=dup_id, deduped_to=dup_id, dedupe_ratio=dup["ratio"],
+                       dedupe_status=dup["status"], **landed)
         new_tid = kb.create_task(
             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
@@ -1271,6 +1296,41 @@ def _handle_unblock(args: dict, **kw) -> str:
         return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)))
 
 
+@_kanban_handler("kanban_archive")
+def _handle_archive(args: dict, **kw) -> str:
+    """Archive a card with a one-line reason (board hygiene; close, not delete)."""
+    _reject_delegated_child_mutation("kanban_archive")
+    _require_orchestrator_tool("kanban_archive")
+    tid = args.get("task_id")
+    _check(tid, "task_id is required")
+    tid = str(tid)
+    _enforce_worker_task_ownership(tid)
+    reason = _redact_opt(args.get("reason") or None)
+    with _board(args.get("board")) as (kb, conn):
+        ok = kb.archive_task(conn, tid, reason=reason)
+        _check(ok, f"could not archive {tid} (unknown id or already archived)")
+        return _ok(task_id=tid, **_fields(kb.get_task(conn, tid), ("status",)), reason=reason)
+
+
+@_kanban_handler("kanban_reassign")
+def _handle_reassign(args: dict, **kw) -> str:
+    """Reassign a mis-filed card to a real profile (None unassigns)."""
+    _reject_delegated_child_mutation("kanban_reassign")
+    _require_orchestrator_tool("kanban_reassign")
+    tid = args.get("task_id")
+    _check(tid, "task_id is required")
+    tid = str(tid)
+    _enforce_worker_task_ownership(tid)
+    profile = args.get("profile") or None
+    reclaim_first = _parse_bool_arg(args, "reclaim_first") if "reclaim_first" in args else False
+    with _board(args.get("board")) as (kb, conn):
+        ok = kb.reassign_task(conn, tid, profile, reclaim_first=reclaim_first, reason="reassigned via kanban_reassign")
+        _check(ok, f"could not reassign {tid} (unknown id, or still running - pass reclaim_first=true)")
+        landed = kb.get_task(conn, tid)
+        return _ok(task_id=tid, assignee=landed.assignee if landed else profile,
+                   status=landed.status if landed else None)
+
+
 @_kanban_handler("kanban_link")
 def _handle_link(args: dict, **kw) -> str:
     """Add a parent→child dependency edge after the fact (cycles/self-links/running
@@ -1290,8 +1350,11 @@ def _handle_link(args: dict, **kw) -> str:
 
 # --- Registration (order preserved: it is the order tools appear in the schema) ---
 
-# kanban_list / kanban_unblock route the board and are hidden from task workers.
-_ORCHESTRATOR_TOOLS = frozenset({"kanban_list", "kanban_unblock"})
+# kanban_list / kanban_unblock / kanban_archive / kanban_reassign route and clean
+# the board and are hidden from task workers.
+_ORCHESTRATOR_TOOLS = frozenset({
+    "kanban_list", "kanban_unblock", "kanban_archive", "kanban_reassign",
+})
 _TOOLS = (
     ("kanban_show", KANBAN_SHOW_SCHEMA, _handle_show, "📋"),
     ("kanban_list", KANBAN_LIST_SCHEMA, _handle_list, "📋"),
@@ -1307,6 +1370,8 @@ _TOOLS = (
     ("kanban_attachments", KANBAN_ATTACHMENTS_SCHEMA, _handle_attachments, "📎"),
     ("kanban_create", KANBAN_CREATE_SCHEMA, _handle_create, "➕"),
     ("kanban_unblock", KANBAN_UNBLOCK_SCHEMA, _handle_unblock, "▶"),
+    ("kanban_archive", KANBAN_ARCHIVE_SCHEMA, _handle_archive, "🗄"),
+    ("kanban_reassign", KANBAN_REASSIGN_SCHEMA, _handle_reassign, "🔁"),
     ("kanban_link", KANBAN_LINK_SCHEMA, _handle_link, "🔗"))
 
 for _name, _sch, _handler, _emoji in _TOOLS:
