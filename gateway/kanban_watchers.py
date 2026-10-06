@@ -37,6 +37,25 @@ _GC_INTERVAL_SECONDS = 3600.0
 _HEALTH_WINDOW = 6
 
 
+def _kanban_project_channel_map() -> dict[str, str]:
+    """Read kanban.project_channel_map (project slug -> Discord channel id).
+
+    Delivery Phase 2: a task carrying a project tag present in this map gets an
+    untagged (no @-mention) copy in the mapped channel. Ships empty; the
+    operator fills one channel id per project slug. Returns {} when the config
+    key is absent/unreadable so the feature is inert by default.
+    """
+    try:
+        from hermes_cli.config import load_config as _load_config
+
+        cfg = _load_config()
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        out = (kanban_cfg or {}).get("project_channel_map", {})
+        return dict(out) if isinstance(out, dict) else {}
+    except Exception:
+        return {}
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -176,6 +195,7 @@ class GatewayKanbanWatchersMixin:
                     notifier_profile=notifier_profile, gc_due=_gc_due, gc_retention_days=_retention,
                 )
                 for d in deliveries:
+                    d["project_channel_map"] = _kanban_project_channel_map()
                     await _KanbanNotification(
                         self, d, platform_cls=_Platform, sub_fail_counts=sub_fail_counts,
                     ).deliver()

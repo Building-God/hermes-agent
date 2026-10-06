@@ -525,6 +525,16 @@ class _KanbanNotification:
         self.adapter: Any = None
         self.is_push_adapter = True
         self.wake_kinds: set = set()
+        # Delivery Phase 2 (project-channel untagged copy): resolve the task's
+        # project channel from kanban.project_channel_map (project slug ->
+        # Discord channel id). None = no project channel configured for this
+        # task, so no copy is sent.
+        _project_map = d.get("project_channel_map") or {}
+        _project_map = _project_map if isinstance(_project_map, dict) else {}
+        _project_id = getattr(task, "project_id", None) if task is not None else None
+        self.project_chat_id: Optional[str] = (
+            str(_project_map[_project_id]) if _project_id and _project_id in _project_map else None
+        )
 
     # -- cursor / subscription ops (blocking, run in a fresh-context thread) --
 
@@ -709,6 +719,54 @@ class _KanbanNotification:
                 logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)
         return True
 
+    async def _send_project_channel_copy(self, ev: Any, msg: str) -> bool:
+        """Send an untagged copy of one event to the task's project channel.
+
+        Fired when the task carries a ``project_id`` present in
+        ``kanban.project_channel_map``. The copy carries no ``user_id``
+        metadata, so it does not @-mention anyone. Best-effort: any failure
+        is logged and swallowed so origin delivery (and its cursor) is never
+        affected.
+        """
+        if not self.project_chat_id or not self.adapter:
+            return True  # No project channel configured for this task; silently skip
+        from gateway.warning_notifications import present_notification
+
+        adapter = self.adapter
+        # Project channel gets the untagged copy: no user_id metadata.
+        metadata: dict[str, Any] = {}
+        _send_res = None
+
+        async def send_project_ping():
+            nonlocal _send_res
+            _send_res = await adapter.send(self.project_chat_id, msg, metadata=metadata)
+
+        try:
+            if not await present_notification(
+                send_project_ping, platform=self.platform_str, diagnostic=diagnostic_event(ev)
+            ):
+                logger.debug(
+                    "kanban notifier: project channel send skipped for %s (notification gate)",
+                    self.task_id,
+                )
+                return True
+            if getattr(_send_res, "success", True) is False:
+                logger.warning(
+                    "kanban notifier: project channel send reported failure for %s: %s",
+                    self.task_id, getattr(_send_res, "error", None) or "unknown error",
+                )
+                return True  # Log but never treat project-channel failure as fatal
+            logger.debug(
+                "kanban notifier: delivered %s event for %s to project channel %s on %s",
+                ev.kind, self.task_id, self.project_chat_id, self.platform_str,
+            )
+        except Exception as exc:
+            logger.debug(
+                "kanban notifier: project channel send failed for %s: %s", self.task_id, exc
+            )
+            return True  # Project channel send failures never block origin delivery
+        return True
+
     async def _send_pings(self) -> bool:
         """Send every text ping; False when a send failed (claim already rewound/dropped)."""
         for ev in self.d["events"]:
@@ -738,6 +796,10 @@ class _KanbanNotification:
                     event_id=ev.id,
                 ))
                 self.clear_failures()
+                # Delivery Phase 2: send an untagged copy to the task's project
+                # channel. Best-effort: _send_project_channel_copy never raises
+                # and never touches the origin delivery cursor.
+                await self._send_project_channel_copy(ev, msg)
             except Exception as exc:
                 await self.delivery_failed(
                     "kanban notifier: send failed for %s on %s (attempt %d/%d): %s", (self.task_id, self.platform_str),
