@@ -1950,6 +1950,10 @@ DEFAULT_CONFIG = {
         # Running tasks with no heartbeat (last_heartbeat_at) for this many seconds are reclaimed to
         # ready on the next tick; a still-running local worker is terminated first. 0 = off.
         "dispatch_stale_timeout_seconds": 14400,
+        # A card blocked needs_input with no answer for longer than this many seconds is
+        # auto-released to ready (with a logged safe-default note) so the owning worker
+        # respawns from its checkpoint instead of staying blocked forever. 0 = off.
+        "stale_needs_input_ttl_seconds": 86400,
         # Each tick, requeue 'running' cards with broken claim bookkeeping (claim_lock or
         # claim_expires NULL with a dead worker) that TTL/crash/stale recovery can't see. False
         # keeps orphans frozen for manual forensics.
