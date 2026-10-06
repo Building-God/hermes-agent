@@ -796,3 +796,122 @@ def test_review_requested_does_not_wake_a_notify_only_subscription(
     assert adapter.handled == [], (
         "notify-only subscriptions must not be woken by a review handoff"
     )
+
+
+# ---------------------------------------------------------------------------
+# Discord "quiet" mode (kanban.notify_discord_quiet): the main Discord chat
+# carries only needs-input pings and direct replies, never completion/review/
+# changes chatter or .md/.txt artifact uploads.
+# ---------------------------------------------------------------------------
+
+
+class DiscordQuietAdapter(RecordingAdapter):
+    """Discord-shaped recording adapter that also records document uploads."""
+
+    def __init__(self):
+        super().__init__()
+        self.documents = []
+
+    async def send_document(self, chat_id, file_path, metadata=None):
+        self.documents.append(
+            {"chat_id": chat_id, "file_path": file_path, "metadata": metadata or {}}
+        )
+
+    async def send_multiple_images(self, chat_id, images, metadata=None):
+        pass
+
+    async def send_video(self, chat_id, video_path, metadata=None):
+        pass
+
+    def extract_local_files(self, text):
+        return ([], [])
+
+
+def _discord_quiet_runner(adapter, monkeypatch):
+    """Runner with a Discord adapter and kanban.notify_discord_quiet=True."""
+    import hermes_cli.config as hc
+
+    monkeypatch.setattr(
+        hc, "load_config", lambda: {"kanban": {"notify_discord_quiet": True}}
+    )
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = object()
+    return runner
+
+
+def test_discord_quiet_suppresses_completion_and_keeps_needs_input(tmp_path, monkeypatch):
+    """Quiet mode drops the completion ping + artifact upload but keeps the
+    needs-input ping — the whole point of the card: noise out, needs-you in."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "discord-quiet.db"))
+    kb.init_db()
+
+    report = tmp_path / "report.md"
+    report.write_text("done")
+
+    conn = kbc.connect()
+    try:
+        done_tid = kb.create_task(conn, title="build the thing", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=done_tid, platform="discord", chat_id="main-chat")
+        kb.complete_task(
+            conn, done_tid, summary="built it", metadata={"artifacts": [str(report)]}
+        )
+
+        block_tid = kb.create_task(conn, title="needs a key", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=block_tid, platform="discord", chat_id="main-chat")
+        kb.block_task(conn, block_tid, reason="which API key?", kind="needs_input")
+    finally:
+        conn.close()
+
+    adapter = DiscordQuietAdapter()
+    runner = _discord_quiet_runner(adapter, monkeypatch)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    texts = [d["text"] for d in adapter.sent]
+    assert done_tid not in "\n".join(texts), "completion ping must be dropped in quiet mode"
+    assert adapter.documents == [], "artifact uploads must be dropped in quiet mode"
+    assert any(block_tid in t for t in texts), f"needs-input ping missing: {texts}"
+
+
+def test_discord_quiet_is_opt_in_and_default_still_delivers(tmp_path, monkeypatch):
+    """Without the flag, Discord completions keep firing — quiet mode is opt-in
+    and must not change default behaviour."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "discord-loud.db"))
+    kb.init_db()
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="build the thing", assignee="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="discord", chat_id="main-chat")
+        kb.complete_task(conn, tid, summary="built it")
+    finally:
+        conn.close()
+
+    adapter = DiscordQuietAdapter()
+    runner = _make_runner(adapter)
+    runner.adapters = {Platform.DISCORD: adapter}
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert any(tid in d["text"] for d in adapter.sent), (
+        "completion ping must still fire without quiet mode"
+    )
+
+
+def test_event_needs_owner_input_classification():
+    """Only needs_input blocks / block-loop escalations are owner asks."""
+    from gateway.kanban_watchers_notifier import _event_needs_owner_input
+
+    class _Ev:
+        def __init__(self, kind, payload):
+            self.kind = kind
+            self.payload = payload
+
+    assert _event_needs_owner_input(_Ev("blocked", {"kind": "needs_input"}))
+    assert _event_needs_owner_input(_Ev("block_loop_detected", {"kind": "needs_input"}))
+    assert not _event_needs_owner_input(_Ev("blocked", {"kind": "capability"}))
+    assert not _event_needs_owner_input(_Ev("completed", {}))
+    assert not _event_needs_owner_input(_Ev("review_requested", {}))
+    assert not _event_needs_owner_input(_Ev("changes_requested", {}))
+    assert not _event_needs_owner_input(_Ev("crashed", {}))
