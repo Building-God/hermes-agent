@@ -158,6 +158,10 @@ class GatewayKanbanWatchersMixin:
         except Exception as exc:
             logger.warning("kanban notifier: cannot load config (%s); continuing enabled", exc)
             kanban_cfg = {}
+        # Discord "quiet" mode: completion/review/changes chatter and artifact file
+        # uploads are dropped for Discord so the main chat only carries replies and
+        # needs-you pings (see gateway/kanban_watchers_notifier.py).
+        self._kanban_notify_discord_quiet = bool(kanban_cfg.get("notify_discord_quiet", False))
         if not kanban_cfg.get("notify_in_gateway", True):
             logger.info("kanban notifier: disabled via config kanban.notify_in_gateway=false")
             return

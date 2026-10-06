@@ -1958,6 +1958,12 @@ DEFAULT_CONFIG = {
         # On boards that never archive, the notifier GC purges subscriptions for tasks done with no
         # activity for this many days so stale rows aren't scanned forever. 0 = off.
         "done_sub_retention_days": 30,
+        # When true, the kanban notifier only delivers 'needs_input' blocks (and block-loop
+        # triage pings typed needs_input) to Discord, and never uploads artifact files: worker
+        # completion/review/changes chatter and .md/.txt dumps stay on the board and in logs
+        # instead of flooding the main Discord chat. Needs-you pings and direct replies are
+        # unaffected. Default false = full Discord notifications.
+        "notify_discord_quiet": False,
         # Delivery Phase 2: map a project slug -> Discord channel id so that a
         # task carrying a project tag also sends an untagged (no @-mention) copy
         # to that project's channel. Ships empty; the operator fills one channel

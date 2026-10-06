@@ -57,6 +57,18 @@ def diagnostic_event(ev) -> bool:
     if ev.kind in {"blocked", "block_loop_detected"}:
         return (ev.payload or {}).get("kind") != "needs_input"
     return ev.kind == "status" and (ev.payload or {}).get("status") in {"blocked", "triage"}
+
+
+def _event_needs_owner_input(ev) -> bool:
+    """True for the two event kinds that carry a concrete human decision.
+
+    These are the 'waiting on you' pings the owner must keep seeing even when
+    worker completion/review/changes chatter is silenced
+    (``kanban.notify_discord_quiet``). Only a block typed ``needs_input`` (or a
+    block-loop escalation typed ``needs_input``) is a genuine owner ask; every
+    other terminal kind is worker-status noise to the human.
+    """
+    return ev.kind in {"blocked", "block_loop_detected"} and (ev.payload or {}).get("kind") == "needs_input"
 # Consecutive send failures (adapter raised OR reported SendResult(success=False))
 # before a sub is dropped as a dead chat. 12 ≈ 60s at the 5s cadence: a transient
 # API outage must not permanently unsubscribe a live review-gate channel.
@@ -536,6 +548,13 @@ class _KanbanNotification:
             str(_project_map[_project_id]) if _project_id and _project_id in _project_map else None
         )
 
+    def _discord_quiet(self) -> bool:
+        """Discord quiet mode (``kanban.notify_discord_quiet``): drop worker-status
+        chatter and artifact uploads on Discord, keep only needs-input pings."""
+        return self.platform_str == "discord" and bool(
+            getattr(self.runner, "_kanban_notify_discord_quiet", False)
+        )
+
     # -- cursor / subscription ops (blocking, run in a fresh-context thread) --
 
     async def rewind(self) -> None:
@@ -709,7 +728,7 @@ class _KanbanNotification:
         # review-bound card's files exist precisely so the human sees them at
         # handoff time. Retry exposure matches ``completed`` (the sub cursor is
         # rewound only when a send failed).
-        if ev.kind in ("completed", "review_requested"):
+        if ev.kind in ("completed", "review_requested") and not self._discord_quiet():
             try:
                 await self.runner._deliver_kanban_artifacts(
                     adapter=adapter, chat_id=sub["chat_id"], metadata=metadata,
@@ -772,6 +791,10 @@ class _KanbanNotification:
         for ev in self.d["events"]:
             msg = self.format_event(ev)
             if msg is None:
+                continue
+            # Discord quiet mode: only the two needs-input kinds reach Discord; all
+            # completion/review/changes chatter is worker-status noise to the owner.
+            if self._discord_quiet() and not _event_needs_owner_input(ev):
                 continue
             # Non-push adapters (api_server) always report SendResult(success=False)
             # from send(); treating that as failure would drop the sub forever and
