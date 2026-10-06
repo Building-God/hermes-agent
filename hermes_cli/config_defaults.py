@@ -1,6 +1,6 @@
 """Default configuration data for Hermes Agent: DEFAULT_CONFIG and OPTIONAL_ENV_VARS.
 
-Pure-data leaf module — must not import from hermes_cli.config. Comments are the user-facing
+Pure-data leaf module - must not import from hermes_cli.config. Comments are the user-facing
 docs of config.yaml.
 """
 
@@ -63,7 +63,7 @@ DEFAULT_CONFIG = {
         "terminal_continue": True,
     },
     # Where the TUI/desktop gateway stages session file attachments (uploads, pasted
-    # text). "hermes-home" (default) keeps <profile home>/attachments — the dir
+    # text). "hermes-home" (default) keeps <profile home>/attachments - the dir
     # container backends bind-mount, so @file: refs resolve in the sandbox (#76577).
     # "workspace" opts into <session workspace>/.hermes/attachments: staging lands
     # inside the allowed ref root, so the same profile's agent can always read its
@@ -83,7 +83,7 @@ DEFAULT_CONFIG = {
         # elapsed; implicit provider stale timeouts capped to remaining budget. CLI equivalent:
         # `hermes chat --run-budget N`.
         "run_budget_seconds": None,
-        # Gateway inactivity timeout (seconds). Only fires when the agent is completely idle — not
+        # Gateway inactivity timeout (seconds). Only fires when the agent is completely idle - not
         # while calling tools or receiving API responses. 0 = unlimited.
         "gateway_timeout": 1800,
         # Max seconds an alias routing key waits for the active turn holding the same session lease;
@@ -118,7 +118,7 @@ DEFAULT_CONFIG = {
         # In-band restart (/restart, SIGUSR1): refuse new work, then wait up to this many seconds
         # for in-flight agents/cron/api runs to finish before stop(). 0 = enter stop() at once. 30
         # min is a safety valve for wedged agents, not a target; raise for long unattended turns.
-        # Default 30 min is a safety valve for wedged agents, not a target latency — an interactive `hermes
+        # Default 30 min is a safety valve for wedged agents, not a target latency - an interactive `hermes
         # gateway restart` must never block for hours on a turn that wedged (#79133).
         "restart_after_turn_timeout": 1800,
         # Max seconds a submitted prompt waits for the deferred agent build (MCP discovery, model
@@ -204,7 +204,7 @@ DEFAULT_CONFIG = {
         # categories to names-only (explicit opt-in); "on" = force everywhere; "off" = disable.
         "coding_context": "auto",
         # Standing operator instructions (string or list) appended to the coding brief as an extra
-        # stable system block — project-wide workflow rules, e.g. "Don't run tsc/lint until I
+        # stable system block - project-wide workflow rules, e.g. "Don't run tsc/lint until I
         # approve." Cache-safe: takes effect next session.
         "coding_instructions": "",
         # When verify-on-stop finds edits without fresh verification evidence, add guidance for
@@ -227,13 +227,13 @@ DEFAULT_CONFIG = {
         # top-level ``clarify.timeout`` still wins when explicitly set).
         # 1h because users step away and a shorter value evicted the entry mid-think so a later
         # button tap hit a dead entry. Tradeoff: a higher value holds the gateway's running-agent
-        # guard longer for a genuinely abandoned prompt — lower it to free the guard sooner. See #32762.
+        # guard longer for a genuinely abandoned prompt - lower it to free the guard sooner. See #32762.
         "clarify_timeout": 3600,
         # "Still working" status interval (seconds); 0 = off. Lower = faster feedback, more noise;
         # 180 catches spinning weak-model runs before users /restart.
         "gateway_notify_interval": 180,
         # Session stall watchdog (seconds): RECOVERY notifier for an in-process AIAgent with an
-        # adapter-queued follow-up while its activity clock is stale — NOT a general stall detector
+        # adapter-queued follow-up while its activity clock is stale - NOT a general stall detector
         # (ignores startup restore, build sentinels, leases, debounce, other processes; scan cadence
         # per AIAgent). Notify-only: tells the user to try /new. Distinct from gateway_timeout
         # (kills the turn) and gateway_notify_interval. 0 = disable.
@@ -246,7 +246,7 @@ DEFAULT_CONFIG = {
         # See #96870.
         "sanitizer_heal_escalation_threshold": 3,
         # Seconds of continuous reconnect failure before a platform gets needs_attention flagged in
-        # gateway status (`hermes status` / fleet monitoring). Retries never stop — a signal, not a
+        # gateway status (`hermes status` / fleet monitoring). Retries never stop - a signal, not a
         # circuit breaker. 0 = disable.
         "reconnect_attention_after": 7200,
         # Freshness window (seconds) for the auto-continue note. After a crash/restart mid-run the
@@ -304,7 +304,7 @@ DEFAULT_CONFIG = {
         "cwd": ".",  # Use current directory
         # Root for terminal session temp files (background logs/pid/exit files, code-exec
         # sandboxes). Empty = TMPDIR/TMP/TEMP if set, else HERMES_HOME/cache/terminal (auto-pruned
-        # after 72h) — NOT tmpfs /tmp, which is RAM-capped and fills under load. Must be an existing
+        # after 72h) - NOT tmpfs /tmp, which is RAM-capped and fills under load. Must be an existing
         # absolute POSIX path; user-set paths are never auto-pruned.
         "temp_dir": "",
         # CSS font-family for the desktop app's xterm.js terminal (e.g. "'CaskaydiaCoveNerdFont',
@@ -333,7 +333,7 @@ DEFAULT_CONFIG = {
         # HERMES_HOME/home; "real" = force real HOME; "profile" = force HERMES_HOME/home when it
         # exists (strict per-profile isolation).
         "home_mode": "auto",
-        # Extra files sourced in the login shell when building the per-session env snapshot — for
+        # Extra files sourced in the login shell when building the per-session env snapshot - for
         # nvm/pyenv/asdf/PATH entries registered by files a bash login shell skips (~/.bashrc,
         # ~/.zshrc, ~/.zprofile). Supports ~ and ${VAR}; missing files skipped. When empty and the
         # shell is bash, ~/.profile, ~/.bash_profile, ~/.bashrc are auto-sourced in that order (see
@@ -351,7 +351,7 @@ DEFAULT_CONFIG = {
         "docker_image": DEFAULT_SANDBOX_IMAGE,
         "docker_forward_env": [],
         # Exact key-value env pairs set inside Docker containers (unlike docker_forward_env, which
-        # reads host values) — useful under systemd without the user's shell env. Example:
+        # reads host values) - useful under systemd without the user's shell env. Example:
         # {"SSH_AUTH_SOCK": "/run/user/1000/ssh-agent.sock"}
         "docker_env": {},
         "singularity_image": f"docker://{DEFAULT_SANDBOX_IMAGE}",
@@ -392,7 +392,7 @@ DEFAULT_CONFIG = {
     },
 
     "web": {
-        "backend": "",           # shared fallback — applies to both search and extract
+        "backend": "",           # shared fallback - applies to both search and extract
         "search_backend": "",    # per-capability override for web_search (e.g. "searxng")
         "extract_backend": "",   # per-capability override for web_extract (e.g. "native")
         # per-page char budget for web_extract; larger pages truncate, full text kept in cache/web
@@ -506,11 +506,11 @@ DEFAULT_CONFIG = {
         # Skip files larger than this (MB) when staging (datasets, model weights). 0 = no filter.
         "max_file_size_mb": 10,
         # Background sweep (CLI helper thread / gateway housekeeping tick, at most once per
-        # min_interval_hours; never on the startup path — its git gc can block for tens of seconds):
+        # min_interval_hours; never on the startup path - its git gc can block for tens of seconds):
         # deletes projects whose last_touch is older than retention_days, GCs the shared store when
         # refs moved, enforces max_total_size_mb, deletes legacy-* archives older than retention_days.
         # It NEVER deletes orphans (workdir missing on
-        # disk) — a missing workdir may just be an unmounted volume/VPN, and an unattended sweep
+        # disk) - a missing workdir may just be an unmounted volume/VPN, and an unattended sweep
         # must not guess. Orphans: `hermes checkpoints prune` (`--keep-orphans` to skip).
         "auto_prune": True,
         "retention_days": 7,
@@ -524,12 +524,12 @@ DEFAULT_CONFIG = {
     # against network-backed filesystems (iCloud Drive, OneDrive, NFS) that can block a cold read.
     "context_file_read_timeout": 5.0,
     # Max chars per read_file call; larger reads are rejected with offset+limit guidance. 100K chars
-    # ≈ 25–35K tokens.
+    # ≈ 25-35K tokens.
     "file_read_max_chars": 100_000,
     # Seconds the first agent build waits for background MCP discovery before snapshotting its tool
     # list. Returns the instant discovery completes (no MCP servers → ~0s); the bound only bites
     # when a server is still connecting. Turn-1 latency knob only: a server that misses it is picked
-    # up by the between-turns refresh (agent/turn_context.py), so keep it small — a dead server adds
+    # up by the between-turns refresh (agent/turn_context.py), so keep it small - a dead server adds
     # this much to first-response latency.
     "mcp_discovery_timeout": 1.5,
     # Same bound for single-query mode (``hermes -q/-z``). With only ONE turn there is no
@@ -540,11 +540,11 @@ DEFAULT_CONFIG = {
     "mcp": {  # MCP runtime behavior (distinct from mcp_servers: definitions and auxiliary.mcp).
         # Auto-reload MCP connections when config.yaml's mcp_servers changes (CLI watcher). Every
         # reload rebuilds the tool surface and INVALIDATES the provider prompt cache (next message
-        # re-sends the full prefix) — costly on long-context models. When false the watcher still
+        # re-sends the full prefix) - costly on long-context models. When false the watcher still
         # detects the change and prints /reload-mcp guidance.
         "auto_reload_on_config_change": True,
         # Max MCP servers connected (and their stdio child trees spawned) at once per discovery
-        # pass — at boot, on /reload-mcp and on the config watcher's reconcile. Unbounded, a config
+        # pass - at boot, on /reload-mcp and on the config watcher's reconcile. Unbounded, a config
         # with N servers spawns N process trees in the same instant (RAM/CPU spike, 429 fan-out on
         # multi-profile fleets). 0 = unlimited.
         "discovery_concurrency": 4,
@@ -587,7 +587,7 @@ DEFAULT_CONFIG = {
         # are floored at 0.75 (raise-only) so compaction doesn't fire with half the window free; set
         # above 0.75 to override the floor.
         "threshold": 0.50,
-        # threshold_tokens: optional absolute token cap — when set, compression triggers at the
+        # threshold_tokens: optional absolute token cap - when set, compression triggers at the
         # lower of the ratio threshold and this count. Clamped to the model's context length.
         # Off by default: no single count suits windows from 64K to 1M+, so the ratio decides.
         "threshold_tokens": None,
@@ -611,7 +611,7 @@ DEFAULT_CONFIG = {
         # prune, independent of `threshold` (which rarely fires on large windows, so old tool output
         # is re-sent every turn); e.g. 48000 reclaims early. 0 = off. Tail protected by
         # `protect_last_n`. Built-in compressor only. Each committed prune rewrites sent history and
-        # breaks the prompt-cache prefix — the min_reclaim gate below keeps those breaks episodic.
+        # breaks the prompt-cache prefix - the min_reclaim gate below keeps those breaks episodic.
         "proactive_prune_tokens": 0,
         # Prune's summarize pass only touches tool results larger than this (chars); clamped >= 200
         # so a generated summary can't be re-summarized.
@@ -619,7 +619,7 @@ DEFAULT_CONFIG = {
         # A prune only commits when it reclaims at least this many tokens, then waits for a
         # trigger-sized runway to regrow before rearming. 0 = no minimum-savings gate.
         "proactive_prune_min_reclaim_tokens": 4096,
-        # micro_compact: opt-in — after each turn fold the oldest un-absorbed exchange into a
+        # micro_compact: opt-in - after each turn fold the oldest un-absorbed exchange into a
         # rolling summary, amortizing compression cost. Off by default because every pass rewrites
         # sent history and breaks the prompt-cache prefix EVERY turn; enable only if the amortized
         # stall beats the cached-prefix discount. See website/docs/developer-guide/micro-compaction.md.
@@ -681,7 +681,7 @@ DEFAULT_CONFIG = {
         # in_place: compaction rewrites the message list and system prompt WITHOUT rotating the
         # session id (no parent_session_id chain, no `name #N` renumbering), avoiding the
         # session-rotation bug cluster. Pre-compaction turns are soft-archived under the same id
-        # (active=0, compacted=1) — still session_search-able. False = legacy rotating-compaction
+        # (active=0, compacted=1) - still session_search-able. False = legacy rotating-compaction
         # path.
         "in_place": True,
         # Per-model threshold overrides: keys substring-match the model name (longest wins), values
@@ -696,11 +696,11 @@ DEFAULT_CONFIG = {
         "idle_compact_after_seconds": 0,
     },
     # Anthropic prompt caching (Claude via OpenRouter or native API). cache_ttl: "5m" | "1h" | "auto"
-    # (auto = 1h for human-paced sessions — cli/tui/desktop/messaging — and 5m for subagent, cron,
+    # (auto = 1h for human-paced sessions - cli/tui/desktop/messaging - and 5m for subagent, cron,
     # oneshot, webhook, kanban, api, tool, batch); other non-falsy values are ignored; falsy (false, null, "off",
     # "disabled", "no", "none") disables caching.
     "prompt_caching": {"cache_ttl": "5m"},
-    # OpenRouter settings. response_cache: X-OpenRouter-Cache header — identical requests return
+    # OpenRouter settings. response_cache: X-OpenRouter-Cache header - identical requests return
     # cached responses at zero billing; independent of Anthropic prompt caching. response_cache_ttl:
     # seconds (1-86400), only used when response_cache is on. min_coding_score (0.0-1.0):
     # pareto-code router knob, applied only when model.model is "openrouter/pareto-code"; higher =
@@ -723,7 +723,7 @@ DEFAULT_CONFIG = {
             "trace": "disabled",         # "enabled" | "disabled" | "enabled_full"
         },
     },
-    # Auxiliary model config — provider/model per side task. provider "auto" = auto-detect;
+    # Auxiliary model config - provider/model per side task. provider "auto" = auto-detect;
     # empty model = provider's default aux model; all tasks fall back to
     # openrouter:google/gemini-3-flash-preview when the configured provider is unavailable.
     # extra_body is forwarded verbatim as request body fields for that task, e.g. OpenRouter
@@ -733,7 +733,7 @@ DEFAULT_CONFIG = {
     #       extra_body:
     #         provider: {order: [anthropic, google], sort: throughput}  # or price | latency
     #         plugins: [{id: pareto-router, min_coding_score: 0.5}]
-    # Each task is independent — main-agent provider_routing and openrouter.min_coding_score
+    # Each task is independent - main-agent provider_routing and openrouter.min_coding_score
     # do NOT propagate to aux calls by design.
     "auxiliary": {
         # Same-provider retries for a transient blip (reset/timeout/5xx/408) on ANY aux call before
@@ -741,7 +741,7 @@ DEFAULT_CONFIG = {
         # fallback is not meaningful recovery.
         "transient_retries": 2,
         # When true, the auto-chain's OpenRouter step is skipped unless the fallback model ends in
-        # ":free" — a PAID lane is never used for background aux traffic even with
+        # ":free" - a PAID lane is never used for background aux traffic even with
         # OPENROUTER_API_KEY set.
         "free_only": False,
         # Override the auto-chain's OpenRouter fallback model (default google/gemini-3.6-flash,
@@ -761,10 +761,10 @@ DEFAULT_CONFIG = {
         # are ignored. Compression: raise timeout for local models. no_progress_timeout:
         # seconds a streamed call goes without a substantive chunk before it fails fast into
         # retry/fallback; None = built-in 60s default. Independent of "timeout" (the overall request
-        # budget) — raising "timeout" alone does not widen this window. See #108104.
+        # budget) - raising "timeout" alone does not widen this window. See #108104.
         "compression": _aux(120, no_progress_timeout=None),
         "skills_hub": _aux(30),
-        "approval": _aux(30),   # classifier — a fast/cheap model is recommended
+        "approval": _aux(30),   # classifier - a fast/cheap model is recommended
         # /review reviewer: a full subagent on the async delegation rail, credentials resolved like
         # delegation.provider pins. "auto" + "" = main agent's model. api_mode forces transport:
         # chat_completions | anthropic_messages | codex_responses.
@@ -774,7 +774,7 @@ DEFAULT_CONFIG = {
         "title_generation": {
             "enabled": True,
             "model_upgrade_enabled": True,  # False = keep the instant derived title, never call a model
-            # Note: session_search no longer uses an auxiliary LLM (PR #27590 — single-shape tool returns DB
+            # Note: session_search no longer uses an auxiliary LLM (PR #27590 - single-shape tool returns DB
             # content directly). The old ``auxiliary.session_search.*`` block was removed here. Existing
             # values in user config.yaml files are harmless leftovers and ignored.
             "provider": "auto",
@@ -810,7 +810,7 @@ DEFAULT_CONFIG = {
         # prompt-cache prefix (#30532). Set provider/model below to route the review to another model
         # if you want a different effort level; a one-time warning says so when the key is set.
         "background_review": {"enabled": True, **_aux(120)},
-        # No reasoning_effort on MoA blocks by design — configured PER SLOT in the preset
+        # No reasoning_effort on MoA blocks by design - configured PER SLOT in the preset
         # (moa.presets.<name>.reference_models[].reasoning_effort / aggregator.reasoning_effort).
         "moa_reference": _aux(900, reasoning_effort=False),
         "moa_aggregator": _aux(900, reasoning_effort=False),
@@ -949,7 +949,7 @@ DEFAULT_CONFIG = {
         # ("-# " Discord small grey text; Discord's default). Per-platform via
         # display.platforms.<platform>.reasoning_style.
         "reasoning_style": "code",
-        # Auto-delete EphemeralReply system notices ("✨ New session started!", …) after N seconds
+        # Auto-delete EphemeralReply system notices ("✨ New session started!", ...) after N seconds
         # where deletion is supported (Telegram; others ignore). Agent responses are never touched.
         # 0 = disabled.
         "ephemeral_system_ttl": 0,
@@ -1007,7 +1007,7 @@ DEFAULT_CONFIG = {
         "compute_host_heartbeat_secs": 15,
         "compute_host_respawn_max": 3,
         # Token/cost analytics surfaces are hidden by default: the numbers are a local LOWER-BOUND
-        # estimate, not billing — only successful main-agent responses with a response.usage count;
+        # estimate, not billing - only successful main-agent responses with a response.usage count;
         # auxiliary calls, retries, fallbacks and cache writes are missed, so the total can be
         # 10x-100x under the provider bill.
         "show_token_analytics": False,
@@ -1031,21 +1031,21 @@ DEFAULT_CONFIG = {
         # end_reason='startup_orphan_reap'; otherwise they stay phantom "active" forever.
         # Messaging-gateway and live sessions are never touched; swept rows stay resumable.
         # The ws-orphan grace timer above is in-process, so a gateway restart (update, crash, systemd)
-        # leaves disconnected sessions ``ended_at IS NULL`` forever — phantom "active" rows in /resume and
+        # leaves disconnected sessions ``ended_at IS NULL`` forever - phantom "active" rows in /resume and
         # dashboards. See #65194.
         "startup_orphan_sweep": True,
         # OAuth gate (engaged when --host is set and --insecure is not), read by the Nous Portal
         # plugin. Env HERMES_DASHBOARD_OAUTH_CLIENT_ID / HERMES_DASHBOARD_PORTAL_URL win when
         # non-empty. Empty client_id = no provider; empty portal_url = production.
         "oauth": {
-            "client_id": "",  # agent:{instance_id} — Portal provisions this
+            "client_id": "",  # agent:{instance_id} - Portal provisions this
             "portal_url": "",
         },
         # Username/password gate (dashboard_auth/basic plugin, no OAuth IDP). Active when username
         # plus password_hash (preferred) or password (hashed in-memory) are set; empty username =
         # no-op. Env HERMES_DASHBOARD_BASIC_AUTH_USERNAME / _PASSWORD_HASH / _PASSWORD / _SECRET /
         # _TTL_SECONDS win when non-empty. secret signs session tokens; empty = random per-process
-        # key (sessions die on restart, no multi-worker) — set 32+ random bytes. Hash:
+        # key (sessions die on restart, no multi-worker) - set 32+ random bytes. Hash:
         # plugins.dashboard_auth.basic.hash_password('PW').
         "basic_auth": {
             "username": "",
@@ -1119,9 +1119,9 @@ DEFAULT_CONFIG = {
         "xai": {
             "voice_id": "eve",  # or a custom voice ID (docs.x.ai custom voices)
             "language": "en",  # BCP-47 code ("en", "pt-BR") or "auto"
-            "speed": 1.0,  # 0.7–1.5
+            "speed": 1.0,  # 0.7-1.5
             "auto_speech_tags": False,  # insert expressive audio tags via LLM rewrite
-            "optimize_streaming_latency": 0,  # 0–2, trades quality for lower latency
+            "optimize_streaming_latency": 0,  # 0-2, trades quality for lower latency
             "sample_rate": 24000,  # 22050 / 24000 / 44100 / 48000
             "bit_rate": 128000,  # MP3 bitrate; only applies when codec=mp3
         },
@@ -1160,7 +1160,7 @@ DEFAULT_CONFIG = {
         "echo_transcripts": True,
         # No seeded "provider": a stored value counts as an explicit user pick; unset = autodetect
         # ladder. Valid: "local" (faster-whisper) | "groq" | "openai" | "mistral" | "elevenlabs" |
-        # "deepinfra". Global language hint unless a per-provider language overrides it. "en"
+        # "deepinfra" | "deepgram". Global language hint unless a per-provider language overrides it. "en"
         # because Whisper auto-detect misreads short/accented clips; "" = auto; or "es", "zh", ...
         "language": "en",
         # Client-side ffmpeg silence trim before cloud upload (local whisper uses VAD): silence
@@ -1210,12 +1210,19 @@ DEFAULT_CONFIG = {
             "model": "",  # empty = first stt-tagged model from the live catalog
             # optional "base_url" key overrides DEEPINFRA_BASE_URL for STT only
         },
+        "deepgram": {
+            "model": "nova-3",  # nova-3, nova-2, base, enhanced, ... (Nova-3 = the dash voice spine)
+            "language": "",  # auto-detect; set "en", "es", ... to force
+            "punctuate": True,  # add punctuation + capitalization
+            "smart_format": True,  # convert numbers/dates/units to their spoken forms
+            # optional "base_url" key overrides DEEPGRAM_STT_BASE_URL for STT only
+        },
     },
 
     "voice": {
         # How the Desktop voice conversation is wired:
-        #   chained  — STT → Hermes turn → TTS (the stt.* / tts.* providers below)
-        #   gpt-live — one full-duplex voice model (OpenAI GPT-Live) owns the mic and speaker and
+        #   chained  - STT → Hermes turn → TTS (the stt.* / tts.* providers below)
+        #   gpt-live - one full-duplex voice model (OpenAI GPT-Live) owns the mic and speaker and
         #              DELEGATES every real request to Hermes (any model / provider you have
         #              selected); needs an OpenAI API key. $0.05/min voice layer billing.
         "voice_chat_mode": "chained",
@@ -1295,7 +1302,7 @@ DEFAULT_CONFIG = {
 
     "human_delay": {"mode": "off", "min_ms": 800, "max_ms": 2500},
 
-    # Context engine — how the context window is managed near the token limit. "compressor" =
+    # Context engine - how the context window is managed near the token limit. "compressor" =
     # built-in lossy summarization; or a plugin name (e.g. "lcm") installed in
     # plugins/context_engine/<name>/ or ~/.hermes/plugins/.
     "context": {
@@ -1309,7 +1316,7 @@ DEFAULT_CONFIG = {
             "info_log_min_delta_mb": 0.0,
         },
     },
-    "memory": {  # Persistent memory — bounded curated memory injected into the system prompt
+    "memory": {  # Persistent memory - bounded curated memory injected into the system prompt
         "memory_enabled": True,
         "user_profile_enabled": True,
         # Approval gate for memory writes on BOTH foreground turns and the background review fork.
@@ -1325,7 +1332,7 @@ DEFAULT_CONFIG = {
         # "hindsight", "supermemory").
         "provider": "",
     },
-    # Subagent delegation — override the provider:model used by delegate_task so children run on a
+    # Subagent delegation - override the provider:model used by delegate_task so children run on a
     # cheaper/faster model. Uses the same runtime provider resolution as CLI/gateway startup, so
     # every configured provider is supported.
     "delegation": {
@@ -1349,7 +1356,7 @@ DEFAULT_CONFIG = {
         "request_overrides": {},
         # compression_threshold_tokens: optional absolute cap on a subagent's compaction TRIGGER
         # (not the request payload), applied as the lower of this and the child's ratio threshold.
-        # 0 (default) = no subagent-specific cap; children compact where the parent does — the lower
+        # 0 (default) = no subagent-specific cap; children compact where the parent does - the lower
         # of 0.50 x window and the global compression.threshold_tokens cap. A replay of a 1,393-agent
         # run showed 200K-400K caps within 5% of each other in cost once cache prefixes are intact,
         # and every compaction is a chance to lose detail, so the default stays off. A token count >= 16000 enables it;
@@ -1365,7 +1372,7 @@ DEFAULT_CONFIG = {
         # ~/.hermes/cache/delegation/ with a head+tail window + read_file offset footer, nothing
         # lost). 0 disables the ceiling; the dynamic budget still applies.
         "max_summary_chars": 24000,
-        # Inactivity cap per child (seconds, floor 30) — time with NO progress, not total runtime. 0 = no cap:
+        # Inactivity cap per child (seconds, floor 30) - time with NO progress, not total runtime. 0 = no cap:
         # children fail only from real errors (API, tools, iteration budget). A progressing child (including one
         # waiting on a multi-minute completion) restarts the window; a frozen one is caught.
         "child_timeout_seconds": 0,
@@ -1376,7 +1383,7 @@ DEFAULT_CONFIG = {
         # dispatches beyond it run synchronously. Floor 1, no ceiling.
         "max_concurrent_children": 10,
         # Background fan-outs return as ONE message when the whole call finishes. true = each task
-        # (or `group`) returns on its own as it finishes — more new turns for the orchestrator.
+        # (or `group`) returns on its own as it finishes - more new turns for the orchestrator.
         "independent_completions": False,
         # Orchestrator role controls. Depth floored at 1, no ceiling; each level multiplies cost.
         "max_spawn_depth": 1,  # 1 = flat, 2 = orchestrator→leaf, 3+ = deeper
@@ -1394,18 +1401,18 @@ DEFAULT_CONFIG = {
         # deliverable). Async-delegation results are NEVER suppressed.
         "surface_child_process_notifications": False,
     },
-    # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
+    # Ephemeral prefill messages file - JSON list of {role, content} dicts injected at the start of
     # every API call for few-shot priming. Never saved to sessions/logs/trajectories.
     "prefill_messages_file": "",
-    # Goals — persistent cross-turn /goal loop: after each turn an aux-model judge checks if the
+    # Goals - persistent cross-turn /goal loop: after each turn an aux-model judge checks if the
     # goal is satisfied, else a continuation prompt re-enters the session until done, budget
     # exhausted, or paused. Judge failures fail OPEN; the budget is the backstop.
     "goals": {
-        # Max continuation turns before auto-pause (/goal resume) — guards against judge false
+        # Max continuation turns before auto-pause (/goal resume) - guards against judge false
         # negatives and unbounded spend.
         "max_turns": 20,
     },
-    # Loops — /loop re-runs a prompt or slash command on a cadence in-session. Fixed interval fires
+    # Loops - /loop re-runs a prompt or slash command on a cadence in-session. Fixed interval fires
     # on the user's clock; self-paced (no interval) starts at the floor and backs off exponentially
     # while replies stop changing.
     "loops": {
@@ -1414,7 +1421,7 @@ DEFAULT_CONFIG = {
         "self_paced_floor_seconds": 60,  # Self-paced cadence bounds (seconds).
         "self_paced_ceiling_seconds": 900,
     },
-    # Mixture of Agents — named presets used by /moa. A preset is an execution mode around the main
+    # Mixture of Agents - named presets used by /moa. A preset is an execution mode around the main
     # model, not a model itself: references + aggregator synthesize private guidance before each
     # main-model iteration.
     "moa": {
@@ -1428,8 +1435,8 @@ DEFAULT_CONFIG = {
         # traces only; aggregator sees raw) | "full" (also the aggregator prompt).
         # Advisors can echo PII from the conversation (emails, formatted phone numbers) and credential
         # shapes into reference blocks, traces, and the aggregator prompt. Modes ('' = off, the default):
-        # "display" — redact user-visible surfaces only (reference blocks shown in the UI + saved MoA trace
-        # records); the aggregator still sees raw advisor text. "full"    — additionally redact the advisor
+        # "display" - redact user-visible surfaces only (reference blocks shown in the UI + saved MoA trace
+        # records); the aggregator still sees raw advisor text. "full"    - additionally redact the advisor
         # text injected into the aggregator prompt (issue #59959).
         "privacy_filter": "",
         "presets": {
@@ -1444,8 +1451,8 @@ DEFAULT_CONFIG = {
             }
         },
     },
-    # Skills — external skill directories shared across tools/agents. Paths are expanded (~, ${VAR})
-    # and resolved; read-only — creation goes to ~/.hermes/skills/ unless create_dir redirects it.
+    # Skills - external skill directories shared across tools/agents. Paths are expanded (~, ${VAR})
+    # and resolved; read-only - creation goes to ~/.hermes/skills/ unless create_dir redirects it.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
         # Where skill_manage-created skills go (empty = profile-local dir). When set, new skills
@@ -1453,7 +1460,7 @@ DEFAULT_CONFIG = {
         # HERMES_HOME, scanned alongside the local dir.
         "create_dir": "",
         # In a git checkout, <root>/.hermes/skills/ and <root>/.agents/skills/ load as the
-        # highest-precedence tier — ONLY if the root is in trusted_project_dirs. false = no scan, no
+        # highest-precedence tier - ONLY if the root is in trusted_project_dirs. false = no scan, no
         # untrusted-skills notice.
         "project_discovery": True,
         # Trusted project roots; managed by `hermes skills trust` / `untrust`.
@@ -1465,7 +1472,7 @@ DEFAULT_CONFIG = {
         # Substitute ${HERMES_SKILL_DIR} / ${HERMES_SESSION_ID} in SKILL.md content.
         "template_vars": True,
         # Pre-execute !`cmd` snippets in SKILL.md, inlining stdout (dates, git state...). Off:
-        # skill-author content would run on the host unapproved — trusted sources only.
+        # skill-author content would run on the host unapproved - trusted sources only.
         "inline_shell": False,
         "inline_shell_timeout": 10,  # seconds per !`cmd` snippet
         # Security-scan skills the agent writes via skill_manage. Off: the agent can run the same
@@ -1483,7 +1490,7 @@ DEFAULT_CONFIG = {
         "write_approval": False,
         # Audit ledger: every skill mutation appends to ~/.hermes/skills/.curator_ledger.jsonl with
         # before/after hashes (blobs under ~/.hermes/.curator_backups/blobs/); powers `hermes
-        # curator ledger` / `rollback <entry-id>`. Never a gate — failures can't block.
+        # curator ledger` / `rollback <entry-id>`. Never a gate - failures can't block.
         # See #79686.
         "ledger": True,
         # Size cap for that ledger: once the file grows past this, the next append rewrites it
@@ -1492,7 +1499,7 @@ DEFAULT_CONFIG = {
         "ledger_max_bytes": 5 * 1024 * 1024,
     },
 
-    # Curator — background maintenance of AGENT-CREATED skills (never hub-installed): marks
+    # Curator - background maintenance of AGENT-CREATED skills (never hub-installed): marks
     # long-unused skills stale, archives (never deletes) obsolete ones, optionally consolidates
     # overlaps via a forked aux-model agent. Inactivity-triggered from session start, no cron
     # daemon. `hermes curator status` shows the last run.
@@ -1521,7 +1528,7 @@ DEFAULT_CONFIG = {
             "keep": 2,  # retain last N regular snapshots
         },
     },
-    # Honcho memory plugin (plugin catalog) — ~/.honcho/config.json is the source of truth (apiKey,
+    # Honcho memory plugin (plugin catalog) - ~/.honcho/config.json is the source of truth (apiKey,
     # workspace, peerName, sessions, enabled); the plugin reads hermes-specific overrides from here.
     "honcho": {},
     # IANA timezone (e.g. "Asia/Kolkata", "America/New_York"). Empty = server-local time.
@@ -1606,9 +1613,9 @@ DEFAULT_CONFIG = {
             "enabled": False,  # master switch for the mixer subsystem
             "ambient_enabled": True,  # play the idle "thinking" bed while tools run
             "ambient_path": "",  # custom loop audio file; "" = synthesised pad
-            "ambient_gain": 0.18,  # idle bed loudness, 0.0–1.0
+            "ambient_gain": 0.18,  # idle bed loudness, 0.0-1.0
             "duck_gain": 0.06,  # ambient loudness while speech plays
-            "speech_gain": 1.0,  # TTS / ack loudness, 0.0–1.0
+            "speech_gain": 1.0,  # TTS / ack loudness, 0.0-1.0
             "ack_enabled": True,  # speak a short phrase before the first tool call
             "ack_phrases": [  # picked at random; [] disables phrases
                 "Let me look into that.",
@@ -1656,7 +1663,7 @@ DEFAULT_CONFIG = {
     },
     # Approvals for dangerous commands.
     # mode: manual (always prompt) | smart (aux LLM auto-approves low-risk) | off (= --yolo)
-    # cron_mode / single_query_mode / unattended_mode: deny | approve — what to do when a
+    # cron_mode / single_query_mode / unattended_mode: deny | approve - what to do when a
     #   cron job, a -q session (HERMES_INTERACTIVE=1 but nobody to answer), or an unattended
     #   platform (webhook, msgraph_webhook, api_server; no /approve channel) hits one.
     #   deny blocks instantly so the agent finds another way instead of waiting out the
@@ -1664,18 +1671,18 @@ DEFAULT_CONFIG = {
     # timeout: seconds before an unanswered prompt fails closed (CLI and gateway). 60s
     #   proved too tight for Telegram/Discord push notifications, hence 300.
     "approvals": {
-        # single_query_mode — what to do when a single-query (-q) session hits a dangerous command. -q runs
+        # single_query_mode - what to do when a single-query (-q) session hits a dangerous command. -q runs
         # export HERMES_INTERACTIVE=1 (for interactive sudo prompts) but have NO user waiting to answer
-        # approval prompts — an unanswered prompt just waits the full timeout then fails closed, so the
+        # approval prompts - an unanswered prompt just waits the full timeout then fails closed, so the
         # agent is forced to work around the block (often via execute_code). This setting makes that intent
-        # explicit: deny    — block the command and let the agent find another way (default, safe; mirrors
-        # cron_mode deny) approve — auto-approve all dangerous commands in single-query mode These surfaces
+        # explicit: deny    - block the command and let the agent find another way (default, safe; mirrors
+        # cron_mode deny) approve - auto-approve all dangerous commands in single-query mode These surfaces
         # bind a session platform like chat gateways do, but have no send_exec_approval and no /approve
-        # channel — a pending approval there just blocks for the full timeout with nobody to answer (#37284,
-        # #87509): deny    — block the command instantly and let the agent find another way (default, safe;
-        # mirrors cron_mode deny) approve — auto-approve all dangerous commands on unattended platforms
+        # channel - a pending approval there just blocks for the full timeout with nobody to answer (#37284,
+        # #87509): deny    - block the command instantly and let the agent find another way (default, safe;
+        # mirrors cron_mode deny) approve - auto-approve all dangerous commands on unattended platforms
         # Shared by the CLI prompt and gateway/messaging waits. Messaging approvals arrive as a push
-        # notification the user may not see immediately — 60s proved too tight on Telegram/Discord (the
+        # notification the user may not see immediately - 60s proved too tight on Telegram/Discord (the
         # prompt expired before the user reached their phone), so the default is 300.
         "mode": "smart",
         "timeout": 300,
@@ -1762,7 +1769,7 @@ DEFAULT_CONFIG = {
         # How `hermes auth add openai-codex` / `hermes model` sign in to OpenAI Codex.
         # "device_code" (default): open a URL, enter a code. "browser": authorization-code + PKCE on
         # the loopback listener http://localhost:1455/auth/callback (the redirect OpenAI registered
-        # for the Codex client) — for organizations that disable the device-code grant. Falls back
+        # for the Codex client) - for organizations that disable the device-code grant. Falls back
         # to device code when that port is busy. `hermes auth add openai-codex --browser` opts in
         # for one login without changing this key.
         "codex_login_flow": "device_code",
@@ -1826,7 +1833,7 @@ DEFAULT_CONFIG = {
         # e.g. "chronos" (NAS-mediated managed cron for scale-to-zero). An unknown or unavailable
         # provider falls back to the built-in so cron never loses its trigger.
         "provider": "",
-        # Chronos settings; consulted only when provider == "chronos". All non-secret — the agent
+        # Chronos settings; consulted only when provider == "chronos". All non-secret - the agent
         # holds NO scheduler credentials (provision reuses the Nous Portal token).
         "chronos": {
             # NAS/portal base URL that arms/cancels one-shots and mints the inbound fire JWT (used
@@ -1921,17 +1928,17 @@ DEFAULT_CONFIG = {
         # boards and both dispatch lanes. None = ~MemTotal / 512 MiB clamped to [2, 8]; where
         # MemTotal is unreadable (macOS/Windows) None means no cap.
         # Global concurrency cap (#33488): when set to a positive int, the HOST never has more than N tasks
-        # in 'running' at once — counted across every active board and across both the ready and review
+        # in 'running' at once - counted across every active board and across both the ready and review
         # dispatch lanes (workers are OS processes sharing one machine's memory, so the cap bounds the
         # machine, not each board; OOF-30). Unset (None) means "derive from system memory" (OOF-30/OOF-77):
-        # the dispatcher caps concurrency at roughly MemTotal / 512 MiB, clamped to [2, 8] — e.g. 2 workers
+        # the dispatcher caps concurrency at roughly MemTotal / 512 MiB, clamped to [2, 8] - e.g. 2 workers
         # on a 1 GiB VM. On hosts where total memory can't be read (macOS/Windows), unset falls back to no
         # cap. Set an explicit value to override the derived default in either direction.
         "max_in_progress": None,
         # Per-profile cap: positive int = no single profile runs more than N workers even if the
         # global caps allow; blocked tasks defer to the next tick. None = no per-profile cap. Useful
         # when fan-out would saturate one profile's model/API quota/browser pool.
-        # Unset (None) means "no per-profile cap" — backward-compatible with existing installs. Useful for
+        # Unset (None) means "no per-profile cap" - backward-compatible with existing installs. Useful for
         # fan-out workflows that would otherwise saturate one profile's local model / API quota / browser
         # pool while leaving other profiles idle. See #21582.
         "max_in_progress_per_profile": None,
@@ -1993,7 +2000,7 @@ DEFAULT_CONFIG = {
         # kernel_idle_timeout idle seconds, or by LRU eviction past max_session_kernels. A
         # timed-out/interrupted cell kills the kernel; env is frozen at spawn (reset=true after
         # changing passthrough). Tool RPC authority (approval, session, allow-list, call budget) is
-        # rebound per cell — that runtime boundary is the cross-cell enforcement.
+        # rebound per cell - that runtime boundary is the cross-cell enforcement.
         "kernel_idle_timeout": 1800,
         "max_session_kernels": 4,
     },
@@ -2068,7 +2075,7 @@ DEFAULT_CONFIG = {
     # agent/model_metadata.py). <provider>._default and top-level _default fill gaps ONLY for models
     # the catalog does not know, so they never clamp known models. Unknown ids start from safe
     # defaults (200K context, tools on) and get patched; supports_vision / supports_reasoning stay
-    # UNKNOWN (fail-open) unless the override sets them — a context_window-only entry must not turn
+    # UNKNOWN (fail-open) unless the override sets them - a context_window-only entry must not turn
     # into "text-only" and hide vision_analyze / reasoning controls (#112649). Provider keys: Hermes
     # or models.dev id; model ids match case-insensitively. Example: {"custom:my-local-vllm":
     # {"my-llava-model": {"context_window": 8192}}}
@@ -2118,7 +2125,7 @@ DEFAULT_CONFIG = {
         "signal_interrupt_grace_timeout": 1,
         # Durable delivery-obligation ledger: final responses are recorded in state.db around the
         # platform send; a gateway that died between finalize and platform ACK redelivers on next
-        # boot (ambiguous cases carry a "recovered reply — may be a duplicate" marker;
+        # boot (ambiguous cases carry a "recovered reply - may be a duplicate" marker;
         # at-least-once). Disable to lose in-flight final responses on crash/restart.
         "delivery_ledger": True,
         # Seconds to wait for one platform to connect at startup/reconnect; raise on "discord
@@ -2158,7 +2165,7 @@ DEFAULT_CONFIG = {
         "write_sessions_json": True,
         # One gateway for every profile on this host: the DEFAULT profile's gateway also connects
         # each named profile's bots (their own .env / config.yaml, per-profile secret scope) and
-        # stamps the profile into session keys. This is the ONLY supported topology — there is no
+        # stamps the profile into session keys. This is the ONLY supported topology - there is no
         # `false` opt-out any more: an explicit `false` still parses (it is the runtime mode flag
         # every scoped code path reads) but is warned about and IGNORED for process topology, and
         # `hermes gateway migrate --multiplex` folds any per-profile fleet that is left.
@@ -2166,18 +2173,18 @@ DEFAULT_CONFIG = {
         # preflight and stays standalone (logging why) while a secondary still runs its own
         # gateway or a blocker exists, then converges once that is resolved.
         # TWO things DO change on a host that had pinned `false`, and neither is a process:
-        #   • INGRESS — `/p/<profile>/` on the default listener goes 404 -> served
+        #   * INGRESS - `/p/<profile>/` on the default listener goes 404 -> served
         #     (gateway/api_server.py::_resolve_request_profile, gateway/webhook.py). A host that
         #     opted out GAINS that HTTP surface; it is authenticated exactly like the default
         #     profile's, but it is new reachable surface, so audit any reverse proxy that assumed
         #     /p/ was dead.
-        #   • SECRET SCOPE — eager multi-profile activation no longer consults the flag
+        #   * SECRET SCOPE - eager multi-profile activation no longer consults the flag
         #     (tui_gateway/launch_profile_policy.py), so a host with a leftover servable profile
         #     dir flips eager=false/reads-open -> eager=true/fail-closed: an UNSCOPED `get_secret`
         #     now raises UnscopedSecretError, and a key that lives ONLY in the unit's
         #     `Environment=` (no .env) disappears from file-built scopes. A genuinely
         #     single-profile host never activates and is byte-identical.
-        # Two profiles configuring the same bot token cannot be served together — the duplicate
+        # Two profiles configuring the same bot token cannot be served together - the duplicate
         # adapter is parked; `hermes profile create --clone` therefore leaves messaging channels
         # behind unless --clone-channels is passed.
         "multiplex_profiles": True,
@@ -2227,7 +2234,7 @@ DEFAULT_CONFIG = {
         # Media delivery. False: any emitted file path is delivered natively unless under the
         # credential/system denylist (/etc, /proc, ~/.ssh, ~/.aws, ~/.hermes/.env, auth.json). True:
         # files must be under the Hermes cache, media_delivery_allow_dirs, or fresher than
-        # trust_recent_files_seconds — recommended for public-facing gateways so prompt injection
+        # trust_recent_files_seconds - recommended for public-facing gateways so prompt injection
         # can't exfiltrate host secrets. Bridged to HERMES_MEDIA_DELIVERY_STRICT.
         "strict": False,
         # Extra roots (project/scratch dirs, mounted shares) from which bare file paths may be
@@ -2284,7 +2291,7 @@ DEFAULT_CONFIG = {
         # Inactive days of ended-session history to keep (= `hermes sessions prune`).
         # When true, prune ENDED sessions inactive for retention_days once per (roughly) min_interval_hours
         # at CLI/gateway/cron startup. Activity is the freshest of live activity (last_activity_at) / latest
-        # message timestamp / creation time. Sessions that are still open, pinned, or mid-turn are never deleted — the
+        # message timestamp / creation time. Sessions that are still open, pinned, or mid-turn are never deleted - the
         # only open rows the sweep touches are stale automation sessions (cron/kanban/subagent/one-shot CLI)
         # whose process died without closing them; those are *closed*, not deleted, and get a further full
         # retention window before removal. Default true since #54189: without it state.db grows without
@@ -2301,7 +2308,7 @@ DEFAULT_CONFIG = {
         # VACUUM after a prune that deleted rows (SQLite never reclaims disk on DELETE). VACUUM
         # blocks writes (~seconds per 100MB), so it runs only at startup, only when ≥1 session was
         # deleted AND freelist/page_count > 25%.
-        # SQLite does not reclaim disk space on DELETE — freed pages are just reused on subsequent INSERTs —
+        # SQLite does not reclaim disk space on DELETE - freed pages are just reused on subsequent INSERTs -
         # so without VACUUM the file stays bloated even after pruning. See #54189.
         "vacuum_after_prune": True,
         # Minimum days between VACUUM rewrites; pruning keeps its normal cadence.
@@ -2370,14 +2377,14 @@ DEFAULT_CONFIG = {
         # <HERMES_HOME>/backups/ (``hermes import`` restores; slow on large homes; ``--backup``
         # forces once). off = none (``--no-backup`` forces once). Legacy booleans: true -> full,
         # false -> off.
-        # Pre-update safety backup — ONE consolidated mechanism, three modes: Files over 1 GiB (e.g. a
+        # Pre-update safety backup - ONE consolidated mechanism, three modes: Files over 1 GiB (e.g. a
         # bloated state.db) are skipped with a warning so the snapshot stays fast. This is the #48200
         # (wrong-path wipe) safety net.
         "pre_update_backup": "quick",
         # Full backup zips to retain (older pruned after each success; floored to 1 so the newest is
         # always kept). The quick snapshot always keeps exactly 1.
         "backup_keep": 5,
-        # Uncommitted source-tree changes during NON-interactive updates (desktop, gateway — no TTY;
+        # Uncommitted source-tree changes during NON-interactive updates (desktop, gateway - no TTY;
         # interactive updates always stash and ask). stash = stash, pull, restore on top (conflicts
         # stay in a git stash). discard = stash and drop after the pull (stash-and-drop, not reset
         # --hard + clean -fd, so ignored paths like node_modules/venv are never touched).
@@ -2415,7 +2422,7 @@ DEFAULT_CONFIG = {
         "broken_retry_seconds": 0.0,
         # Workspace roots (glob patterns, ~ expanded; a bare path also matches everything under
         # it) where no language server runs at all, e.g. one huge monorepo whose server cannot
-        # finish in budget, while every other workspace keeps its diagnostics. Must be a list —
+        # finish in budget, while every other workspace keeps its diagnostics. Must be a list -
         # any other shape logs a warning and skips LSP for every workspace until fixed.
         "exclude_roots": [],
         # Directories (~ expanded; everything under an entry counts) whose projects a language
@@ -2458,7 +2465,7 @@ DEFAULT_CONFIG = {
         # Retries on 5xx / ReadTimeout / ConnectionError (backoff 1.5x attempt s, cap 5s).
         "retries": 2,
     },
-    # External secret sources — pull credentials from secret managers at startup instead of storing
+    # External secret sources - pull credentials from secret managers at startup instead of storing
     # them in ~/.hermes/.env.
     # Browser credential vault: which login sources browser_vault_list/fill may draw from. The local
     # encrypted vault (`hermes vault add`, Desktop → Settings → Credential Vault) is always on.
@@ -2484,7 +2491,7 @@ DEFAULT_CONFIG = {
         # first claim on a var wins, later ones warn. "sources": [],
         "bitwarden": {
             "enabled": False,  # When false, BSM is never contacted and bws is never auto-installed.
-            # Env var holding the machine-account token — the one bootstrap secret; lives in
+            # Env var holding the machine-account token - the one bootstrap secret; lives in
             # ~/.hermes/.env (or the shell), never in config.yaml.
             "access_token_env": "BWS_ACCESS_TOKEN",
             "project_id": "",  # UUID of the BSM project to sync from.
@@ -2561,9 +2568,9 @@ DEFAULT_CONFIG = {
         # CUA_DRIVER_RS_TELEMETRY_ENABLED=0 in every child env unless this is true.
         "cua_telemetry": False,
         # Windows only: opt IN to the per-boot cua-driver-serve logon task. False (default)
-        # keeps the driver on-demand — Computer Use starts it per session, exactly as on
+        # keeps the driver on-demand - Computer Use starts it per session, exactly as on
         # macOS/Linux, and install/enable flows register no scheduled task (#97389). True
-        # registers (or repairs) the task at install time — needed to drive Windows over SSH,
+        # registers (or repairs) the task at install time - needed to drive Windows over SSH,
         # where Session 0 has no interactive desktop (see the computer-use guide).
         "autostart": False,
         "native_wayland": False,
@@ -2578,7 +2585,7 @@ DEFAULT_CONFIG = {
         # spills the rest to a cache file, so an unbounded walk pays for nodes the model never sees:
         # measured on macOS (cua-driver 0.28.2, M-series) a 1,444-node Chrome window went 540 ms -> 83 ms
         # and a 456-node Finder window 6.9 s -> 0.6 s at 200, with the returned elements a prefix of the
-        # unbounded walk. 0 = driver default (2,000 elements / depth 25) — the pre-fix behaviour.
+        # unbounded walk. 0 = driver default (2,000 elements / depth 25) - the pre-fix behaviour.
         # ~400 keeps the full first 100 visible elements on a pathological tree, at ~1.4 s on Finder;
         # the walk's cost grows with the bound, so keep it in the low hundreds. This caps the nodes
         # COLLECTED, not the walk's wall clock: a target whose AX surface exceeds the driver's own 20 s
@@ -2650,7 +2657,7 @@ DEFAULT_CONFIG = {
         "renderer_max_old_space_mb": 0,
         # Linux Ozone backend, bridged to ELECTRON_OZONE_PLATFORM_HINT (explicit env wins). auto =
         # Chromium default; x11 = XWayland, for compositors that ignore always-on-top for Wayland
-        # clients (e.g. COSMIC) — also puts the HUD on the solid-window input path; wayland = force
+        # clients (e.g. COSMIC) - also puts the HUD on the solid-window input path; wayland = force
         # a native Wayland surface.
         # See #84011.
         "ozone_platform_hint": "auto",
@@ -2671,7 +2678,7 @@ DEFAULT_CONFIG = {
         # are still created. True keeps the generated entry current on each launch.
         "manage_launcher_entry": True,
         # macOS only: code-signing identity (login-keychain cert; self-signed works) to re-sign
-        # locally rebuilt apps so the Designated Requirement — and thus TCC grants — survives
+        # locally rebuilt apps so the Designated Requirement - and thus TCC grants - survives
         # updates. Empty = default ad-hoc identifier-pinned signing.
         "macos_signing_identity": "",
         # Windows only: explicit ssh client for SSH connections, the -G config probe and SSH
@@ -2798,7 +2805,7 @@ OPTIONAL_ENV_VARS = {
     "GEMINI_BASE_URL": _base_url("Google AI Studio", "Gemini"),
     "VERTEX_CREDENTIALS_PATH": _prov(
         "Path to a Google Cloud service account JSON for Vertex AI (Gemini). Vertex uses "
-        "OAuth2, not a static API key — this points at the credentials Hermes mints short-lived "
+        "OAuth2, not a static API key - this points at the credentials Hermes mints short-lived "
         "tokens from. Falls back to GOOGLE_APPLICATION_CREDENTIALS, then to ADC (gcloud auth "
         "application-default login). Set project/region under vertex: in config.yaml.",
         "Vertex service account JSON path (leave empty to use ADC / "
@@ -2856,7 +2863,7 @@ OPTIONAL_ENV_VARS = {
     "OPENCODE_ZEN_API_KEY": _prov("OpenCode Zen API key (pay-as-you-go access to curated models)",
         "OpenCode Zen API key", "https://opencode.ai/auth"),
     "COMMANDCODE_API_KEY": _prov(
-        "CommandCode API key (GOAT/Pro/Max/Provider plans — 30+ models via one key)",
+        "CommandCode API key (GOAT/Pro/Max/Provider plans - 30+ models via one key)",
         "CommandCode API key", "https://commandcode.ai/studio/"),
     "OPENCODE_ZEN_BASE_URL": _base_url("OpenCode Zen"),
     "OPENCODE_GO_API_KEY": _prov("OpenCode Go API key ($10/month subscription for open models)",
@@ -2866,7 +2873,7 @@ OPTIONAL_ENV_VARS = {
         "Hugging Face token for Inference Providers (20+ open models via router.huggingface.co)",
         "Hugging Face Token", "https://huggingface.co/settings/tokens", advanced=False),
     "HF_BASE_URL": _base_url("Hugging Face Inference Providers", "HF"),
-    "OLLAMA_API_KEY": _prov("Ollama Cloud API key (ollama.com — cloud-hosted open models)",
+    "OLLAMA_API_KEY": _prov("Ollama Cloud API key (ollama.com - cloud-hosted open models)",
         "Ollama Cloud API key", "https://ollama.com/settings"),
     "OLLAMA_BASE_URL": _prov("Ollama Cloud base URL override (default: https://ollama.com/v1)",
         "Ollama base URL (leave empty for default)", None, password=False),
@@ -2924,7 +2931,7 @@ OPTIONAL_ENV_VARS = {
         "Explicit Nous Subscriber access token for tool-gateway requests (optional; otherwise "
         "read from the Hermes auth store)", "Tool-gateway user token", None, advanced=True),
     "TAVILY_API_KEY": _tool(
-        "Tavily API key for AI-native web search and extract (optional — keyless works when "
+        "Tavily API key for AI-native web search and extract (optional - keyless works when "
         "Tavily is selected)", "Tavily API key", "https://app.tavily.com/home",
         tools=["web_search", "web_extract"]),
     "PERPLEXITY_API_KEY": _tool(
@@ -2932,7 +2939,7 @@ OPTIONAL_ENV_VARS = {
         "snippets)", "Perplexity API key", "https://www.perplexity.ai/account/api",
         tools=["web_search", "web_extract"]),
     "KEENABLE_API_KEY": _tool(
-        "Keenable API key for fast independent-index web search and page fetch (optional — "
+        "Keenable API key for fast independent-index web search and page fetch (optional - "
         "keyless free tier works without it)", "Keenable API key", "https://keenable.ai",
         tools=["web_search", "web_extract"]),
     "SEARXNG_URL": _tool("URL of your SearXNG instance for free self-hosted web search",
@@ -2942,15 +2949,15 @@ OPTIONAL_ENV_VARS = {
         "Brave Search API subscription token (free tier: 2,000 queries/mo)",
         "Brave Search subscription token", "https://brave.com/search/api/", tools=["web_search"]),
     "BROWSERBASE_API_KEY": _tool(
-        "Browserbase API key for cloud browser (optional — local browser works without this)",
+        "Browserbase API key for cloud browser (optional - local browser works without this)",
         "Browserbase API key", "https://browserbase.com/",
         tools=["browser_navigate", "browser_click"]),
     "BROWSERBASE_PROJECT_ID": _tool(
-        "Browserbase project ID (optional — only needed for cloud browser)",
+        "Browserbase project ID (optional - only needed for cloud browser)",
         "Browserbase project ID", "https://browserbase.com/",
         tools=["browser_navigate", "browser_click"], password=False),
     "BROWSER_USE_API_KEY": _tool(
-        "Browser Use API key for cloud browser (optional — local browser works without this)",
+        "Browser Use API key for cloud browser (optional - local browser works without this)",
         "Browser Use API key", "https://browser-use.com/",
         tools=["browser_navigate", "browser_click"]),
     "FIRECRAWL_BROWSER_TTL": _tool(
@@ -3026,7 +3033,7 @@ OPTIONAL_ENV_VARS = {
         "Base URL for self-hosted RetainDB instances (default: https://api.retaindb.com)",
         "RetainDB base URL", password=None, advanced=True),
     # ── ByteRover ──
-    "BRV_API_KEY": _tool("ByteRover API key (optional, for cloud sync — local-first by default)",
+    "BRV_API_KEY": _tool("ByteRover API key (optional, for cloud sync - local-first by default)",
         "ByteRover API key", "https://app.byterover.dev", tools=["brv_query"]),
     # ── OpenViking ──
     "OPENVIKING_API_KEY": _tool("OpenViking API key (leave blank for local dev mode)",
@@ -3173,7 +3180,7 @@ OPTIONAL_ENV_VARS = {
         "API server model name", None, advanced=True),
     "GATEWAY_PROXY_URL": _msg(
         "URL of a remote Hermes API server to forward messages to (proxy mode). When set, the "
-        "gateway handles platform I/O only — all agent work is delegated to the remote server. "
+        "gateway handles platform I/O only - all agent work is delegated to the remote server. "
         "Use for Docker E2EE containers that relay to a host agent. Also configurable via "
         "gateway.proxy_url in config.yaml.",
         "Remote Hermes API server URL (e.g. http://192.168.1.100:8642)", None, advanced=True),
