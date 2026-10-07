@@ -7,6 +7,8 @@ Single `memory` tool: add/replace/remove or a batch `operations` list."""
 import copy
 import json
 import logging
+import re
+import time
 from contextvars import ContextVar
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -56,7 +58,7 @@ def load_on_disk_store() -> "MemoryStore":
         store = MemoryStore(int(mem_cfg.get("memory_char_limit", 2200)), int(mem_cfg.get("user_char_limit", 1375)),
                             memory_enabled=memory_enabled, user_profile_enabled=user_profile_enabled)
     except Exception:
-        store = MemoryStore()  # config optional — fall back to defaults rather than break /memory
+        store = MemoryStore()  # config optional - fall back to defaults rather than break /memory
     store.load_from_disk()
     return store
 
@@ -135,7 +137,7 @@ def _apply_write_gate(store: "MemoryStore", action: str, target: str, content: O
 
 def _validate_single_op(store, action, target, content, old_text) -> Optional[str]:
     """Validate BEFORE the gate so an invalid write is rejected now, not at approve time.
-    Missing ``old_text`` is recoverable (it can't be schema-required — needs a combinator
+    Missing ``old_text`` is recoverable (it can't be schema-required - needs a combinator
     the Codex backend rejects): return the inventory plus a retry instruction."""
     if action == "add" and not content:
         return tool_error("Content is required for 'add' action.", success=False)
@@ -163,14 +165,76 @@ def destructive_ops(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [op for op in ops if (op or {}).get("action") in _BG_DELETE_ACTIONS]
 
 
+# --- Load-bearing guard for unattended background review (#105921 follow-up) ---
+# Routine memory housekeeping (consolidation, deduplication, shortening, and removing clearly
+# stale/superseded entries) applies automatically. An entry that encodes a locked decision,
+# standing rule, credential/key reference, or any load-bearing fact the agent relies on every
+# session is never auto-applied: it is DISCARDED (never staged, never asked) and written to the
+# audit log, so nothing is silently lost without a record.
+
+_LOAD_BEARING_PATTERNS = (
+    # credentials, keys, secrets, tokens
+    r"\b(api[ _-]?key|apikey|access[ _-]?key|client[ _-]?secret|secret|password|passwd|"
+    r"credential|private[ _-]?key|bearer[ _-]?token|auth[ _-]?token|oauth[ _-]?token)\b",
+    # stable IDs / tokens / endpoints the agent looks up
+    r"\b(channel[ _-]?id|server[ _-]?id|discord[ _-]?id|webhook[ _-]?url|token)\b",
+    # locked decisions / standing rules / source-of-truth / freeze markers
+    r"\b(locked[ -]?decision|standing[ -]?rule|standing[ -]?decision|source[ -]of[ -]truth|"
+    r"handoff|canon|do[ -]not[ -]change|never[ -]change|freeze|hard[ -]?freeze)\b",
+    # imperative standing-rule verbs (case-insensitive)
+    r"\b(never|always|mustn't|must not|must|required|forbidden|mandatory|rule)\b",
+)
+
+_LOAD_BEARING_RE = re.compile("|".join(_LOAD_BEARING_PATTERNS), re.IGNORECASE)
+
+
+def _is_load_bearing_entry(entry: Optional[str]) -> bool:
+    """Conservative guard: True when *entry* carries something the agent must not lose to
+    unattended housekeeping (a credential/key, stable ID, locked decision, standing rule, or
+    imperative rule). Over-matching only leaves an entry untouched - it can never delete a
+    load-bearing entry. Deletion safety outranks how aggressively memory consolidates."""
+    return bool(entry) and _LOAD_BEARING_RE.search(entry) is not None
+
+
+def _audit_background_review(decision: str, op: Dict[str, Any], matched_entry: Optional[str],
+                             target: str) -> None:
+    """Best-effort append-only audit of an unattended background review's destructive memory
+    ops: one JSON line per op recording whether the gate auto-applied it or discarded it, plus
+    the full entry text, so nothing is silently lost without a record."""
+    try:
+        from hermes_constants import get_hermes_home, mkdir_under_hermes_home
+        audit_dir = get_hermes_home() / "logs"
+        mkdir_under_hermes_home(audit_dir)
+        record = {
+            "ts": time.time(), "decision": decision, "origin": "background_review",
+            "action": (op or {}).get("action", ""), "target": target,
+            "old_text": (op or {}).get("old_text", ""),
+            "content": (op or {}).get("content") or (op or {}).get("new_text") or "",
+            "entry": matched_entry or "",
+        }
+        with open(audit_dir / "memory_review_audit.jsonl", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        logger.warning("Failed to write memory review audit record", exc_info=True)
+
+
+def _held_result() -> str:
+    """Benign (non-asking, non-surfacing) result for a load-bearing op the gate held."""
+    return json.dumps({
+        "success": True, "done": True, "held": True, "auto_discarded": True,
+        "message": ("Held: this entry looks like a locked decision, standing rule, or "
+                    "credential/key reference and was left unchanged."),
+    }, ensure_ascii=False)
+
+
 def _background_delete_gate(store, action, operations, target="memory", content=None,
                             old_text=None) -> Optional[str]:
-    """Fail-closed operation gate for unattended background-review forks (#105921): ``add``
-    stays available (it is all any review prompt asks for), while ``replace``/``remove`` —
-    single or inside a batch — are never applied unattended. The op is staged in the pending
-    store instead of merely denied: the fork's own review summary is never published back, so
-    a plain denial would drop the consolidation request with no surfacing path at all. A
-    staging failure fails closed to a plain denial."""
+    """Unattended background-review operation gate (#105921): routine memory housekeeping
+    applies automatically and load-bearing entries are never touched. ``add`` stays available
+    (it is all any review prompt asks for); a ``replace``/``remove`` - single or inside a batch -
+    auto-applies when its matched entry is NOT load-bearing, and is discarded (audited, never
+    staged, never asked) when it is. The old behaviour staged every destructive op for approval,
+    surfacing a "staged for your approval" prompt the user must never see again."""
     from tools.skill_provenance import is_unattended_review
 
     if not is_unattended_review():
@@ -180,28 +244,40 @@ def _background_delete_gate(store, action, operations, target="memory", content=
                {"action": action, "target": target, "content": content, "old_text": old_text})
     if not destructive_ops(payload):
         return None
-    detail = ("; ".join(_batch_op_line(op) for op in operations) if operations is not None
-              else _batch_op_line({"action": action, "content": content, "old_text": old_text}))
     try:
         if (unmatched := _pin_matched_entries(store, payload)) is not None:
             return unmatched
-        from tools import write_approval as wa
-        record = wa.stage_write(
-            wa.MEMORY, payload,
-            summary=(f"background review consolidation ({'batch' if operations is not None else action} "
-                     f"on {target}): {detail}")[:200],
-            origin=wa.current_origin())
-        return json.dumps({
-            "success": True, "staged": True, "proposal_staged": True, "pending_id": record["id"],
-            "message": ("Background review may not delete memory entries unattended. The proposed "
-                        f"{'batch' if operations is not None else action} was staged for your approval — "
-                        "review it with /memory pending (approve to apply, discard to drop)."),
-        }, ensure_ascii=False)
     except Exception:
-        logger.warning("Failed to stage background-review consolidation; denying", exc_info=True)
-        return tool_error(
-            "Background review may not delete memory entries ('replace'/'remove', including in a "
-            "batch); 'add' is still available.", success=False)
+        logger.warning("Failed to pin entries for the background-review memory gate; holding",
+                       exc_info=True)
+        return _held_result()
+
+    if operations is not None:
+        # Batch: drop load-bearing ops (audited as discarded), auto-apply the rest. The pinned
+        # ops align 1:1 with ``operations``, so the filtered list is rebuilt from the caller's
+        # list in place - the downstream apply then sees only the safe ops (+ any adds).
+        pinned = payload["operations"]
+        kept: List[Dict[str, Any]] = []
+        for op, pinned_op in zip(operations, pinned):
+            matched = (pinned_op or {}).get("matched_entry")
+            if (op or {}).get("action") in _BG_DELETE_ACTIONS and _is_load_bearing_entry(matched):
+                _audit_background_review("discarded", op, matched, target)
+                continue
+            kept.append(op)
+            if (op or {}).get("action") in _BG_DELETE_ACTIONS:
+                _audit_background_review("auto_applied", op, matched, target)
+        if not kept:
+            return _held_result()
+        operations[:] = kept
+        return None
+
+    # Single destructive op.
+    matched = payload.get("matched_entry")
+    if _is_load_bearing_entry(matched):
+        _audit_background_review("discarded", payload, matched, target)
+        return _held_result()
+    _audit_background_review("auto_applied", payload, matched, target)
+    return None
 
 
 def memory_tool(action: str = None, target: str = "memory", content: str = None, old_text: str = None,
@@ -332,7 +408,7 @@ MEMORY_SCHEMA = {
         "injected into every future turn, so keep entries compact and high-signal.\n\n"
         "HOW: make ALL your changes in ONE call via an 'operations' array (each item: "
         "{action, content?, old_text?}). The batch applies atomically and the char limit is "
-        "checked only on the FINAL result — so a single call can remove/replace stale entries "
+        "checked only on the FINAL result - so a single call can remove/replace stale entries "
         "to free room AND add new ones, even when an add alone would overflow. The response "
         "reports current/limit chars and confirms completion; one batch call finishes the "
         "update, so don't repeat it. Use the bare action/content/old_text fields only for a "
