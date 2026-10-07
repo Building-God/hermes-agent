@@ -68,7 +68,7 @@ class TestConfigureWindowsStdio:
 
 
 # ---------------------------------------------------------------------------
-# terminate_pid — the centralized kill primitive
+# terminate_pid - the centralized kill primitive
 # ---------------------------------------------------------------------------
 
 
@@ -80,7 +80,7 @@ class TestTerminatePidRoutingOnWindows:
     flag on Linux, which selected the taskkill branch on a host where
     ``taskkill`` does not exist and ``gateway/status`` cannot even import its
     ``msvcrt`` branch. On the Windows runner the flag is genuinely True, so
-    only ``subprocess.run`` is mocked — the dependency, not the host.
+    only ``subprocess.run`` is mocked - the dependency, not the host.
     """
 
     def test_force_uses_taskkill_on_windows(self, monkeypatch):
@@ -125,7 +125,7 @@ class TestTerminatePidRoutingOnWindows:
         """Non-force path calls os.kill with SIGTERM (Windows has no SIGKILL).
 
         ``terminate_pid(pid)`` with force=False bypasses the taskkill branch
-        and uses ``os.kill`` directly — so platform doesn't actually matter
+        and uses ``os.kill`` directly - so platform doesn't actually matter
         for the signal choice.  Verifies the getattr fallback works.
         """
         from gateway import status
@@ -239,10 +239,10 @@ class TestTzdataDependencyDeclared:
         # The dependency line should be conditional on sys_platform == 'win32'
         # and should NOT be in the core dependencies for Linux/macOS. We do
         # not care about the exact pinned version (which is bumped over time)
-        # — only that tzdata is declared with a win32 marker. This is an
+        # - only that tzdata is declared with a win32 marker. This is an
         # invariant check, not a snapshot test.
         import re
-        # Match `"tzdata` … `; sys_platform == 'win32'"` allowing any version
+        # Match `"tzdata` ... `; sys_platform == 'win32'"` allowing any version
         # specifier in between (==X.Y.Z, >=X.Y.Z,<W, etc.) and either quote
         # style on the marker.
         pattern = re.compile(
@@ -272,7 +272,7 @@ class TestSubprocessCompatHelpers:
         argv = resolve_node_command("sh", ["-c", "echo hi"])
         assert argv[1:] == ["-c", "echo hi"]
         # First element is either an absolute path (sh found) or the bare
-        # name (fallback) — both are acceptable behaviours.
+        # name (fallback) - both are acceptable behaviours.
 
 
     @pytest.mark.platforms("windows")
@@ -285,9 +285,9 @@ class TestSubprocessCompatHelpers:
 
         Two reasons (the #54220/#56747 console-flash class):
         1. MSDN: CREATE_NO_WINDOW is IGNORED when combined with
-           DETACHED_PROCESS — the hide bit would be dead.
+           DETACHED_PROCESS - the hide bit would be dead.
         2. A console-less daemon forces every console-subsystem descendant
-           (git, gh, cmd, node, …) to allocate its own visible console — a
+           (git, gh, cmd, node, ...) to allocate its own visible console - a
            flash per spawn that no per-call-site hide sweep can fully cover.
            CREATE_NO_WINDOW instead gives the daemon one hidden console that
            all descendants inherit (parent-console root cause isolated by
@@ -333,7 +333,7 @@ class TestSubprocessCompatHelpers:
         CREATE_BREAKAWAY_FROM_JOB with ERROR_ACCESS_DENIED.  Callers
         catch ``OSError`` and retry with this payload (see
         ``gateway_windows._spawn_detached`` for the canonical pattern).
-        It must drop ONLY the breakaway bit — DETACHED_PROCESS et al.
+        It must drop ONLY the breakaway bit - DETACHED_PROCESS et al.
         are still required for the child to survive the parent's exit.
         """
         from hermes_cli import _subprocess_compat as sc
@@ -342,7 +342,7 @@ class TestSubprocessCompatHelpers:
         # Fallback equals full minus the breakaway bit, nothing else changed.
         assert fallback == full & ~0x01000000
         # And the detach bits we still need are present (hidden console, own
-        # process group — NOT console-less DETACHED_PROCESS, see
+        # process group - NOT console-less DETACHED_PROCESS, see
         # test_windows_detach_flags_exclude_detached_process).
         assert fallback & 0x00000200, "fallback missing CREATE_NEW_PROCESS_GROUP"
         assert fallback & 0x08000000, "fallback missing CREATE_NO_WINDOW"
@@ -358,9 +358,9 @@ class TestLocalEnvironmentWindowsTempDir:
     Windows, NOT the POSIX ``/tmp`` literal (which Python can't open)."""
 
     def test_posix_path_preserved_on_linux(self):
-        """Linux/macOS behaviour MUST be unchanged — return / tmp or
+        """Linux/macOS behaviour MUST be unchanged - return / tmp or
         tempfile.gettempdir()-derived POSIX path.  This is the 'do no harm'
-        test — regressions here break every Unix user's terminal tool."""
+        test - regressions here break every Unix user's terminal tool."""
         from tools.environments.local import LocalEnvironment
 
         env = LocalEnvironment(cwd="/tmp", timeout=10, env={})
@@ -429,14 +429,14 @@ class TestGitBashPathNormalization:
 
 
 # ---------------------------------------------------------------------------
-# Gateway detached watcher — Windows creationflags
+# Gateway detached watcher - Windows creationflags
 # ---------------------------------------------------------------------------
 
 
 
 
 class TestWindowlessGatewayRestartSpec:
-    """gateway_windows.windowless_gateway_restart_spec — supplies the
+    """gateway_windows.windowless_gateway_restart_spec - supplies the
     hidden-console respawn spec (normalized interpreter + stable cwd + env
     overlay)."""
 
@@ -461,11 +461,11 @@ class TestWindowlessGatewayRestartSpec:
     @pytest.mark.platforms("windows")
     def test_windows_keeps_console_python_and_preserves_tail(self):
         """On Windows the console interpreter is kept (hidden-console launch,
-        NOT a pythonw swap — #54220/#56747) while every subsequent argument
+        NOT a pythonw swap - #54220/#56747) while every subsequent argument
         is preserved verbatim.
 
         ``platforms("windows")``: faking this on Linux needed two more fakes to hold
-        it up — a pre-import so the lazy ``hermes_cli.gateway`` import didn't
+        it up - a pre-import so the lazy ``hermes_cli.gateway`` import didn't
         re-run ``gateway/status``'s ``import msvcrt`` branch, and a mock of
         ``get_hermes_home`` because the real one's ``Path.resolve()`` consults
         sysconfig and blew up under the platform patch. Both workarounds were
@@ -485,7 +485,7 @@ class TestWindowlessGatewayRestartSpec:
             "--replace",
         ]
 
-        # Only the environment-dependent lookups are stubbed — the host is
+        # Only the environment-dependent lookups are stubbed - the host is
         # genuinely Windows here.
         with mock.patch.object(
             gw, "_stable_gateway_working_dir", return_value="C:/hermes"
@@ -494,7 +494,7 @@ class TestWindowlessGatewayRestartSpec:
         ):
             new_argv, cwd, env = gw.windowless_gateway_restart_spec(list(argv))
 
-        # Interpreter is kept as the console python — hidden-console launch,
+        # Interpreter is kept as the console python - hidden-console launch,
         # no pythonw swap.
         assert new_argv[0] == "C:/venv/Scripts/python.exe"
         # Everything after the interpreter is byte-for-byte preserved.
@@ -518,7 +518,7 @@ class TestGatewayRunRestartWatcherOuterPopenFallback:
     ``CREATE_BREAKAWAY_FROM_JOB``).  A restrictive parent job object rejects
     the breakaway bit with ``ERROR_ACCESS_DENIED`` (surfaced as ``OSError``);
     the launcher must retry once without breakaway, preserving argv and the
-    scrubbed environment, and only warn — never crash, never leak secrets —
+    scrubbed environment, and only warn - never crash, never leak secrets -
     if the retry also fails.
 
     Behavioral: drives the real coroutine with a mocked ``subprocess.Popen``
@@ -527,7 +527,7 @@ class TestGatewayRunRestartWatcherOuterPopenFallback:
     ``platforms("windows")``: this used to run on Linux behind a ``sys.platform``
     patch, and the breakaway-bit assertions had to be skipped there anyway
     (``_subprocess_compat`` caches ``IS_WINDOWS`` at import, so the flags
-    were all 0) — i.e. the most important assertions in the class never
+    were all 0) - i.e. the most important assertions in the class never
     executed. On the Windows runner they do.
     """
 
@@ -649,14 +649,14 @@ class TestGatewayRunRestartWatcherOuterPopenFallback:
         secret = "maxwell-do-not-log-this-secret-42993"
         monkeypatch.setenv("HERMES_TEST_SECRET", secret)
 
-        # Dual failure must NOT propagate — the user's CLI still exits cleanly.
+        # Dual failure must NOT propagate - the user's CLI still exits cleanly.
         self._drive(gr)
 
         assert len(calls) == 2, "both primary and fallback attempted"
         warn.assert_called_once()
 
         # Secret-safe logging: only (interpreter basename, error field, error
-        # code) are logged — never the exception object (str(exc) can carry a
+        # code) are logged - never the exception object (str(exc) can carry a
         # path), the argv (watcher source + interpreter path), or env contents.
         argv_used, kwargs_used = calls[0]
         fmt, *log_args = warn.call_args.args
@@ -683,15 +683,39 @@ class TestGatewayRunRestartWatcherOuterPopenFallback:
 
 
 class TestCronSchedulerBashResolution:
-    """cron.scheduler_script must resolve bash via PATH (Git Bash on Windows) and,
-    when no bash exists, return an actionable error instead of a [WinError 2] crash."""
+    """cron.scheduler_script must resolve bash for .sh/.bash scripts. On Windows it
+    prefers Git Bash explicitly (the WSL shim forwards to a distro that may have no
+    bash); elsewhere it resolves via PATH; and when no bash exists it returns an
+    actionable error instead of a [WinError 2] crash."""
 
-    def test_sh_script_uses_bash_found_on_path(self, tmp_path, monkeypatch):
+    def test_windows_prefers_git_bash_over_path(self, tmp_path, monkeypatch):
+        from cron import scheduler_script
+
+        script = tmp_path / "job.sh"
+        script.write_text("echo hi\n", encoding="utf-8")
+        git_bash = r"C:\Program Files\Git\bin\bash.exe"
+        monkeypatch.setattr(scheduler_script.sys, "platform", "win32")
+        # Git Bash exists; shutil.which would land on the WSL shim instead.
+        monkeypatch.setattr(scheduler_script.os.path, "isfile",
+                            lambda p: p == git_bash)
+        monkeypatch.setattr(
+            scheduler_script.shutil, "which",
+            lambda name: r"C:\Windows\System32\bash.exe" if name == "bash" else None)
+
+        argv, _overlay, error = scheduler_script._script_argv(script)
+
+        assert error is None
+        assert argv == [git_bash, str(script)]
+
+    def test_falls_back_to_path_bash_without_git_bash(self, tmp_path, monkeypatch):
         from cron import scheduler_script
 
         script = tmp_path / "job.sh"
         script.write_text("echo hi\n", encoding="utf-8")
         found = str(tmp_path / "git" / "bin" / "bash.exe")
+        monkeypatch.setattr(scheduler_script.sys, "platform", "win32")
+        # No Git Bash candidate installed -> resolve via PATH as before.
+        monkeypatch.setattr(scheduler_script.os.path, "isfile", lambda p: False)
         monkeypatch.setattr(scheduler_script.shutil, "which",
                             lambda name: found if name == "bash" else None)
 
@@ -705,10 +729,8 @@ class TestCronSchedulerBashResolution:
 
         script = tmp_path / "job.sh"
         script.write_text("echo hi\n", encoding="utf-8")
-        real_isfile = os.path.isfile
         monkeypatch.setattr(scheduler_script.shutil, "which", lambda name: None)
-        monkeypatch.setattr(scheduler_script.os.path, "isfile",
-                            lambda p: False if p == "/bin/bash" else real_isfile(p))
+        monkeypatch.setattr(scheduler_script.os.path, "isfile", lambda p: False)
 
         argv, _overlay, error = scheduler_script._script_argv(script)
 
