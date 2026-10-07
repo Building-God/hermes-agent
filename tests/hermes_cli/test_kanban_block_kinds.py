@@ -1,12 +1,12 @@
 """Tests for typed block reasons + the unblock-loop breaker.
 
-Covers the built-in fix for the kanban "blocked loop" — a worker blocks a
+Covers the built-in fix for the kanban "blocked loop" - a worker blocks a
 task, a cron unblocks it, the worker re-blocks for the same reason, repeat
 forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 ``block_recurrences`` counter:
 
 * ``dependency`` blocks route to ``todo`` (parent-gated, auto-resumed) and
-  never enter the human ``blocked`` bucket a cron would keep unblocking —
+  never enter the human ``blocked`` bucket a cron would keep unblocking -
   unless no parent is open, in which case the wait can never be satisfied
   and the block is recorded as ``needs_input`` (sticky, loop-counted).
 * ``needs_input`` / ``capability`` / un-typed blocks land in ``blocked``;
@@ -86,6 +86,25 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
         assert payload.get("kind") == "capability"
 
 
+def test_distinct_sequential_gates_are_not_a_loop(kanban_home: Path) -> None:
+    """Two sequential needs_input blocks with DIFFERENT reasons are distinct
+    human gates, not a re-ask (t_bae44ee2): the loop breaker must NOT route to
+    triage, and the counter must reset to 1 on each distinct ask."""
+    with kbc.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(conn, tid, reason="tap to confirm the Foundry download", kind="needs_input")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason="provide the licence key", kind="needs_input")
+        loops = [e for e in kb.list_events(conn, tid)
+                 if e.kind == "block_loop_detected"]
+        assert not loops, "two distinct sequential gates must not read as a loop"
+        row = kb.get_task(conn, tid)
+        assert row.status == "blocked", "distinct gate must stay blocked, not triage"
+        assert row.block_recurrences == 1, "a distinct ask resets the loop counter"
+
+
+
 # ---------------------------------------------------------------------------
 # Dependency routing
 # ---------------------------------------------------------------------------
@@ -141,10 +160,11 @@ def test_dependency_block_with_terminal_parents_parks_then_escalates(
         assert kb.recompute_ready(conn) == 0
         assert kb.get_task(conn, child).status == "blocked"
 
-        # A cron/human unblocks; the worker re-declares the same impossible wait.
+        # A cron/human unblocks; the worker re-declares the same impossible wait
+        # (same reason = same ask), which the loop breaker counts as a re-ask.
         assert kb.unblock_task(conn, child)
         assert kb.claim_task(conn, child, claimer="worker") is not None
-        assert kb.block_task(conn, child, reason="still waiting", kind="dependency")
+        assert kb.block_task(conn, child, reason="waiting on upstream", kind="dependency")
         assert kb.get_task(conn, child).status == "triage"
         loop = [e for e in kb.list_events(conn, child) if e.kind == "block_loop_detected"][-1].payload
         assert loop["recurrences"] == kb.BLOCK_RECURRENCE_LIMIT
@@ -165,7 +185,7 @@ def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
     with kbc.connect() as conn:
         parent = kb.create_task(conn, title="open-parent", assignee="alice")
         # Linked while todo (a running child cannot be gated retroactively); the parent then stays
-        # open while the child runs — the reopened-parent shape, forced the same way the loop below does.
+        # open while the child runs - the reopened-parent shape, forced the same way the loop below does.
         child = kb.create_task(conn, title="waiter", assignee="worker")
         kb.link_tasks(conn, parent_id=parent, child_id=child)
         with kb.write_txn(conn):
