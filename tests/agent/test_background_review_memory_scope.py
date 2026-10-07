@@ -1,7 +1,7 @@
 """The review fork's memory access must follow the trigger that fired (#105921).
 
 ``spawn_background_review_thread`` already received ``review_memory`` /
-``review_skills`` but used them only to pick the prompt — the tool whitelist
+``review_skills`` but used them only to pick the prompt - the tool whitelist
 granted the whole ``memory`` toolset whenever the profile had memory enabled,
 so a skill-nudge fork held ``remove``/``replace`` on MEMORY.md it was never
 asked to use. These tests pin the scope-aware whitelist and the pass-through
@@ -115,10 +115,10 @@ class TestExplicitRefineOrigin:
         assert fork._review_attended is explicit
 
 
-class TestConsolidationProposalSurfaces:
-    """The fork's own review summary is never published back, so a consolidation the delete
-    gate staged must surface through ``summarize_background_review_actions`` — otherwise the
-    near-limit denial path drops both the requested update and the proposal, silently (#105921)."""
+class TestBackgroundReviewMemoryHousekeeping:
+    """Unattended background-review memory writes no longer stage for approval: routine
+    consolidation auto-applies and load-bearing entries are held (discarded) without ever
+    surfacing a "staged for your approval" prompt to the user (#105921 follow-up)."""
 
     def _store(self, tmp_path, monkeypatch):
         import json as _json
@@ -130,14 +130,44 @@ class TestConsolidationProposalSurfaces:
         store.load_from_disk()
         return store
 
-    def test_staged_proposal_surfaces_in_summary(self, tmp_path, monkeypatch):
+    def test_routine_replace_auto_applied_not_staged(self, tmp_path, monkeypatch):
         import json
 
         from tools.memory_tool import memory_tool
         from tools.skill_provenance import set_current_write_origin, reset_current_write_origin
 
         store = self._store(tmp_path, monkeypatch)
-        assert store.add("memory", "standing rule entry")["success"] is True
+        assert store.add("memory", "a routine environment fact")["success"] is True
+
+        token = set_current_write_origin("background_review")
+        try:
+            raw = memory_tool(
+                action="replace", old_text="routine environment", content="consolidated fact", store=store)
+        finally:
+            reset_current_write_origin(token)
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "held" not in result and "staged" not in result
+        # The consolidation actually applied - nothing was parked for approval.
+        assert "consolidated fact" in store._entries_for("memory")
+        assert "a routine environment fact" not in store._entries_for("memory")
+
+        review_messages = [
+            {"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "memory", "arguments": json.dumps(
+                {"action": "replace", "old_text": "routine environment", "content": "consolidated fact"})}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": raw},
+        ]
+        actions = bg.summarize_background_review_actions(review_messages, [])
+        assert not any("staged for your approval" in a for a in actions)
+
+    def test_load_bearing_replace_held_not_surfaced(self, tmp_path, monkeypatch):
+        import json
+
+        from tools.memory_tool import memory_tool
+        from tools.skill_provenance import set_current_write_origin, reset_current_write_origin
+
+        store = self._store(tmp_path, monkeypatch)
+        assert store.add("memory", "standing rule entry must never change")["success"] is True
 
         token = set_current_write_origin("background_review")
         try:
@@ -146,7 +176,9 @@ class TestConsolidationProposalSurfaces:
         finally:
             reset_current_write_origin(token)
         result = json.loads(raw)
-        assert result["staged"] is True and result["proposal_staged"] is True
+        assert result["held"] is True and result["auto_discarded"] is True
+        # The standing rule is untouched - never staged, never asked.
+        assert "standing rule entry must never change" in store._entries_for("memory")
 
         review_messages = [
             {"role": "assistant", "tool_calls": [{"id": "c1", "function": {"name": "memory", "arguments": json.dumps(
@@ -154,12 +186,11 @@ class TestConsolidationProposalSurfaces:
             {"role": "tool", "tool_call_id": "c1", "content": raw},
         ]
         actions = bg.summarize_background_review_actions(review_messages, [])
-        assert any("staged for your approval" in a for a in actions)
+        assert not any("staged for your approval" in a for a in actions)
 
-    def test_near_limit_denial_end_to_end(self, tmp_path, monkeypatch):
+    def test_near_limit_consolidation_auto_applies(self, tmp_path, monkeypatch):
         """add rejected by the budget -> fork follows the 'consolidate now' hint with a
-        replace -> the delete gate stages it -> the proposal surfaces; the store never
-        changed and nothing was silently lost."""
+        replace of a non-load-bearing entry -> it auto-applies; nothing is staged."""
         import json
 
         from tools.memory_tool import memory_tool
@@ -179,11 +210,12 @@ class TestConsolidationProposalSurfaces:
             reset_current_write_origin(token)
         assert json.loads(add_raw)["success"] is False  # the budget still rejects the add
         replace_result = json.loads(replace_raw)
-        assert replace_result["staged"] is True and replace_result["proposal_staged"] is True
+        assert replace_result["success"] is True
+        assert "held" not in replace_result and "staged" not in replace_result
 
-        # Fail-closed: nothing was applied or dropped.
-        assert "seed entry one" in store._entries_for("memory")
-        assert "merged entry" not in store._entries_for("memory")
+        # The consolidation applied - nothing was parked for approval.
+        assert "seed entry one" not in store._entries_for("memory")
+        assert "merged entry" in store._entries_for("memory")
 
         review_messages = [
             {"role": "assistant", "tool_calls": [
@@ -196,4 +228,4 @@ class TestConsolidationProposalSurfaces:
             {"role": "tool", "tool_call_id": "c2", "content": replace_raw},
         ]
         actions = bg.summarize_background_review_actions(review_messages, [])
-        assert any("staged for your approval" in a for a in actions)
+        assert not any("staged for your approval" in a for a in actions)
