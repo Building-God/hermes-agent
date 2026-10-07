@@ -157,7 +157,7 @@ def _posix_cron_script_argv(script: Path) -> tuple[list[str], dict[str, str]]:
     # commit runs on its OWN interpreter here, so there is no ABI mix (#122183).
     python = project_python(repo)
     if not python.is_file():
-        # The caller's interpreter is the bare store Python here — the #123044 failure mode.
+        # The caller's interpreter is the bare store Python here - the #123044 failure mode.
         raise RuntimeError(f"dependency environment interpreter is missing: {python}")
     return ([str(python), "-c", _POSIX_SCRIPT_BOOTSTRAP, str(repo), str(script)],
             {"HERMES_DISABLE_LAZY_INSTALLS": "1"})
@@ -237,13 +237,13 @@ def _terminate_process_group(proc: subprocess.Popen) -> None:
     the pipe write ends open and the caller's communicate() would block on EOF forever)."""
     try:
         process_group = os.getpgid(proc.pid)
-        os.killpg(process_group, signal.SIGTERM)  # windows-footgun: ok — POSIX-only branch
+        os.killpg(process_group, signal.SIGTERM)  # windows-footgun: ok - POSIX-only branch
     except (ProcessLookupError, PermissionError, OSError):
         return
     with contextlib.suppress(subprocess.TimeoutExpired):
         proc.wait(timeout=1.0)
     try:
-        os.killpg(process_group, 0)  # windows-footgun: ok — POSIX-only branch
+        os.killpg(process_group, 0)  # windows-footgun: ok - POSIX-only branch
     except (ProcessLookupError, OSError):
         return
     with contextlib.suppress((ProcessLookupError, PermissionError, OSError)):
@@ -322,7 +322,7 @@ def _windows_cron_bootstrap_argv(
 
 def _resolve_script_path(script_path: str) -> tuple[Optional[Path], Optional[str]]:
     """Validate a job script path; ``(path, None)`` or ``(None, error)``. Scripts MUST resolve
-    inside HERMES_HOME/scripts/ (relative, absolute and ``~`` paths are all validated — path
+    inside HERMES_HOME/scripts/ (relative, absolute and ``~`` paths are all validated - path
     traversal / absolute-path injection); contract of lifecycle_guard._expand_candidate_path."""
     scripts_dir = _sched._get_hermes_home() / "scripts"
     _ensure_cron_dir(scripts_dir)
@@ -332,9 +332,9 @@ def _resolve_script_path(script_path: str) -> tuple[Optional[Path], Optional[str
     # would not catch it. str() first so the guard itself cannot raise on a non-str script_path.
     # Same ingestion contract as cron.lifecycle_guard._expand_candidate_path: a NUL-bearing value can never
     # name a real script, and on Windows the Path operations raise ValueError *after* expanduser (expanduser
-    # never expands "~user" there, so the try below never fires) — reject eagerly so both platforms fail
+    # never expands "~user" there, so the try below never fires) - reject eagerly so both platforms fail
     # cleanly instead of crashing the scheduler. str() first so the guard itself can never raise TypeError
-    # on a non-str script_path (e.g. a Path passed by a future caller) — the guard must be crash-proof even
+    # on a non-str script_path (e.g. a Path passed by a future caller) - the guard must be crash-proof even
     # though every current call site passes a plain str (#86832 review).
     if "\x00" in str(script_path):
         return None, f"Blocked: script path contains a NUL byte: {script_path!r}"
@@ -345,7 +345,7 @@ def _resolve_script_path(script_path: str) -> tuple[Optional[Path], Optional[str
         return None, f"Blocked: script path is not a valid filesystem path: {script_path!r}"
     path = raw.resolve() if raw.is_absolute() else (scripts_dir / raw).resolve()
 
-    # Traversal / absolute-path / symlink escape guard — MUST stay inside HERMES_HOME/scripts/.
+    # Traversal / absolute-path / symlink escape guard - MUST stay inside HERMES_HOME/scripts/.
     try:
         path.relative_to(scripts_dir_resolved)
     except ValueError:
@@ -368,7 +368,7 @@ def _resolve_script_path(script_path: str) -> tuple[Optional[Path], Optional[str
 
 def _resolve_cron_interpreter(interpreter: str) -> tuple[Optional[str], Optional[str]]:
     """``(python_exe, error)`` for a job's ``interpreter`` field. Checked at run time, not create
-    time: a user venv can be rebuilt or moved while the job lives. Bare names are refused — they
+    time: a user venv can be rebuilt or moved while the job lives. Bare names are refused - they
     silently change meaning with PATH. The name (and the symlink target's name) must look like a
     Python: the lifecycle guard classifies ``.py`` scripts as Python and skips its shell reference
     walk, so ``interpreter=/bin/bash`` would run an unscanned ``.py`` body as shell. ``pythonw``
@@ -397,20 +397,47 @@ def _resolve_cron_interpreter(interpreter: str) -> tuple[Optional[str], Optional
     return str(resolved), None
 
 
+# Git for Windows ships a real MSYS2 bash, but its bin/ and usr/bin/ directories are
+# NOT on the standard Windows PATH (only <Git>/cmd, for git.exe, is). shutil.which("bash")
+# therefore skips past Git Bash and lands on C:\Windows\System32\bash.exe - the WSL relay
+# shim, which forwards to the WSL default distribution. That distro can be docker-desktop
+# (sh only, no bash), so every .sh cron job dies with "execvpe(/bin/bash) failed: No such
+# file or directory". Resolve Git Bash explicitly first so .sh jobs run on the same bash
+# the worker terminal already uses.
+_WINDOWS_BASH_CANDIDATES = (
+    r"C:\Program Files\Git\bin\bash.exe",
+    r"C:\Program Files\Git\usr\bin\bash.exe",
+    r"C:\Program Files (x86)\Git\bin\bash.exe",
+    r"C:\Program Files (x86)\Git\usr\bin\bash.exe",
+)
+
+
+def _resolve_bash() -> Optional[str]:
+    """Path to a bash that can run .sh/.bash cron scripts, or None.
+
+    Windows prefers Git Bash explicitly (see note above); elsewhere, and as a Windows
+    fallback, resolve via PATH then a literal /bin/bash.
+    """
+    if sys.platform == "win32":
+        for candidate in _WINDOWS_BASH_CANDIDATES:
+            if os.path.isfile(candidate):
+                return candidate
+    return shutil.which("bash") or ("/bin/bash" if os.path.isfile("/bin/bash") else None)
+
+
 def _script_argv(
     path: Path, interpreter: Optional[str] = None,
 ) -> tuple[Optional[list[str]], dict[str, str], Optional[str]]:
-    """``(argv, env_overlay, error)`` for a validated script. Interpreter by extension — the
+    """``(argv, env_overlay, error)`` for a validated script. Interpreter by extension - the
     shebang is deliberately NOT honoured (small, auditable surface): ``.sh``/``.bash`` → bash,
     else the job's ``interpreter`` when set, else a Python chosen by ``_posix_cron_script_argv``
     / ``_windows_cron_python_invocation``. Interpreter selection reads PM's install records and
     may raise; callers run this inside their ``try``."""
     if path.suffix.lower() in {".sh", ".bash"}:
-        # which() finds Git Bash on Windows; None there → clear error instead of a "[WinError 2]".
-        _bash = shutil.which("bash") or ("/bin/bash" if os.path.isfile("/bin/bash") else None)
+        _bash = _resolve_bash()
         if _bash is None:
             return None, {}, (
-                f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "
+                f"Cannot run .sh/.bash script {path.name!r}: bash not found. "
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
             )
@@ -453,8 +480,8 @@ def _run_job_script(
         if argv is None:
             return False, err
         from tools.environments.local import build_subprocess_env
-        # Lossy decode only: keep the platform-default (locale) encoding — gating ``encoding=``
-        # to win32 was deliberate (#66566: unconditional UTF-8 leaked into POSIX) — but
+        # Lossy decode only: keep the platform-default (locale) encoding - gating ``encoding=``
+        # to win32 was deliberate (#66566: unconditional UTF-8 leaked into POSIX) - but
         # ``errors=`` must not stay 'strict': one stray non-UTF-8 byte in the script's stdout
         # or stderr raises UnicodeDecodeError in communicate() and fails the whole run,
         # discarding the output (#105582; the Windows branch decodes lossily per #45099).
@@ -466,9 +493,9 @@ def _run_job_script(
             popen_kwargs = {
                 "creationflags": windows_hide_flags()
                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-                # Lossy UTF-8 decode — locale-mismatched bytes from the STT command must not raise in the
+                # Lossy UTF-8 decode - locale-mismatched bytes from the STT command must not raise in the
                 # reader threads on non-UTF-8 Windows (#45099).
-                # Lossy UTF-8 decode — locale-mismatched bytes from the TTS command must not raise in the
+                # Lossy UTF-8 decode - locale-mismatched bytes from the TTS command must not raise in the
                 # reader threads on non-UTF-8 Windows (#45099).
                 "encoding": "utf-8",
                 "errors": "replace"}
@@ -477,12 +504,12 @@ def _run_job_script(
         # overlay the routed profile's own scope (which never enters os.environ under multiplex
         # semantics) before the sanitizer, which also overlays the names the owning profile declares
         # in terminal.env_passthrough from that scope (#114209). The factory snapshots the process
-        # env itself — no raw copy at the spawn site (test_subprocess_env_guard).
+        # env itself - no raw copy at the spawn site (test_subprocess_env_guard).
         env = build_subprocess_env(strip_launch_profile=True)
         env.update(env_overlay)
         # Subprocess cwd only (default: scripts-dir parent). NEVER os.chdir() the process.
         # Use the job's workdir as the subprocess cwd when configured, otherwise default to the scripts-dir
-        # parent (back-compat). NEVER mutate the Python process cwd — that would leak into concurrent
+        # parent (back-compat). NEVER mutate the Python process cwd - that would leak into concurrent
         # gateway sessions (#69396).
         proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -500,10 +527,10 @@ def _run_job_script(
                 _terminate_cron_script_tree(proc)
                 _drain_script_pipes(proc)
                 # Phase 4a (#85125): a script timeout must leave ZERO living descendants. killpg only
-                # reaches the script's own process group — a grandchild that called setsid (backgrounded
+                # reaches the script's own process group - a grandchild that called setsid (backgrounded
                 # shell jobs, watchdogs) escapes it and keeps running after the job reports failure (#71148
                 # / #59549). agent.deadline.kill_process_tree snapshots the descendant set via psutil BEFORE
-                # signalling, so own-session grandchildren are reached too — the unified deadline layer's
+                # signalling, so own-session grandchildren are reached too - the unified deadline layer's
                 # tree-kill (#85147, d6a5cb9725).
                 return False, f"Script timed out after {script_timeout}s: {path}"
             try:
