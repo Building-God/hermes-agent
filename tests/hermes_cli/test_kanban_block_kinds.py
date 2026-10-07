@@ -170,6 +170,27 @@ def test_dependency_block_with_terminal_parents_parks_then_escalates(
         assert loop["recurrences"] == kb.BLOCK_RECURRENCE_LIMIT
 
 
+def test_dependency_block_with_no_parent_link_stays_parked(
+    kanban_home: Path,
+) -> None:
+    """A ``dependency`` block naming a card that was never linked as a parent
+    keeps ``dependency`` and parks in ``todo``: it must NOT be re-kinded to
+    ``needs_input`` (no false Harry ask), and ``recompute_ready`` must NOT
+    promote it into a context-free respawn (t_745cce3f)."""
+    with kbc.connect_closing() as conn:
+        # No parent edges at all -- the worker named a card but never linked it.
+        child = _running_task(conn, title="orphan-waiter")
+        assert kb.block_task(conn, child, reason="waiting on t_999999", kind="dependency")
+        parked = kb.get_task(conn, child)
+        assert (parked.status, parked.block_kind, parked.block_recurrences) == ("todo", "dependency", 0)
+        events = kb.list_events(conn, child)
+        assert [e for e in events if e.kind == "dependency_wait"]
+        assert not [e for e in events if e.kind == "blocked"]
+        # The zero-parent guard keeps the wait parked across a dispatch tick.
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, child).status == "todo"
+
+
 def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
     kanban_home: Path, all_assignees_spawnable,
 ) -> None:
