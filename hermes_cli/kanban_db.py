@@ -2329,7 +2329,7 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, block_kind "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
@@ -2343,6 +2343,12 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?", (task_id,),
             ).fetchall()
+            # A ``dependency``-wait with no parent link has nothing that can
+            # release it: keep it parked rather than promoting it into a
+            # context-free respawn (t_745cce3f). A parentless todo task with no
+            # block kind still promotes as before.
+            if row["block_kind"] == "dependency" and not parents:
+                continue
             if all(p["status"] in ("done", "archived") for p in parents):
                 resume_status = _resume_status_from_events(conn, task_id)
                 if cur_status == "blocked":
@@ -2384,6 +2390,18 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
         "WHERE l.child_id = ? "
         "AND p.status NOT IN ('done', 'archived') LIMIT 1", (task_id,),
     ).fetchone() is None
+
+
+def _has_parent_link(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the task has at least one parent edge (any status).
+
+    Distinguishes "no parent link" (a worker named a card but never linked it,
+    so ``dependency`` should park) from "parents all terminal" (a wait on an
+    already-done parent, which ``block_task`` re-kinds to ``needs_input``).
+    """
+    return conn.execute(
+        "SELECT 1 FROM task_links WHERE child_id = ? LIMIT 1", (task_id,),
+    ).fetchone() is not None
 
 
 def unsatisfied_parents(conn: sqlite3.Connection, task_id: str) -> list[tuple[str, str]]:
@@ -3399,11 +3417,12 @@ def block_task(
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
-    :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
-    re-kinded to ``needs_input`` (sticky) so ``recompute_ready`` cannot
-    promote it into a context-free respawn. ``transient`` still counts
-    toward the loop breaker so a forever-flaky task escalates. True on any
-    transition.
+    :func:`_route_block`). ``kind='dependency'`` with no parent link parks in
+    ``todo`` (``recompute_ready``'s zero-parent guard keeps it there); with
+    parents that are all ALREADY terminal it is re-kinded to ``needs_input``
+    (sticky) so ``recompute_ready`` cannot promote it into a context-free
+    respawn. ``transient`` still counts toward the loop breaker so a
+    forever-flaky task escalates. True on any transition.
 
     An already-``blocked`` card that the failure breaker parked UNTYPED
     (``block_kind IS NULL``, no live run) is classified in place when *kind*
@@ -3446,10 +3465,15 @@ def block_task(
         requested_kind = kind
         rekind_reason = None
         # ``dependency`` only waits on incomplete parents. A worker filing that
-        # kind with none open would park in ``todo`` and ``recompute_ready``
-        # would promote+respawn it context-free on the next tick. Re-kind to
-        # ``needs_input`` so it is sticky until a human unblocks.
-        if kind == "dependency" and _parents_satisfied(conn, task_id):
+        # kind with NO parent link at all (it named a card but never linked it)
+        # keeps ``dependency`` and parks in ``todo``; ``recompute_ready``'s
+        # zero-parent guard leaves it parked instead of respawning it
+        # context-free (t_745cce3f). A worker filing it with parents that are
+        # all ALREADY terminal cannot be released by ``recompute_ready`` and
+        # resuming on an already-done parent would loop, so only that shape is
+        # re-kinded to ``needs_input`` (sticky, loop-counted) as before.
+        if (kind == "dependency" and _parents_satisfied(conn, task_id)
+                and _has_parent_link(conn, task_id)):
             kind = "needs_input"
             rekind_reason = "no_open_parent"
         new_status, event_kind, set_sql, params, payload = _route_block(
@@ -3536,9 +3560,10 @@ def _route_block(
 
     ``dependency`` never enters the human ``blocked`` bucket: it waits in
     ``todo`` for ``recompute_ready``, so a cron never sees a dependency-wait
-    as something to "unblock". Callers that pass ``dependency`` with no
-    incomplete parent are re-kinded to ``needs_input`` before this runs
-    (see :func:`block_task`). Every other kind counts unblock-loop
+    as something to "unblock". A caller that passes ``dependency`` with parents
+    that are all already terminal is re-kinded to ``needs_input`` before this
+    runs (see :func:`block_task`); one with no parent link at all parks here in
+    ``todo`` (see :func:`recompute_ready`). Every other kind counts unblock-loop
     recurrences: block_task only fires from running/ready (AFTER an unblock
     returned the task to the pool), so a stored ``block_kind`` equal to the
     incoming one AND the same block reason means blocked -> unblocked ->
