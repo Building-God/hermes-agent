@@ -1115,6 +1115,19 @@ def _handle_create(args: dict, **kw) -> str:
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
     with _board(args.get("board")) as (kb, conn):
+        # Lane M.1: no explicit model -> let the chooser pick from the
+        # scoreboard/defaults/ledger chain and stamp it at create.
+        chooser_result = None
+        if not model_override and not provider_override:
+            try:
+                from hermes_cli.agent_ledger import choose_for_new_card
+                chooser_result = choose_for_new_card(conn, args.get("body"),
+                                                     assignee=str(assignee))
+            except Exception:
+                chooser_result = None
+            if chooser_result is not None:
+                model_override = chooser_result.model
+                provider_override = chooser_result.provider
         from gateway.session_context import get_session_env
         from tools.async_delegation import _current_origin_session_id
         self_tid = (os.environ.get("HERMES_KANBAN_TASK")
@@ -1172,6 +1185,13 @@ def _handle_create(args: dict, **kw) -> str:
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"),
             created_by=_persisted_identity(), session_id=session_id)
+        # Lane M.1: record WHY this model was pinned, on the card itself.
+        if chooser_result is not None:
+            try:
+                from hermes_cli.agent_ledger import _log_chooser_event
+                _log_chooser_event(conn, new_tid, chooser_result)
+            except Exception:
+                logger.debug("kanban_create: chooser event not logged", exc_info=True)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
