@@ -40,6 +40,35 @@ from utils import base_url_host_matches
 
 logger = logging.getLogger("agent.conversation_loop")
 
+# Transient connection errors to a LOOPBACK gateway (e.g. the local LiteLLM proxy at
+# http://localhost:4000) get a longer backoff than remote providers: a local gateway
+# restart rebinds in ~30-60s, so retrying fast only exhausts the budget and surfaces a
+# raw "Connection error" to the user instead of waiting the gateway out. Remote
+# providers keep the fast base_delay=2.0 backoff so a genuinely-flaky upstream still
+# fails over to the fallback chain promptly.
+_LOOPBACK_CONNECTION_BACKOFF_BASE = 10.0
+_LOOPBACK_CONNECTION_BACKOFF_MAX = 120.0
+_TRANSIENT_CONNECTION_ERROR_TYPES = frozenset({
+    "APIConnectionError", "ConnectionError", "ConnectError", "ConnectTimeout",
+    "ReadError", "RemoteProtocolError",
+})
+
+
+def _is_loopback_base_url(base_url: Any) -> bool:
+    """True when ``base_url`` points at localhost/loopback (e.g. http://localhost:4000)."""
+    from urllib.parse import urlparse
+
+    try:
+        host = (urlparse(str(base_url or "")).hostname or "").lower()
+    except Exception:
+        return False
+    return host in {"localhost", "127.0.0.1", "::1"}
+
+
+def _is_transient_connection_error(api_error: Any) -> bool:
+    """True for transport-level connection failures (not rate limits / 4xx)."""
+    return type(api_error).__name__ in _TRANSIENT_CONNECTION_ERROR_TYPES
+
 
 def _runtime_uses_ascii_encoding() -> bool:
     """Return whether the process genuinely needs an ASCII-only request fallback."""
@@ -1446,7 +1475,17 @@ def compute_error_backoff(
             # past, which the parser clamps to 0.0) carries no usable wait —
             # treat it as absent so we never hot-loop the provider.
             _retry_after = None
-    wait_time = _retry_after if _retry_after is not None else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
+    if _retry_after is not None:
+        wait_time = _retry_after
+    elif _is_transient_connection_error(api_error) and _is_loopback_base_url(base_url):
+        # A local gateway (e.g. the LiteLLM proxy) is rebinding; wait it out rather than
+        # erroring after 3 fast attempts and surfacing a raw "Connection error".
+        wait_time = jittered_backoff(
+            retry_count, base_delay=_LOOPBACK_CONNECTION_BACKOFF_BASE,
+            max_delay=_LOOPBACK_CONNECTION_BACKOFF_MAX,
+        )
+    else:
+        wait_time = jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
     _backoff_policy = None
     _adaptive = is_rate_limited or is_zai_coding_overload
     if _adaptive and _retry_after is None:
