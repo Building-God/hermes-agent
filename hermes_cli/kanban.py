@@ -360,6 +360,18 @@ def _cmd_create(args: argparse.Namespace) -> int:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
     with kbc.connect_closing() as conn:
+        # Lane M.1: no explicit --model -> let the chooser pick from the
+        # scoreboard/defaults/ledger chain and stamp it at create.
+        chooser_result = None
+        if not getattr(args, "model_override", None) and not getattr(args, "provider_override", None):
+            try:
+                from hermes_cli.agent_ledger import choose_for_new_card
+                chooser_result = choose_for_new_card(conn, body, assignee=args.assignee)
+            except Exception:
+                chooser_result = None
+            if chooser_result is not None:
+                args.model_override = chooser_result.model
+                args.provider_override = chooser_result.provider
         task_id = kb.create_task(
             conn, title=args.title, body=body, assignee=args.assignee,
             created_by=args.created_by or _profile_author(),
@@ -378,6 +390,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
                              if is_dispatcher_owned_worker_context() else None),
         )
         task = kb.get_task(conn, task_id)
+        # Lane M.1: record WHY this model was pinned, on the card itself.
+        if chooser_result is not None:
+            try:
+                from hermes_cli.agent_ledger import _log_chooser_event
+                _log_chooser_event(conn, task_id, chooser_result)
+            except Exception:
+                pass
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
     else:
